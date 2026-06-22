@@ -1,0 +1,15 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+.env
+.env.*
+dist/
+tmp/
+.specify/
+.pi/board-agent/
+tests/gen/

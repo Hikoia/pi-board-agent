@@ -1,0 +1,69 @@
+{
+  "name": "@mancioshell/pi-board-agent",
+  "version": "0.1.0",
+  "description": "Autonomous GitHub Project (v2) board executor for Pi — picks Ready cards, implements them in parallel git worktrees via pi-dynamic-workflows, and opens one PR per plan.",
+  "license": "MIT",
+  "author": {
+    "name": "Alessandro Mancini",
+    "email": "dott.alessandro.mancini@gmail.com",
+    "url": "https://github.com/mancioshell"
+  },
+  "homepage": "https://github.com/mancioshell/pi-board-agent",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mancioshell/pi-board-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mancioshell/pi-board-agent/issues"
+  },
+  "keywords": [
+    "pi",
+    "pi-agent",
+    "pi-extension",
+    "github",
+    "github-projects",
+    "kanban",
+    "automation",
+    "spec-kit",
+    "agents",
+    "workflows"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "skills": [
+      "./skills/board-agent"
+    ]
+  },
+  "files": [
+    "src",
+    "agents",
+    "skills",
+    "scripts",
+    "docs",
+    "config-template.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "yaml": "^2.5.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@quintinshaw/pi-dynamic-workflows": ">=2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@quintinshaw/pi-dynamic-workflows": {
+      "optional": false
+    }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "tsx": "^4.22.4"
+  }
+}

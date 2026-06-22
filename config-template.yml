@@ -1,0 +1,87 @@
+# pi-board-agent configuration
+#
+# Lives at `.pi/board-agent.yml` in your project (or `~/.pi/board-agent.yml` for
+# defaults across projects — project-level overrides global). All fields are
+# optional unless marked REQUIRED.
+
+# ── GitHub Project (v2) ─────────────────────────────────────────────────────
+project:
+  # GitHub user or org that owns the Project (v2).
+  # Leave empty -> auto-detected from `git remote get-url origin`.
+  owner: ""
+  # REQUIRED. Project number — the N in https://github.com/users/<owner>/projects/<N>
+  number: 0
+
+# ── Board columns (Status field) ────────────────────────────────────────────
+# Names must match the option labels of the project's single-select `Status` field
+# exactly (case-insensitive).
+columns:
+  ready: "Ready"
+  building: "Building"
+  review: "Review"
+  done: "Done"
+status_field: "Status"
+
+# ── Plan grouping ───────────────────────────────────────────────────────────
+# Cards are grouped into "plans" by the value of `plan_field` on the project.
+# Suggested setup: add a single-select field "Plan" on the project with one
+# option per spec-kit feature slug (matches the directory name under specs/).
+plan_field: "Plan"
+
+# ── Concurrency ─────────────────────────────────────────────────────────────
+# Max parallel builder workers per wave. Capped at 16 by pi-dynamic-workflows.
+max_workers: 2
+
+# Polling interval (seconds) of the autonomous loop. 60-120 is recommended
+# to stay well within the GitHub GraphQL rate-limit budget.
+tick_seconds: 90
+
+# ── Branch / PR strategy ────────────────────────────────────────────────────
+branches:
+  base: "main"                  # PR target
+  plan_prefix: "plan/"          # branch prefix for the long-lived plan branch
+  task_prefix: "task/"          # branch prefix for short-lived per-task branches
+
+# How per-task branches get merged into the plan branch:
+#   "squash" -> one commit per task on plan/<slug> (recommended, clean PR)
+#   "merge"  -> preserve full commit history of each task branch
+task_merge_strategy: "squash"
+
+# ── PR behaviour ────────────────────────────────────────────────────────────
+pr:
+  # Reviewers requested on the plan PR. Each entry is a GitHub login or
+  # `org/team-slug` (for team reviewers). Empty list -> no reviewers requested.
+  # The PR is always opened as a normal (non-draft) PR.
+  reviewers: []
+  # Optional template path (relative to repo root) used for the PR body.
+  # Falls back to a generated summary of the plan's tasks if missing.
+  body_template: ".github/PULL_REQUEST_TEMPLATE.md"
+  # Labels added to the plan PR (auto-created on the repo if missing).
+  labels:
+    - "board-agent"
+
+# ── Builder model routing ───────────────────────────────────────────────────
+# Maps to pi-dynamic-workflows tiers configured via `/workflows-models`.
+# Each builder agent runs in a worktree under this tier.
+builder_tier: "medium"
+
+# Optional: hard timeout per builder agent (milliseconds). Omit for no cap.
+builder_timeout_ms: 1800000  # 30 min
+
+# Retries for a recoverable failure (timeout, empty output, connection drop).
+builder_retries: 1
+
+# ── Safety rails ────────────────────────────────────────────────────────────
+safety:
+  # Never start a wave if more than this many cards are stuck in `building`
+  # (from a previous crashed run). The user must manually unstick them.
+  max_stuck_building: 3
+  # Refuse to run if the working tree is dirty.
+  require_clean_worktree: true
+  # Skip cards whose linked issue is already closed.
+  skip_closed_issues: true
+
+# ── Bot identity (optional) ─────────────────────────────────────────────────
+# When set, board-agent uses this login for the assignee mutex (atomic claim).
+# Leave empty to use the gh-authenticated user.
+bot_identity: ""
