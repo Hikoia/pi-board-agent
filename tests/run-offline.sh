@@ -40,7 +40,7 @@ echo
 # ---- 1. Config ----
 echo "--- config ---"
 
-cat >"$GEN_DIR/test-config.cts" <<'ENDTS'
+cat >"$GEN_DIR/test-config.ts" <<'ENDTS'
 import { _DEFAULTS, loadConfig, validateConfig, ConfigError } from "../../src/config.js";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
@@ -66,13 +66,13 @@ catch(e) { if (e instanceof ConfigError) console.log("PASS: validateConfig rejec
 try { validateConfig({ ...cfg, max_workers: 20 }); console.log("FAIL: validateConfig accepted max_workers=20"); }
 catch(e) { if (e instanceof ConfigError) console.log("PASS: validateConfig rejects max_workers>16"); else console.log("FAIL: wrong error type"); }
 ENDTS
-TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-config.cts"
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-config.ts"
 echo
 
 # ---- 2. Inflight ----
 echo "--- inflight ---"
 
-cat >"$GEN_DIR/test-inflight.cts" <<'ENDTS'
+cat >"$GEN_DIR/test-inflight.ts" <<'ENDTS'
 import { Inflight } from "../../src/inflight.js";
 const cwd = process.env.TMP_DIR!;
 const inf = new Inflight(cwd);
@@ -98,13 +98,13 @@ inf.clear("PVTI_abc");
 if (!inf.has("PVTI_abc")) console.log("PASS: inflight clear removes item");
 else console.log("FAIL: inflight clear did not remove");
 ENDTS
-TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-inflight.cts"
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-inflight.ts"
 echo
 
 # ---- 3. Plan summary ----
 echo "--- plan summary ---"
 
-cat >"$GEN_DIR/test-plan.cts" <<'ENDTS'
+cat >"$GEN_DIR/test-plan.ts" <<'ENDTS'
 import { summarizePlans, isPlanComplete } from "../../src/plan.js";
 import { loadConfig } from "../../src/config.js";
 const cfg = loadConfig(process.env.TMP_DIR!);
@@ -135,13 +135,13 @@ auth.doneCards = 3;
 if (isPlanComplete(auth)) console.log("PASS: auth is complete when all Done");
 else console.log("FAIL: auth should be complete");
 ENDTS
-TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-plan.cts"
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-plan.ts"
 echo
 
 # ---- 4. Workflow prompt ----
 echo "--- workflow prompt ---"
 
-cat >"$GEN_DIR/test-wf.cts" <<'ENDTS'
+cat >"$GEN_DIR/test-wf.ts" <<'ENDTS'
 import { renderWorkflowSource, buildTasksForWave, extractTaskKey } from "../../src/workflow-prompt.js";
 import { loadConfig } from "../../src/config.js";
 const cfg = loadConfig(process.env.TMP_DIR!);
@@ -172,13 +172,13 @@ else console.log("FAIL: source missing merge strategy");
 if (src.includes("closes #' + (t.issueNumber")) console.log("PASS: source references issue number in commit instructions");
 else console.log("FAIL: source missing issue reference");
 ENDTS
-TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-wf.cts"
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-wf.ts"
 echo
 
 # ---- 5. Loop tick ----
 echo "--- loop tick (dry-run) ---"
 
-cat >"$GEN_DIR/test-loop.cts" <<'ENDTS'
+cat >"$GEN_DIR/test-loop.ts" <<'ENDTS'
 import { createLoopState, BoardLoop, type LoopDeps } from "../../src/loop.js";
 import { Inflight } from "../../src/inflight.js";
 import { loadConfig } from "../../src/config.js";
@@ -208,7 +208,7 @@ loop.stop();
 if (!state.running) console.log("PASS: loop.stop clears running");
 else console.log("FAIL: loop.stop did not clear running");
 ENDTS
-TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-loop.cts"
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-loop.ts"
 echo
 
 # ---- summary ----

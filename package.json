@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Autonomous GitHub Project (v2) board executor for Pi — picks Ready cards, implements them in parallel git worktrees via pi-dynamic-workflows, and opens one PR per plan.",
   "license": "MIT",
+  "type": "module",
   "author": {
     "name": "Alessandro Mancini",
     "email": "dott.alessandro.mancini@gmail.com",
@@ -17,6 +18,7 @@
     "url": "https://github.com/mancioshell/pi-board-agent/issues"
   },
   "keywords": [
+    "pi-package",
     "pi",
     "pi-agent",
     "pi-extension",
