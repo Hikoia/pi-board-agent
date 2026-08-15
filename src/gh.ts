@@ -69,7 +69,7 @@ function runGh(args: string[], opts: { input?: string; cwd?: string } = {}): Pro
     child.on("error", (err) => reject(err));
     child.on("close", (code) => {
       if (code === 0) resolve(stdout);
-      else reject(new GhError(`gh ${args.join(" ")} failed`, code ?? -1, stderr));
+      else reject(new GhError(`gh ${args.join(" ")} failed: ${stderr.trim().split(String.fromCharCode(10))[0]}`, code ?? -1, stderr));
     });
     if (opts.input !== undefined) {
       child.stdin.write(opts.input);
@@ -557,17 +557,25 @@ export async function createIssue(opts: {
   parentIssueId?: string;
 }): Promise<{ number: number; id: string; url: string }> {
   const repoId = await resolveRepositoryId(opts.repoOwner, opts.repoName);
-  const mutation = `
-    mutation($repoId: ID!, $title: String!, $body: String!, $parentId: ID) {
-      createIssue(input: { repositoryId: $repoId, title: $title, body: $body, issueId: $parentId }) {
-        issue { number id url }
-      }
-    }`;
+  // GitHub rejects declared-but-unused variables: build the mutation without
+  // $parentId when there is no parent (no sub-issue).
+  const hasParent = !!opts.parentIssueId;
+  const mutation = hasParent
+    ? `mutation($repoId: ID!, $title: String!, $body: String!, $parentId: ID) {
+        createIssue(input: { repositoryId: $repoId, title: $title, body: $body, parentIssueId: $parentId }) {
+          issue { number id url }
+        }
+      }`
+    : `mutation($repoId: ID!, $title: String!, $body: String!) {
+        createIssue(input: { repositoryId: $repoId, title: $title, body: $body }) {
+          issue { number id url }
+        }
+      }`;
   const data = await graphql<any>(mutation, {
     repoId,
     title: opts.title,
     body: opts.body,
-    ...(opts.parentIssueId ? { parentId: opts.parentIssueId } : {}),
+    ...(hasParent ? { parentId: opts.parentIssueId } : {}),
   });
   const issue = data?.createIssue?.issue;
   if (!issue) throw new Error("createIssue failed (empty response).");
