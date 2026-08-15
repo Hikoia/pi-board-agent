@@ -100,6 +100,18 @@ refine:
   timeout_ms: 240000    # per-refine agent timeout
   max_tasks: 12         # safety cap on tasks created per story
 
+# ── Watchdog (PR CI + mentions) ───────────────────────────────────────
+# Keeps bot-managed PRs healthy: auto-fix failing CI (max rounds, cooldown),
+# then ask the human; replies to @bot mentions on its PRs.
+watchdog:
+  enabled: true
+  interval_seconds: 300      # standalone /board-agent watchdog interval
+  fix_rounds_max: 5          # max auto-fix rounds per PR before needs-human
+  fix_cooldown_minutes: 5    # pause between fix attempts (CI needs time)
+  respond_to_mentions: true
+  pr_label: "board-agent"
+  needs_human_label: "needs-human"
+
 # ── Safety rails ────────────────────────────────────────────────────────────
 safety:
   # Never start a wave if more than this many cards are stuck in `building`

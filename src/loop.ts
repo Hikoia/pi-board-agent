@@ -149,6 +149,25 @@ export class BoardLoop {
         await this.processStories(cards);
       }
 
+      // --- Watchdog: healthy bot PRs (CI fixes + mentions) ---
+      if (cfg.watchdog.enabled) {
+        try {
+          const { Watchdog } = await import("./watchdog.js");
+          const wd = new Watchdog({
+            cwd: this.deps.cwd,
+            cfg,
+            repoOwner,
+            repoName,
+            botLogin: this.deps.botLogin,
+            meta,
+            callback,
+          });
+          await wd.tick();
+        } catch (err: any) {
+          callback(`Watchdog tick failed: ${err.message}`, "warn");
+        }
+      }
+
       // --- Plan-level: detect completions → open PR ---
       const plans = summarizePlans(cfg, cards);
       for (const [, summary] of plans) {

@@ -94,6 +94,59 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ----------- /board-agent watchdog -----------
+  pi.registerCommand("board-agent watchdog", {
+    description: "Run the standalone watchdog loop (PR CI fixes + mentions)",
+    handler: async (_args, ctx) => {
+      try {
+        const cwd = ctx.cwd;
+        const cfg = loadConfig(cwd);
+        validateConfig(cfg);
+        const { owner, repoName } = resolveOwner(cfg, cwd);
+        const botLogin = cfg.bot_identity || (await whoami());
+        const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
+        const { Watchdog } = await import("./watchdog.js");
+        const wd = new Watchdog({
+          cwd,
+          cfg,
+          repoOwner: owner,
+          repoName,
+          botLogin,
+          meta,
+          callback: (msg, level = "info") => {
+            const prefix = level === "error" ? "❌" : level === "warn" ? "⚠️" : "✓";
+            ctx.ui.notify(`[watchdog] ${prefix} ${msg}`, level === "warn" ? "warning" : level);
+          },
+        });
+        const tick = () =>
+          wd.tick().catch((err: Error) => ctx.ui.notify(`[watchdog] ${err.message}`, "error"));
+        await tick();
+        const interval = setInterval(tick, cfg.watchdog.interval_seconds * 1000);
+        ctx.ui.notify(
+          `Watchdog loop started (every ${cfg.watchdog.interval_seconds}s). /board-agent stop-watchdog to stop.`,
+          "info",
+        );
+        (pi as any).watchdogInterval = interval;
+      } catch (err: any) {
+        ctx.ui.notify(`Watchdog failed to start: ${err.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("board-agent stop-watchdog", {
+    description: "Stop the standalone watchdog loop",
+    handler: async (_args, ctx) => {
+      const interval = (pi as any).watchdogInterval;
+      if (interval) {
+        clearInterval(interval);
+        (pi as any).watchdogInterval = undefined;
+        ctx.ui.notify("Watchdog loop stopped.", "info");
+      } else {
+        ctx.ui.notify("No watchdog loop is running.", "warning");
+      }
+    },
+  });
+
   // ----------- /board-agent context -----------
   pi.registerCommand("board-agent context", {
     description: "Generate/show the repo context digest injected into builder missions",

@@ -314,6 +314,51 @@ else console.log('FAIL: workflow payload context=null when absent');
 ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-context.ts"
 echo
+# ---- 8. Watchdog (Phase D) ----
+echo "--- watchdog ---"
+
+cat > "$GEN_DIR/test-watchdog.ts" <<'ENDTS'
+import { WatchdogStateStore } from "../../src/watchdog.js";
+import { renderFixWorkflowSource, renderReplyWorkflowSource } from "../../src/watchdog.js";
+
+// 1) state store
+const cwd = process.env.TMP_DIR!;
+const store = new WatchdogStateStore(cwd);
+store.update(42, { fixAttempts: 1 });
+store.update(42, { fixAttempts: 2, lastFixAtMs: 1234 });
+const st = store.get(42);
+if (st.fixAttempts === 2 && st.lastFixAtMs === 1234 && !st.needsHuman) console.log("PASS: watchdog state persists per-PR");
+else console.log("FAIL: watchdog state persists per-PR");
+if (store.get(999).fixAttempts === 0) console.log("PASS: watchdog state defaults for unknown PR");
+else console.log("FAIL: watchdog state defaults for unknown PR");
+
+// 2) fix workflow source embeds PR/branch/checks/model/context
+const fix = renderFixWorkflowSource({
+  prNumber: 42,
+  repoOwner: "mancioshell",
+  repoName: "pi-board-agent",
+  headBranch: "plan/001-auth",
+  failingChecks: ["pr-ci", "branch-ci"],
+  contextDigest: "## Repo tree",
+  model: "deepseek-v4-flash-0731",
+  timeoutMs: 60000,
+});
+if (fix.includes('PR #42') && fix.includes('plan/001-auth') && fix.includes('pr-ci') && fix.includes('"repoOwner":"mancioshell"') && fix.includes('deepseek-v4-flash-0731')) console.log("PASS: fix workflow embeds PR/branch/checks/repo/model");
+else console.log("FAIL: fix workflow embeds PR/branch/checks/repo/model");
+
+// 3) reply workflow source
+const reply = renderReplyWorkflowSource({
+  prNumber: 7,
+  mentionBody: "@board-bot what is the plan?",
+  contextDigest: "ctx",
+  model: "deepseek-v4-flash-0731",
+  timeoutMs: 60000,
+});
+if (reply.includes("PR #7") && reply.includes("@board-bot what is the plan?") && reply.includes("reply")) console.log("PASS: reply workflow embeds mention + schema");
+else console.log("FAIL: reply workflow embeds mention + schema");
+ENDTS
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-watchdog.ts"
+echo
 # ---- summary ----
 echo
 echo "---"
@@ -381,3 +426,4 @@ else console.log("FAIL: refine comment lists created tasks");
 ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-refine.ts"
 echo
+

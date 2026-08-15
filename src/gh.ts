@@ -648,3 +648,101 @@ export async function isPrMerged(
     return false;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase D — watchdog helpers (PR checks, PR listing)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface AgentPr {
+  number: number;
+  title: string;
+  headRefName: string;
+  headRefOid: string;
+  url: string;
+}
+
+/** List open PRs with a given label (created by the bot). */
+export async function listPrsWithLabel(
+  repoOwner: string,
+  repoName: string,
+  label: string,
+): Promise<AgentPr[]> {
+  const out = await runGh([
+    "pr", "list",
+    "--repo", `${repoOwner}/${repoName}`,
+    "--state", "open",
+    "--label", label,
+    "--json", "number,title,headRefName,headRefOid,url",
+    "--limit", "50",
+  ]);
+  const arr = JSON.parse(out) as Array<{
+    number: number;
+    title: string;
+    headRefName: string;
+    headRefOid: string;
+    url: string;
+  }>;
+  return arr;
+}
+
+export interface CheckRunInfo {
+  name: string;
+  conclusion: string | null;
+  status: string;
+}
+
+/** Check-runs of a commit (REST). */
+export async function getCheckRuns(
+  repoOwner: string,
+  repoName: string,
+  headSha: string,
+): Promise<CheckRunInfo[]> {
+  try {
+    const out = await runGh([
+      "api",
+      `repos/${repoOwner}/${repoName}/commits/${headSha}/check-runs`,
+      "--jq",
+      ".check_runs[] | { name, conclusion, status }",
+    ]);
+    const lines = out.trim();
+    if (!lines) return [];
+    return lines.split("\n").map((l) => JSON.parse(l));
+  } catch {
+    return [];
+  }
+}
+
+/** Issue comments via REST (PRs are issues). */
+export async function listPrComments(
+  repoOwner: string,
+  repoName: string,
+  number: number,
+): Promise<IssueComment[]> {
+  try {
+    const out = await runGh([
+      "api",
+      `repos/${repoOwner}/${repoName}/issues/${number}/comments`,
+      "--jq",
+      ".[] | { id: .id|tostring, body, created_at, author: .user.login }",
+    ]);
+    const lines = out.trim();
+    if (!lines) return [];
+    return lines.split("\n").map((l) => JSON.parse(l));
+  } catch {
+    return [];
+  }
+}
+
+/** Add a label to a PR (best-effort). */
+export async function addPrLabel(
+  repoOwner: string,
+  repoName: string,
+  prNumber: number,
+  label: string,
+): Promise<void> {
+  await runGh([
+    "pr", "edit", String(prNumber),
+    "--repo", `${repoOwner}/${repoName}`,
+    "--add-label", label,
+  ]).catch(() => undefined);
+}

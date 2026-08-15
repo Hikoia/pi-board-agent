@@ -42,6 +42,15 @@ export interface Config {
     timeout_ms: number; // per-refine agent timeout
     max_tasks: number; // safety cap on tasks created per story
   };
+  watchdog: {
+    enabled: boolean;
+    interval_seconds: number; // standalone watchdog loop interval
+    fix_rounds_max: number; // max auto-fix rounds per PR before asking the human
+    fix_cooldown_minutes: number; // pause between fix attempts
+    respond_to_mentions: boolean; // reply to @bot mentions on its PRs
+    pr_label: string; // label identifying bot-managed PRs
+    needs_human_label: string; // label added when the watchdog asks for help
+  };
   safety: {
     max_stuck_building: number;
     require_clean_worktree: boolean;
@@ -70,6 +79,15 @@ const DEFAULTS: Config = {
   },
   context: { enabled: true, max_chars: 20000, exclude: [] },
   refine: { enabled: true, timeout_ms: 240000, max_tasks: 12 },
+  watchdog: {
+    enabled: true,
+    interval_seconds: 300,
+    fix_rounds_max: 5,
+    fix_cooldown_minutes: 5,
+    respond_to_mentions: true,
+    pr_label: "board-agent",
+    needs_human_label: "needs-human",
+  },
   safety: { max_stuck_building: 3, require_clean_worktree: true, skip_closed_issues: true },
   bot_identity: "",
 };
@@ -208,6 +226,14 @@ export function readConfigTemplate(): string {
     `  enabled: true`,
     `  timeout_ms: 240000`,
     `  max_tasks: 12`,
+    `watchdog:`,
+    `  enabled: true`,
+    `  interval_seconds: 300`,
+    `  fix_rounds_max: 5`,
+    `  fix_cooldown_minutes: 5`,
+    `  respond_to_mentions: true`,
+    `  pr_label: "board-agent"`,
+    `  needs_human_label: "needs-human"`,
     `safety:`,
     `  max_stuck_building: 3`,
     `  require_clean_worktree: true`,
