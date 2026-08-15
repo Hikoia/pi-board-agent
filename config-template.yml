@@ -112,6 +112,20 @@ watchdog:
   pr_label: "board-agent"
   needs_human_label: "needs-human"
 
+# ── Telegram notifications ────────────────────────────────────────────
+# Same bot + channel used by the project releases. Token/chat id come from
+# the environment (never stored here).
+telegram:
+  enabled: true
+  bot_token_env: "TELEGRAM_BOT_TOKEN"
+  chat_id_env: "TELEGRAM_CHAT_ID"
+  # events: pr_opened, ci_fixed, needs_human, task_failed, refine_questions, refine_done
+  on: ["pr_opened", "ci_fixed", "needs_human", "task_failed", "refine_questions", "refine_done"]
+
+# ── Auto start (container) ──────────────────────────────────────────────────
+# Start the loop automatically when the pi session starts (Docker/headless).
+auto_start: false
+
 # ── Safety rails ────────────────────────────────────────────────────────────
 safety:
   # Never start a wave if more than this many cards are stuck in `building`

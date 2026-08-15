@@ -218,3 +218,16 @@ the autonomous GitHub Project board executor for Claude Code.
 ## License
 
 MIT © Alessandro Mancini. See [LICENSE](LICENSE).
+## Docker (Raspberry Pi)
+
+Run the board-agent in its own always-on container (independent pi instance):
+
+```bash
+cp .env.example .env      # GH_TOKEN + Telegram + provider key
+docker compose up -d --build
+```
+
+The container runs pi headless with `auto_start: true` (config) — the loop's
+setInterval keeps the process alive. Control via GitHub comments
+(`@<bot-login> status|stop|refine <plan>`) or `docker compose exec`.
+See `docs/docker.md` for the full setup.

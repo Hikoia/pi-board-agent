@@ -359,6 +359,27 @@ else console.log("FAIL: reply workflow embeds mention + schema");
 ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-watchdog.ts"
 echo
+
+# ---- 9. Notify (Phase E) ----
+echo "--- notify ---"
+
+cat > "$GEN_DIR/test-notify.ts" <<'ENDTS'
+import { mdToHtml } from "../../src/notify.js";
+import { _DEFAULTS } from "../../src/config.js";
+
+const html = mdToHtml("### Titolo\n- item one\n- item two\n**bold**\nplain <tag> & stuff");
+if (html.includes("<b>Titolo</b>") && html.includes("• item one") && html.includes("<b>bold</b>") && html.includes("&lt;tag&gt; &amp;")) console.log("PASS: mdToHtml converts headers/bullets/bold/escape");
+else console.log("FAIL: mdToHtml conversion", html);
+
+if (_DEFAULTS.telegram.enabled && _DEFAULTS.telegram.bot_token_env === "TELEGRAM_BOT_TOKEN" && _DEFAULTS.telegram.chat_id_env === "TELEGRAM_CHAT_ID") console.log("PASS: telegram config defaults");
+else console.log("FAIL: telegram config defaults");
+if (_DEFAULTS.telegram.on.includes("needs_human") && _DEFAULTS.telegram.on.includes("pr_opened") && _DEFAULTS.telegram.on.includes("ci_fixed")) console.log("PASS: telegram default events");
+else console.log("FAIL: telegram default events");
+if (_DEFAULTS.auto_start === false) console.log("PASS: auto_start default false");
+else console.log("FAIL: auto_start default false");
+ENDTS
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-notify.ts"
+echo
 # ---- summary ----
 echo
 echo "---"

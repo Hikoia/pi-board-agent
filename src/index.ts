@@ -25,7 +25,92 @@ import { dispatchWave, type WaveOutcome } from "./dispatch.js";
 let loop: BoardLoop | null = null;
 let loopState = createLoopState();
 
+// Start the autonomous loop (shared by /board-agent run and auto_start).
+async function startBoardLoop(
+  cwd: string,
+  ui: { notify: (msg: string, level?: "info" | "warning" | "error") => void },
+): Promise<void> {
+  const cfg = loadConfig(cwd);
+  validateConfig(cfg);
+  const { owner, repoName } = resolveOwner(cfg, cwd);
+
+  const botLogin = cfg.bot_identity || (await whoami());
+  const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
+
+  const callback = (msg: string, level: "info" | "warn" | "error" = "info") => {
+    const prefix = level === "error" ? "❌" : level === "warn" ? "⚠️" : "✓";
+    ui.notify(`[board-agent] ${prefix} ${msg}`, level === "warn" ? "warning" : level);
+  };
+
+  const inflight = new Inflight(cwd);
+
+  // Real dispatch (v0.2): pi-dynamic-workflows exposes a programmatic API
+  // (runWorkflow) usable directly from the extension — no LLM round-trip.
+  const pendingWaves = new Map<string, Promise<WaveOutcome[]>>();
+
+  const deps: LoopDeps = {
+    cwd,
+    cfg,
+    repoOwner: owner,
+    repoName,
+    botLogin,
+    meta,
+    callback,
+    dxRun: async (script: string): Promise<string> => {
+      const runId = `wave-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      callback(`Dispatching wave ${runId} (pi-dynamic-workflows)…`);
+      const wave = dispatchWave({
+        cwd,
+        script,
+        maxAgents: cfg.max_workers,
+        agentTimeoutMs: cfg.builder_timeout_ms,
+        runId,
+        onLog: (line) => callback(`[wave] ${line}`, "info"),
+      }).catch((err: Error) => {
+        callback(`Wave ${runId} failed to run: ${err.message}`, "error");
+        return [];
+      });
+      pendingWaves.set(runId, wave);
+      return runId;
+    },
+    dxResult: async (runId: string): Promise<any[]> => {
+      const wave = pendingWaves.get(runId);
+      if (!wave) {
+        callback(`No pending wave for ${runId}`, "warn");
+        return [];
+      }
+      pendingWaves.delete(runId);
+      const outcomes = await wave;
+      for (const o of outcomes) {
+        if (o.status === "success") callback(`Task ${o.taskKey} → ${o.status} (${o.summary ?? ""})`);
+        else callback(`Task ${o.taskKey} → ${o.status}: ${o.error ?? "unknown"}`, "warn");
+      }
+      return outcomes;
+    },
+  };
+
+  loopState = createLoopState();
+  loop = new BoardLoop(deps, loopState, inflight);
+  loop.start();
+  ui.notify(
+    `[board-agent] Loop started. Ticking every ${cfg.tick_seconds}s. Project: ${owner}/#${cfg.project.number}. Use /board-agent stop to stop.`,
+    "info",
+  );
+}
+
 export default function (pi: ExtensionAPI) {
+  // Auto-start (container/headless): start the loop as soon as the session
+  // starts when config.auto_start is true.
+  pi.on("session_start", async (_event, ctx) => {
+    try {
+      const cfg = loadConfig(ctx.cwd);
+      if (cfg.auto_start && !loop?.isRunning()) {
+        await startBoardLoop(ctx.cwd, ctx.ui);
+      }
+    } catch {
+      // auto-start is best-effort: the user can still start via /board-agent run
+    }
+  });
   // ----------- /board-agent init -----------
   pi.registerCommand("board-agent init", {
     description: "Write a default .pi/board-agent.yml for this project",
@@ -216,110 +301,11 @@ export default function (pi: ExtensionAPI) {
   // ----------- /board-agent run -----------
   pi.registerCommand("board-agent run", {
     description: "Start the autonomous loop (picks Ready cards from the GitHub Project)",
-    handler: async (args, ctx) => {
+    handler: async (_args, ctx) => {
       try {
-        const cwd = ctx.cwd;
-        const cfg = loadConfig(cwd);
-        validateConfig(cfg);
-        const { owner, repoName } = resolveOwner(cfg, cwd);
-
-        const botLogin = cfg.bot_identity || (await whoami());
-        const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
-
-        // Check that board-agent skill is discoverable.
-        // It ships with the package; pi should have it loaded already via
-        // package.json `pi.skills`.
-
-        const callback = (msg: string, level: "info" | "warn" | "error" = "info") => {
-          const prefix = level === "error" ? "❌" : level === "warn" ? "⚠️" : "✓";
-          ctx.ui.notify(`[board-agent] ${prefix} ${msg}`, level === "warn" ? "warning" : level);
-        };
-
-        // pi-dynamic-workflows integration:
-        // The extension registers a custom tool "board_agent_launch_wave" that
-        // the LLM calls; but we need direct API access. pi-dynamic-workflows
-        // exposes CMD commands: `dx.workflow.run()` hooks into them.
-        // For now we use a simpler path: we inject the workflow script into
-        // the session via pi.sendMessage + triggerTurn, and pray. BUT that's
-        // fragile.
-        //
-        // THE BETTER PATH (v0.2): expose a `board_agent_workflow` tool that
-        // the loop invokes directly. pi-dynamic-workflows registers its own
-        // `workflow` tool, which we could call — but tools are callable only
-        // by the LLM, not by extensions.
-        //
-        // PRACTICAL PATH (v0.1): The loop delegates to pi-dynamic-workflows
-        // through its `workflow` tool. The extension calls it by injecting a
-        // user message with the workflow script. Ugly? Yes. But it works today
-        // without forking pi-dynamic-workflows.
-        //
-        // We expose a simple mockable interface: LoopDeps.dxRun / dxResult.
-        // In the real extension, we implement them via the workflow tool.
-
-        const inflight = new Inflight(cwd);
-
-        // Real dispatch (v0.2): pi-dynamic-workflows exposes a programmatic
-        // API (runWorkflow) usable directly from the extension — no LLM
-        // round-trip needed. dxRun starts the wave (stored by runId), dxResult
-        // awaits it and returns the normalized per-card outcomes.
-        const pendingWaves = new Map<string, Promise<WaveOutcome[]>>();
-
-        const deps: LoopDeps = {
-          cwd,
-          cfg,
-          repoOwner: owner,
-          repoName,
-          botLogin,
-          meta,
-          callback,
-          dxRun: async (script: string): Promise<string> => {
-            const runId = `wave-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-            callback(`Dispatching wave ${runId} (pi-dynamic-workflows)…`);
-            const wave = dispatchWave({
-              cwd,
-              script,
-              maxAgents: cfg.max_workers,
-              agentTimeoutMs: cfg.builder_timeout_ms,
-              runId,
-              onLog: (line) => callback(`[wave] ${line}`, "info"),
-            }).catch((err: Error) => {
-              callback(`Wave ${runId} failed to run: ${err.message}`, "error");
-              return [];
-            });
-            pendingWaves.set(runId, wave);
-            return runId;
-          },
-          dxResult: async (runId: string): Promise<any[]> => {
-            const wave = pendingWaves.get(runId);
-            if (!wave) {
-              callback(`No pending wave for ${runId}`, "warn");
-              return [];
-            }
-            pendingWaves.delete(runId);
-            const outcomes = await wave;
-            for (const o of outcomes) {
-              if (o.status === "success") {
-                callback(`Task ${o.taskKey} → ${o.status} (${o.summary ?? ""})`);
-              } else {
-                callback(`Task ${o.taskKey} → ${o.status}: ${o.error ?? "unknown"}`, "warn");
-              }
-            }
-            return outcomes;
-          },
-        };
-
-        loopState = createLoopState();
-        loop = new BoardLoop(deps, loopState, inflight);
-        loop.start();
-        ctx.ui.notify(
-          `[board-agent] Loop started. Ticking every ${cfg.tick_seconds}s. Project: ${owner}/#${cfg.project.number}. Use /board-agent stop to stop.`,
-          "info",
-        );
+        await startBoardLoop(ctx.cwd, ctx.ui);
       } catch (err: any) {
-        ctx.ui.notify(
-          `[board-agent] Failed to start: ${err.message}`,
-          "error",
-        );
+        ctx.ui.notify(`[board-agent] Failed to start: ${err.message}`, "error");
       }
     },
   });

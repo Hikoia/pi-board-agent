@@ -37,6 +37,7 @@ import {
   type RefineOutput,
 } from "./refine.js";
 import { listIssueComments, createComment, isPrMerged } from "./gh.js";
+import { makeNotifier } from "./notify.js";
 
 export type StatusCallback = (msg: string, level?: "info" | "warn" | "error") => void;
 
@@ -107,6 +108,10 @@ export class BoardLoop {
       }
     }, ms);
     this.deps.callback(`Loop started (tick=${this.deps.cfg.tick_seconds}s)`);
+  }
+
+  isRunning(): boolean {
+    return this.state.running;
   }
 
   stop(): void {
@@ -190,6 +195,14 @@ export class BoardLoop {
             callback(
               `Plan PR ${result.status === "opened" ? "opened" : "exists"}: ${result.url ?? summary.slug}`,
             );
+            if (result.status === "opened") {
+              await makeNotifier(cfg)(
+                "pr_opened",
+                `PR aperta: ${summary.rawName}`,
+                `#${result.number} — ${result.url}`,
+                [result.url ?? ""],
+              );
+            }
           }
         }
       }
@@ -437,6 +450,11 @@ export class BoardLoop {
         await setStatus(meta, story.itemId, cfg.columns.needs_design).catch(() => undefined);
         refineState.update(number, { refined: false, lastSeenCommentId: questionId });
         callback(`Story "${story.title}" → ${cfg.columns.needs_design}: ${refine.openQuestions.length} domanda/e aperta/e.`);
+        await makeNotifier(cfg)(
+          "refine_questions",
+          `Domande di design: ${story.title}`,
+          refine.openQuestions.join("\n"),
+        );
         return;
       }
 
@@ -457,6 +475,12 @@ export class BoardLoop {
       refineState.update(number, { refined: true });
       callback(
         `Story "${story.title}" raffinata: ${created.length} task creati (${created.map((c) => c.taskKey).join(", ")}).`,
+      );
+      await makeNotifier(cfg)(
+        "refine_done",
+        `Storia raffinata: ${story.title}`,
+        `${created.length} task creati: ${created.map((c) => c.taskKey).join(", ")}`,
+        created.map((c) => c.url),
       );
     } catch (err: any) {
       // Revert to Ready so the next tick retries (or a human can inspect).
@@ -528,6 +552,11 @@ export class BoardLoop {
         this.deps.callback(
           `Task "${item.card.title}" failed: ${outcome?.error ?? "unknown"}. Returned to ${cfg.columns.ready}.`,
           "warn",
+        );
+        await makeNotifier(cfg)(
+          "task_failed",
+          `Task fallito: ${item.card.title}`,
+          `${outcome?.error ?? "unknown"} — rimesso in ${cfg.columns.ready} per riprovare.`,
         );
         continue;
       }

@@ -30,6 +30,7 @@ import {
 } from "./gh.js";
 import type { ProjectMetadata } from "./gh.js";
 import { generateContext } from "./context.js";
+import { makeNotifier } from "./notify.js";
 
 // ── state ───────────────────────────────────────────────────────────────────
 
@@ -267,6 +268,12 @@ export class Watchdog {
       // fresh attempts.
       if (!pending && st.fixAttempts > 0) {
         this.state.update(pr.number, { fixAttempts: 0 });
+        await makeNotifier(this.deps.cfg)(
+          "ci_fixed",
+          `CI verde: PR #${pr.number}`,
+          `La pipeline è tornata verde (${pr.headRefName}).`,
+          [pr.url],
+        );
       }
       return;
     }
@@ -391,6 +398,12 @@ export class Watchdog {
     }
     this.state.update(pr.number, { needsHuman: true });
     callback(`Watchdog: PR #${pr.number} → needs-human (dopo ${attempts} fix falliti).`, "warn");
+    await makeNotifier(this.deps.cfg)(
+      "needs_human",
+      `Serve intervento umano: PR #${pr.number}`,
+      `Dopo ${attempts} fix automatici la CI è ancora rossa (${failing.join(", ")}).`,
+      [pr.url],
+    );
   }
 
   private async getContextDigest(): Promise<string> {

@@ -51,6 +51,13 @@ export interface Config {
     pr_label: string; // label identifying bot-managed PRs
     needs_human_label: string; // label added when the watchdog asks for help
   };
+  telegram: {
+    enabled: boolean;
+    bot_token_env: string; // env var holding the bot token
+    chat_id_env: string; // env var holding the channel id
+    on: string[]; // events to notify: pr_opened, ci_fixed, needs_human, task_failed, refine_questions, refine_done
+  };
+  auto_start: boolean; // start the loop automatically at session start (container)
   safety: {
     max_stuck_building: number;
     require_clean_worktree: boolean;
@@ -88,6 +95,13 @@ const DEFAULTS: Config = {
     pr_label: "board-agent",
     needs_human_label: "needs-human",
   },
+  telegram: {
+    enabled: true,
+    bot_token_env: "TELEGRAM_BOT_TOKEN",
+    chat_id_env: "TELEGRAM_CHAT_ID",
+    on: ["pr_opened", "ci_fixed", "needs_human", "task_failed", "refine_questions", "refine_done"],
+  },
+  auto_start: false,
   safety: { max_stuck_building: 3, require_clean_worktree: true, skip_closed_issues: true },
   bot_identity: "",
 };
@@ -234,6 +248,12 @@ export function readConfigTemplate(): string {
     `  respond_to_mentions: true`,
     `  pr_label: "board-agent"`,
     `  needs_human_label: "needs-human"`,
+    `telegram:`,
+    `  enabled: true`,
+    `  bot_token_env: "TELEGRAM_BOT_TOKEN"`,
+    `  chat_id_env: "TELEGRAM_CHAT_ID"`,
+    `  on: ["pr_opened", "ci_fixed", "needs_human", "task_failed", "refine_questions", "refine_done"]`,
+    `auto_start: false`,
     `safety:`,
     `  max_stuck_building: 3`,
     `  require_clean_worktree: true`,
