@@ -71,6 +71,14 @@ builder_timeout_ms: 1800000  # 30 min
 # Retries for a recoverable failure (timeout, empty output, connection drop).
 builder_retries: 1
 
+# ── LLM models (parametrizzabili) ───────────────────────────────────────────
+# Explicit model id used for each role. When set, it takes precedence over
+# the tier. Use "provider/modelId" or a bare modelId resolvable by pi.
+models:
+  builder: "deepseek-v4-flash-0731"
+  refine: "deepseek-v4-flash-0731"
+  watch: "deepseek-v4-flash-0731"
+
 # ── Safety rails ────────────────────────────────────────────────────────────
 safety:
   # Never start a wave if more than this many cards are stuck in `building`

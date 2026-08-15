@@ -20,6 +20,7 @@ import { loadConfig, validateConfig, resolveOwner } from "./config.js";
 import { getProjectMetadata, whoami } from "./gh.js";
 import { createLoopState, BoardLoop, type LoopDeps } from "./loop.js";
 import { Inflight } from "./inflight.js";
+import { dispatchWave, type WaveOutcome } from "./dispatch.js";
 
 let loop: BoardLoop | null = null;
 let loopState = createLoopState();
@@ -32,7 +33,7 @@ export default function (pi: ExtensionAPI) {
       const cwd = ctx.cwd;
       const dest = resolve(cwd, CONFIG_DIR_NAME, "board-agent.yml");
       if (existsSync(dest)) {
-        ctx.ui.notify(`Already exists: ${dest}`, "warn");
+        ctx.ui.notify(`Already exists: ${dest}`, "warning");
         return;
       }
       const { readConfigTemplate } = await import("./config.js");
@@ -131,7 +132,7 @@ export default function (pi: ExtensionAPI) {
 
         const callback = (msg: string, level: "info" | "warn" | "error" = "info") => {
           const prefix = level === "error" ? "❌" : level === "warn" ? "⚠️" : "✓";
-          ctx.ui.notify(`[board-agent] ${prefix} ${msg}`, level);
+          ctx.ui.notify(`[board-agent] ${prefix} ${msg}`, level === "warn" ? "warning" : level);
         };
 
         // pi-dynamic-workflows integration:
@@ -157,6 +158,12 @@ export default function (pi: ExtensionAPI) {
 
         const inflight = new Inflight(cwd);
 
+        // Real dispatch (v0.2): pi-dynamic-workflows exposes a programmatic
+        // API (runWorkflow) usable directly from the extension — no LLM
+        // round-trip needed. dxRun starts the wave (stored by runId), dxResult
+        // awaits it and returns the normalized per-card outcomes.
+        const pendingWaves = new Map<string, Promise<WaveOutcome[]>>();
+
         const deps: LoopDeps = {
           cwd,
           cfg,
@@ -166,21 +173,38 @@ export default function (pi: ExtensionAPI) {
           meta,
           callback,
           dxRun: async (script: string): Promise<string> => {
-            // Queue a workflow script via the workflow tool path.
-            // pi-dynamic-workflows auto-detects the word "workflow" in the
-            // user message and triggers creation. We send the script verbatim.
-            //
-            // This is the compromise for v0.1. v0.2 will use a direct API
-            // when pi-dynamic-workflows exposes one.
             const runId = `wave-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-            ctx.ui.notify(`[board-agent] Workflow queued (placeholder runId=${runId}). Full API integration deferred to v0.2.`, "warn");
-
-            // In v0.2: call pi-dynamic-workflows direct, await result here.
-            // For now, return a placeholder so the loop can proceed.
+            callback(`Dispatching wave ${runId} (pi-dynamic-workflows)…`);
+            const wave = dispatchWave({
+              cwd,
+              script,
+              maxAgents: cfg.max_workers,
+              agentTimeoutMs: cfg.builder_timeout_ms,
+              runId,
+              onLog: (line) => callback(`[wave] ${line}`, "info"),
+            }).catch((err: Error) => {
+              callback(`Wave ${runId} failed to run: ${err.message}`, "error");
+              return [];
+            });
+            pendingWaves.set(runId, wave);
             return runId;
           },
-          dxResult: async (_runId: string): Promise<any[]> => {
-            return [];
+          dxResult: async (runId: string): Promise<any[]> => {
+            const wave = pendingWaves.get(runId);
+            if (!wave) {
+              callback(`No pending wave for ${runId}`, "warn");
+              return [];
+            }
+            pendingWaves.delete(runId);
+            const outcomes = await wave;
+            for (const o of outcomes) {
+              if (o.status === "success") {
+                callback(`Task ${o.taskKey} → ${o.status} (${o.summary ?? ""})`);
+              } else {
+                callback(`Task ${o.taskKey} → ${o.status}: ${o.error ?? "unknown"}`, "warn");
+              }
+            }
+            return outcomes;
           },
         };
 
@@ -188,7 +212,7 @@ export default function (pi: ExtensionAPI) {
         loop = new BoardLoop(deps, loopState, inflight);
         loop.start();
         ctx.ui.notify(
-          `[board-agent] Loop started. Ticking every ${cfg.tick_seconds}s. Project: ${owner}/#${cfg.project.number}. `/board-agent stop\` to stop.`,
+          `[board-agent] Loop started. Ticking every ${cfg.tick_seconds}s. Project: ${owner}/#${cfg.project.number}. Use /board-agent stop to stop.`,
           "info",
         );
       } catch (err: any) {
@@ -205,7 +229,7 @@ export default function (pi: ExtensionAPI) {
     description: "Stop the autonomous loop gracefully",
     handler: async (_args, ctx) => {
       if (!loop) {
-        ctx.ui.notify("No loop is running.", "warn");
+        ctx.ui.notify("No loop is running.", "warning");
         return;
       }
       loop.stop();

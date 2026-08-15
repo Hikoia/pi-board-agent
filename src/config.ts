@@ -26,6 +26,11 @@ export interface Config {
   builder_tier: "small" | "medium" | "big";
   builder_timeout_ms?: number;
   builder_retries: number;
+  models: {
+    builder: string; // LLM model for builder agents (default: DeepSeek V4 Flash 0731)
+    refine: string; // LLM model for the refine phase
+    watch: string; // LLM model for the watchdog
+  };
   safety: {
     max_stuck_building: number;
     require_clean_worktree: boolean;
@@ -46,6 +51,11 @@ const DEFAULTS: Config = {
   pr: { reviewers: [], body_template: ".github/PULL_REQUEST_TEMPLATE.md", labels: ["board-agent"] },
   builder_tier: "medium",
   builder_retries: 1,
+  models: {
+    builder: "deepseek-v4-flash-0731",
+    refine: "deepseek-v4-flash-0731",
+    watch: "deepseek-v4-flash-0731",
+  },
   safety: { max_stuck_building: 3, require_clean_worktree: true, skip_closed_issues: true },
   bot_identity: "",
 };
@@ -166,6 +176,10 @@ export function readConfigTemplate(): string {
     `  labels: ["board-agent"]`,
     `builder_tier: "medium"`,
     `builder_retries: 1`,
+    `models:`,
+    `  builder: "deepseek-v4-flash-0731"`,
+    `  refine: "deepseek-v4-flash-0731"`,
+    `  watch: "deepseek-v4-flash-0731"`,
     `safety:`,
     `  max_stuck_building: 3`,
     `  require_clean_worktree: true`,

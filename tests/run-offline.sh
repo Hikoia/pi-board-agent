@@ -211,6 +211,67 @@ ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-loop.ts"
 echo
 
+
+# ---- 4. Dispatch (normalizeWaveResults) + workflow-prompt (model) ----
+echo '--- dispatch ---'
+
+cat >"$GEN_DIR/test-dispatch.ts" <<'ENDTS'
+import { normalizeWaveResults } from "../../src/dispatch.js";
+import { _DEFAULTS, type Config } from "../../src/config.js";
+import { renderWorkflowSource, buildTasksForWave } from "../../src/workflow-prompt.js";
+
+// normalizeWaveResults: happy path
+const raw = [
+  { taskKey: "T001", itemId: "PVTI_a", status: "success", branch: "task/t001", commits: 1, summary: "done" },
+  { taskKey: "T002", itemId: "PVTI_b", status: "failure", error: "conflict" },
+];
+const out = normalizeWaveResults(raw);
+if (out.length === 2 && out[0].status === "success" && out[0].branch === "task/t001") console.log("PASS: normalize happy path");
+else console.log("FAIL: normalize happy path");
+if (out[1].status === "failure" && out[1].error === "conflict") console.log("PASS: normalize failure keeps error");
+else console.log("FAIL: normalize failure keeps error");
+
+// normalizeWaveResults: defensive (nulls, malformed, non-array)
+if (normalizeWaveResults(null).length === 0) console.log("PASS: normalize null -> []");
+else console.log("FAIL: normalize null -> []");
+if (normalizeWaveResults([null, { x: 1 }, { taskKey: "T3", itemId: "PVTI_c" }]).length === 1) console.log("PASS: normalize skips null/malformed");
+else console.log("FAIL: normalize skips null/malformed");
+
+// workflow-prompt: rendered script includes the configured builder model
+const cfg: Config = { ..._DEFAULTS, models: { builder: "deepseek-v4-flash-0731", refine: "deepseek-v4-flash-0731", watch: "deepseek-v4-flash-0731" } };
+const card = { itemId: "PVTI_x", number: 12, title: "T001 Do the thing", body: "acceptance", status: "Ready", plan: "001-auth", closed: false };
+const task = buildTasksForWave(cfg, "001-auth", [card])[0];
+const script = renderWorkflowSource({ cfg, planSlug: "001-auth", baseBranch: "main", tasks: [task], skillName: "board-agent" });
+if (script.includes("deepseek-v4-flash-0731")) console.log("PASS: workflow script embeds builder model");
+else console.log("FAIL: workflow script embeds builder model");
+if (script.includes("isolation: 'worktree'")) console.log("PASS: workflow script uses worktree isolation");
+else console.log("FAIL: workflow script uses worktree isolation");
+if (script.includes('"issueNumber":12')) {
+  console.log("PASS: workflow payload embeds issue number");
+} else {
+  console.log("FAIL: workflow payload embeds issue number");
+}
+ENDTS
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-dispatch.ts"
+echo
+
+# ---- 5. Dispatch smoke (runWorkflow programmatic, no agents) ----
+echo "--- dispatch smoke ---"
+
+cat > "$GEN_DIR/test-dispatch-smoke.ts" <<'ENDTS'
+import { runWorkflow } from "@quintinshaw/pi-dynamic-workflows";
+const script = `
+export const meta = { name: 'smoke', description: 'smoke', phases: [{ title: 'x' }] };
+const results = [{ taskKey: 'T001', itemId: 'PVTI_a', status: 'success', branch: 'task/t001' }];
+return results;
+`;
+const res = await runWorkflow(script, { cwd: process.cwd(), persistLogs: false });
+const out = Array.isArray(res.result) ? res.result : [];
+if (out.length === 1 && out[0].taskKey === "T001") console.log("PASS: runWorkflow smoke (programmatic dispatch works)");
+else console.log("FAIL: runWorkflow smoke", JSON.stringify(res.result));
+ENDTS
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-dispatch-smoke.ts"
+echo
 # ---- summary ----
 echo
 echo "---"

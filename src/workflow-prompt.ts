@@ -69,6 +69,9 @@ export function renderWorkflowSource(input: {
       builder_timeout_ms: input.cfg.builder_timeout_ms,
       builder_retries: input.cfg.builder_retries,
     },
+    models: {
+      builder: input.cfg.models.builder,
+    },
     skillName: input.skillName,
     planSlug: input.planSlug,
   });
@@ -131,6 +134,7 @@ const results = await parallel(
     ].join('\\n'),
     {
       tier: PAYLOAD.cfg.builder_tier,
+      model: PAYLOAD.models.builder,
       isolation: 'worktree',
       label: 'build ' + t.taskKey,
       retries: PAYLOAD.cfg.builder_retries,
