@@ -230,12 +230,29 @@ export class BoardLoop {
 
         // Dispatch the wave.
         const tasks = claimed.map((x) => x.task);
+        let context: string | undefined;
+        if (cfg.context.enabled) {
+          try {
+            const { generateContext } = await import("./context.js");
+            context = generateContext({
+              cwd: this.deps.cwd,
+              maxChars: cfg.context.max_chars,
+              exclude: cfg.context.exclude,
+            });
+            callback(
+              `Repo context digest: ${context.length} chars injected into the wave`,
+            );
+          } catch (err: any) {
+            callback(`Context generation failed: ${err.message}`, "warn");
+          }
+        }
         const script = renderWorkflowSource({
           cfg,
           planSlug: summary.slug,
           baseBranch: cfg.branches.base,
           tasks,
           skillName: "board-agent",
+          context,
         });
 
         this.state.wavesLaunched++;

@@ -72,6 +72,31 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ----------- /board-agent context -----------
+  pi.registerCommand("board-agent context", {
+    description: "Generate/show the repo context digest injected into builder missions",
+    handler: async (_args, ctx) => {
+      try {
+        const cwd = ctx.cwd;
+        const cfg = loadConfig(cwd);
+        validateConfig(cfg);
+        const { generateContext } = await import("./context.js");
+        const text = generateContext({
+          cwd,
+          maxChars: cfg.context.max_chars,
+          exclude: cfg.context.exclude,
+        });
+        const lines = text.split("\n").length;
+        ctx.ui.notify(
+          `Repo context digest: ${text.length} chars, ${lines} lines → .pi/board-agent/context.md`,
+          "info",
+        );
+      } catch (err: any) {
+        ctx.ui.notify(`Context failed: ${err.message}`, "error");
+      }
+    },
+  });
+
   // ----------- /board-agent status -----------
   pi.registerCommand("board-agent status", {
     description: "Show board snapshot and loop stats",

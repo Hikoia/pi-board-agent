@@ -272,6 +272,48 @@ else console.log("FAIL: runWorkflow smoke", JSON.stringify(res.result));
 ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-dispatch-smoke.ts"
 echo
+
+# ---- 6. Context digest (Phase B) ----
+echo '--- context ---'
+
+cat > "$GEN_DIR/test-context.ts" <<'ENDTS'
+import { renderContext, generateContext } from "../../src/context.js";
+import { _DEFAULTS, type Config } from "../../src/config.js";
+import { renderWorkflowSource, buildTasksForWave } from "../../src/workflow-prompt.js";
+
+// 1) renderContext on the pi-board-agent repo itself
+const text = renderContext({ cwd: process.cwd(), maxChars: 40000, exclude: [] });
+if (text.includes('Repo tree')) console.log('PASS: context has tree section');
+else console.log('FAIL: context has tree section');
+if (text.includes('Source files') && text.includes('dispatch.ts')) console.log('PASS: context lists source files');
+else console.log('FAIL: context lists source files');
+if (text.includes('Recent commits')) console.log('PASS: context has recent commits');
+else console.log('FAIL: context has recent commits');
+
+// 2) truncation
+const small = renderContext({ cwd: process.cwd(), maxChars: 2000, exclude: [] });
+if (small.length <= 2100 && small.includes('truncated')) console.log('PASS: context truncates at maxChars');
+else console.log('FAIL: context truncates at maxChars');
+
+// 3) cache: same hash -> same content, file written
+const a = generateContext({ cwd: process.cwd(), maxChars: 40000, exclude: [] });
+const b = generateContext({ cwd: process.cwd(), maxChars: 40000, exclude: [] });
+if (a === b) console.log('PASS: context cache stable (hash-based)');
+else console.log('FAIL: context cache stable');
+
+// 4) workflow script embeds the context
+const cfg: Config = { ..._DEFAULTS };
+const card = { itemId: 'PVTI_x', number: 12, title: 'T001 Do the thing', body: 'acceptance', status: 'Ready', plan: '001-auth', closed: false };
+const task = buildTasksForWave(cfg, '001-auth', [card])[0];
+const withCtx = renderWorkflowSource({ cfg, planSlug: '001-auth', baseBranch: 'main', tasks: [task], skillName: 'board-agent', context: '## Repo tree\n- src/' });
+if (withCtx.includes('REPO CONTEXT') && withCtx.includes('## Repo tree')) console.log('PASS: workflow embeds repo context');
+else console.log('FAIL: workflow embeds repo context');
+const withoutCtx = renderWorkflowSource({ cfg, planSlug: '001-auth', baseBranch: 'main', tasks: [task], skillName: 'board-agent' });
+if (withoutCtx.includes('"context":null')) console.log('PASS: workflow payload context=null when absent');
+else console.log('FAIL: workflow payload context=null when absent');
+ENDTS
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-context.ts"
+echo
 # ---- summary ----
 echo
 echo "---"

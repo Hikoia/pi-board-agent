@@ -31,6 +31,11 @@ export interface Config {
     refine: string; // LLM model for the refine phase
     watch: string; // LLM model for the watchdog
   };
+  context: {
+    enabled: boolean; // generate + inject the repo digest into builder missions
+    max_chars: number; // digest size cap (~4 chars/token → 20000 ≈ 5K tokens)
+    exclude: string[]; // extra paths/globs to exclude from the digest
+  };
   safety: {
     max_stuck_building: number;
     require_clean_worktree: boolean;
@@ -56,6 +61,7 @@ const DEFAULTS: Config = {
     refine: "deepseek-v4-flash-0731",
     watch: "deepseek-v4-flash-0731",
   },
+  context: { enabled: true, max_chars: 20000, exclude: [] },
   safety: { max_stuck_building: 3, require_clean_worktree: true, skip_closed_issues: true },
   bot_identity: "",
 };
@@ -180,6 +186,10 @@ export function readConfigTemplate(): string {
     `  builder: "deepseek-v4-flash-0731"`,
     `  refine: "deepseek-v4-flash-0731"`,
     `  watch: "deepseek-v4-flash-0731"`,
+    `context:`,
+    `  enabled: true`,
+    `  max_chars: 20000`,
+    `  exclude: []`,
     `safety:`,
     `  max_stuck_building: 3`,
     `  require_clean_worktree: true`,

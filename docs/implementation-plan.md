@@ -240,5 +240,7 @@ Ogni fase = branch `feat/v0.2-*` + PR su pi-board-agent (aperta a richiesta).
 - **Storie vs task sulla stessa board**: come le distinguiamo (campo `Type`? tipo item)? → domanda.
 - **Task come issue semplici o sub-issue della storia?** → domanda.
 - **Modello builder di default** (quale provider/tier)?
-- **Controllo board-agent nel container**: docker exec / comandi GitHub? (la chat resta fuori)
-- **pi headless nel container**: confermare la modalità di avvio pi senza TUI.
+- **Controllo board-agent nel container**: **B + a** — comandi via **commenti GitHub**
+  (`@board-bot status/stop/refine …`, il watchdog li interpreta) come canale primario, e
+  `docker exec` come fallback locale. (La chat Telegram corrente resta fuori dal board.)
+- **pi headless nel container**: confermato — headless con loop auto-start (entrypoint).

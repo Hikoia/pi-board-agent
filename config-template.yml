@@ -79,6 +79,15 @@ models:
   refine: "deepseek-v4-flash-0731"
   watch: "deepseek-v4-flash-0731"
 
+# ── Builder context (repo digest) ───────────────────────────────────────────
+# Deterministic markdown digest injected into every builder mission so the
+# agent starts oriented without exploring the repo (saves tokens).
+# Regenerated automatically when the git HEAD changes.
+context:
+  enabled: true
+  max_chars: 20000      # ~5K tokens
+  exclude: []           # extra paths/globs to exclude from the digest
+
 # ── Safety rails ────────────────────────────────────────────────────────────
 safety:
   # Never start a wave if more than this many cards are stuck in `building`

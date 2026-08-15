@@ -59,6 +59,7 @@ export function renderWorkflowSource(input: {
   baseBranch: string;
   tasks: BuilderTask[];
   skillName: string;       // "board-agent" — pi will load skills/board-agent/SKILL.md
+  context?: string;        // repo digest (see src/context.ts) — optional
 }): string {
   const payload = JSON.stringify({
     tasks: input.tasks,
@@ -72,13 +73,14 @@ export function renderWorkflowSource(input: {
     models: {
       builder: input.cfg.models.builder,
     },
+    context: input.context ?? null,
     skillName: input.skillName,
     planSlug: input.planSlug,
   });
 
   // The body of an agent() prompt is plain text. We embed taskKey/title/body
-  // verbatim, then instruct the subagent to load the board-agent skill and
-  // follow it step by step.
+  // verbatim, plus the repo context digest (when enabled), then instruct the
+  // subagent to load the board-agent skill and follow it step by step.
   return `
 export const meta = {
   name: 'board-agent-wave-${input.planSlug}',
@@ -108,6 +110,7 @@ const results = await parallel(
       t.body,
       '----8<----',
       '',
+      ...(PAYLOAD.context ? ['', 'REPO CONTEXT (use this instead of exploring the whole repo):', '----8<----', PAYLOAD.context, '----8<----', ''] : []),
       'Procedure (follow EXACTLY):',
       '',
       '1. Read the board-agent skill (skills/board-agent/SKILL.md) for full details.',
