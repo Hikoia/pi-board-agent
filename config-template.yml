@@ -23,7 +23,7 @@ columns:
   needs_design: "Needs Design"
   backlog: "Backlog"
 status_field: "Status"
-type_field: "Type"
+type_field: "Kind"
 
 # ── Plan grouping ───────────────────────────────────────────────────────────
 # Cards are grouped into "plans" by the value of `plan_field` on the project.

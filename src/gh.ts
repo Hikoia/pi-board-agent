@@ -84,7 +84,8 @@ async function graphql<T = unknown>(query: string, variables: Record<string, unk
   const args = ["api", "graphql", "-f", `query=${query}`];
   for (const [k, v] of Object.entries(variables)) {
     if (typeof v === "number") args.push("-F", `${k}=${v}`);
-    else args.push("-f", `${k}=${String(v)}`);
+    else if (typeof v === "string") args.push("-f", `${k}=${v}`);
+    else args.push("-F", `${k}=${JSON.stringify(v)}`); // objects/arrays → typed JSON
   }
   const out = await runGh(args);
   const parsed = JSON.parse(out);
@@ -176,9 +177,11 @@ function resolveFields(
   };
   if (planFieldName) {
     const plan = fields.find((f) => f.name.toLowerCase() === planFieldName.toLowerCase());
-    if (plan?.options) {
+    if (plan) {
       meta.planFieldId = plan.id;
-      meta.planOptions = Object.fromEntries(plan.options.map((o) => [o.name, o.id]));
+      if (plan.options) {
+        meta.planOptions = Object.fromEntries(plan.options.map((o) => [o.name, o.id]));
+      }
     }
   }
   if (typeFieldName) {
@@ -214,6 +217,10 @@ export async function listCards(projectId: string, statusFieldName: string, plan
                       name
                       field { ... on ProjectV2SingleSelectField { name } }
                     }
+                    ... on ProjectV2ItemFieldTextValue {
+                      text
+                      field { ... on ProjectV2Field { name } }
+                    }
                   }
                 }
                 content {
@@ -246,7 +253,10 @@ export async function listCards(projectId: string, statusFieldName: string, plan
     for (const item of items.nodes) {
       const fieldByName = new Map<string, string>();
       for (const fv of item.fieldValues.nodes) {
-        if (fv?.field?.name && fv.name) fieldByName.set(fv.field.name.toLowerCase(), fv.name);
+        const fname = fv?.field?.name;
+        if (!fname) continue;
+        if (typeof fv.name === "string") fieldByName.set(fname.toLowerCase(), fv.name);
+        else if (typeof fv.text === "string") fieldByName.set(fname.toLowerCase(), fv.text);
       }
       const c = item.content ?? {};
       cards.push({
@@ -459,12 +469,18 @@ export async function ensureStandardFields(
     const found = fields.find((f) => f.name.toLowerCase() === spec.name.toLowerCase());
     if (found) {
       existing.push(spec.name);
-      // Ensure single-select options exist (add missing ones).
+      // Missing options on an existing single-select field? updateProjectV2Field
+      // replaces the whole options list — set it to the desired union.
       if (spec.kind === "single" && spec.options && found.options) {
-        for (const opt of spec.options) {
-          if (!found.options.some((o) => o.name.toLowerCase() === opt.toLowerCase())) {
-            await addFieldOption(found.id, opt);
-          }
+        // updateProjectV2Field REPLACES the option list: apply the standard
+        // exactly (no leftovers from previous setups).
+        const desired = spec.options.map((o) => o.toLowerCase()).sort().join("|");
+        const current = found.options.map((o) => o.name.toLowerCase()).sort().join("|");
+        if (desired !== current) {
+          await updateFieldOptions(
+            found.id,
+            spec.options.map((name, i) => ({ name, color: fieldColor(spec, i) })),
+          );
         }
       }
       continue;
@@ -472,7 +488,12 @@ export async function ensureStandardFields(
     const fieldId = await createField(meta.projectId, spec);
     created.push(spec.name);
     if (spec.kind === "single" && spec.options) {
-      for (const opt of spec.options) await addFieldOption(fieldId, opt);
+      // GitHub has no createProjectV2FieldOption mutation: options are only set
+      // via updateProjectV2Field(singleSelectOptions).
+      await updateFieldOptions(
+        fieldId,
+        spec.options.map((name, i) => ({ name, color: fieldColor(spec, i) })),
+      );
     }
   }
 
@@ -496,26 +517,68 @@ async function listProjectFields(projectId: string): Promise<Array<{ id: string;
   return data?.node?.fields?.nodes ?? [];
 }
 
+/** Create a field. SINGLE_SELECT requires its options at creation time
+ * (inlined as GraphQL literals — the gh CLI does not parse complex -F
+ * variables). Existing fields instead get missing options via
+ * updateProjectV2Field. */
 async function createField(projectId: string, spec: StandardFieldSpec): Promise<string> {
   const dataType = spec.kind === "single" ? "SINGLE_SELECT" : "TEXT";
+  if (spec.kind === "single") {
+    if (!spec.options || spec.options.length === 0) {
+      throw new Error(`Single-select field '${spec.name}' needs at least one option.`);
+    }
+    const literals = spec.options
+      .map((name, i) => `{ name: ${JSON.stringify(name)}, color: ${fieldColor(spec, i)}, description: "" }`)
+      .join(", ");
+    const mutation = `
+      mutation($projectId: ID!, $name: String!) {
+        createProjectV2Field(input: {
+          projectId: $projectId
+          name: $name
+          dataType: SINGLE_SELECT
+          singleSelectOptions: [${literals}]
+        }) {
+          projectV2Field { ... on ProjectV2SingleSelectField { id } }
+        }
+      }`;
+    const data = await graphql<any>(mutation, { projectId, name: spec.name });
+    return data?.createProjectV2Field?.projectV2Field?.id;
+  }
   const mutation = `
     mutation($projectId: ID!, $name: String!, $dataType: ProjectV2CustomFieldType!) {
       createProjectV2Field(input: { projectId: $projectId, name: $name, dataType: $dataType }) {
-        projectV2Field { ... on ProjectV2SingleSelectField { id } ... on ProjectV2Field { id } }
+        projectV2Field { ... on ProjectV2Field { id } }
       }
     }`;
   const data = await graphql<any>(mutation, { projectId, name: spec.name, dataType });
   return data?.createProjectV2Field?.projectV2Field?.id;
 }
 
-async function addFieldOption(fieldId: string, name: string, color = "GRAY"): Promise<void> {
+function fieldColor(spec: StandardFieldSpec, i: number): string {
+  const palette = ["GRAY", "BLUE", "YELLOW", "ORANGE", "PURPLE", "GREEN", "PINK", "RED"];
+  return spec.colors?.[i] ?? palette[i % palette.length];
+}
+
+/** Replace (or set for the first time) the options of a single-select field.
+ * Options are inlined as GraphQL literals: the gh CLI does not parse complex
+ * -F variables (arrays/objects), so variables are avoided here. */
+async function updateFieldOptions(
+  fieldId: string,
+  options: Array<{ name: string; color: string }>,
+): Promise<void> {
+  const literals = options
+    .map((o) => `{ name: ${JSON.stringify(o.name)}, color: ${o.color}, description: \"\" }`)
+    .join(", ");
   const mutation = `
-    mutation($fieldId: ID!, $name: String!, $color: ProjectV2FieldColor!) {
-      createProjectV2FieldOption(input: { fieldId: $fieldId, name: $name, color: $color }) {
-        field { ... on ProjectV2SingleSelectField { id } }
+    mutation($fieldId: ID!) {
+      updateProjectV2Field(input: {
+        fieldId: $fieldId
+        singleSelectOptions: [${literals}]
+      }) {
+        projectV2Field { ... on ProjectV2SingleSelectField { id } }
       }
     }`;
-  await graphql(mutation, { fieldId, name, color });
+  await graphql(mutation, { fieldId });
 }
 
 async function createBoardView(projectId: string, name: string, groupByFieldId: string): Promise<void> {
@@ -586,12 +649,12 @@ export async function createIssue(opts: {
 export async function addIssueToProject(projectId: string, contentId: string): Promise<string> {
   const mutation = `
     mutation($projectId: ID!, $contentId: ID!) {
-      addProjectV2ItemByContentId(input: { projectId: $projectId, contentId: $contentId }) {
+      addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
         item { id }
       }
     }`;
   const data = await graphql<any>(mutation, { projectId, contentId });
-  return data?.addProjectV2ItemByContentId?.item?.id;
+  return data?.addProjectV2ItemById?.item?.id;
 }
 
 /** Post a comment on an issue. Returns the comment node id. */
