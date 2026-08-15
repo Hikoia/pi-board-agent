@@ -58,16 +58,38 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`gh user: ${login} ✓`, "info");
 
         try {
-          await getProjectMetadata(cfg.project.owner || login, cfg.project.number, cfg.status_field, cfg.plan_field);
+          await getProjectMetadata(cfg.project.owner || login, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
           ctx.ui.notify(`Project #${cfg.project.number}: accessible ✓`, "info");
         } catch (err: any) {
           const { owner } = resolveOwner(cfg, cwd);
-          await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field);
+          await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
           ctx.ui.notify(`Project #${cfg.project.number} (owner ${owner}): accessible ✓`, "info");
         }
         ctx.ui.notify("All checks passed.", "info");
       } catch (err: any) {
         ctx.ui.notify(`Lint failed: ${err.message}`, "error");
+      }
+    },
+  });
+
+  // ----------- /board-agent init-project -----------
+  pi.registerCommand("board-agent init-project", {
+    description: "Initialize the GitHub Project with the standard board (columns, Type, Plan, Board view)",
+    handler: async (_args, ctx) => {
+      try {
+        const cwd = ctx.cwd;
+        const cfg = loadConfig(cwd);
+        validateConfig(cfg);
+        const { owner, repoName } = resolveOwner(cfg, cwd);
+        const { initProject } = await import("./init-project.js");
+        const res = await initProject(owner, cfg.project.number, cfg);
+        const created = res.created.length ? `creati: ${res.created.join(", ")}` : "nessuno (già presenti)";
+        ctx.ui.notify(
+          `Project #${cfg.project.number} (${owner}/${repoName}) — campi ${created}; vista "${res.view}" pronta.`,
+          "info",
+        );
+      } catch (err: any) {
+        ctx.ui.notify(`init-project failed: ${err.message}`, "error");
       }
     },
   });
@@ -107,9 +129,9 @@ export default function (pi: ExtensionAPI) {
         validateConfig(cfg);
         const { owner, repoName } = resolveOwner(cfg, cwd);
         const login = await whoami();
-        const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field);
+        const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
         const { listCards } = await import("./gh.js");
-        const cards = await listCards(meta.projectId, cfg.status_field, cfg.plan_field);
+        const cards = await listCards(meta.projectId, cfg.status_field, cfg.plan_field, cfg.type_field);
         const { summarizePlans } = await import("./plan.js");
         const plans = summarizePlans(cfg, cards);
 
@@ -149,7 +171,7 @@ export default function (pi: ExtensionAPI) {
         const { owner, repoName } = resolveOwner(cfg, cwd);
 
         const botLogin = cfg.bot_identity || (await whoami());
-        const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field);
+        const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
 
         // Check that board-agent skill is discoverable.
         // It ships with the package; pi should have it loaded already via

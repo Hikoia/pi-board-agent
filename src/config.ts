@@ -11,9 +11,10 @@ import { parse as parseYaml } from "yaml";
 
 export interface Config {
   project: { owner: string; number: number };
-  columns: { ready: string; building: string; review: string; done: string };
+  columns: { ready: string; building: string; review: string; done: string; needs_design: string; backlog: string };
   status_field: string;
   plan_field: string;
+  type_field: string;
   max_workers: number;
   tick_seconds: number;
   branches: { base: string; plan_prefix: string; task_prefix: string };
@@ -36,6 +37,11 @@ export interface Config {
     max_chars: number; // digest size cap (~4 chars/token → 20000 ≈ 5K tokens)
     exclude: string[]; // extra paths/globs to exclude from the digest
   };
+  refine: {
+    enabled: boolean; // story → refine → sub-issue tasks
+    timeout_ms: number; // per-refine agent timeout
+    max_tasks: number; // safety cap on tasks created per story
+  };
   safety: {
     max_stuck_building: number;
     require_clean_worktree: boolean;
@@ -46,9 +52,10 @@ export interface Config {
 
 const DEFAULTS: Config = {
   project: { owner: "", number: 0 },
-  columns: { ready: "Ready", building: "Building", review: "Review", done: "Done" },
+  columns: { ready: "Ready", building: "In Progress", review: "Review", done: "Done", needs_design: "Needs Design", backlog: "Backlog" },
   status_field: "Status",
   plan_field: "Plan",
+  type_field: "Type",
   max_workers: 2,
   tick_seconds: 90,
   branches: { base: "main", plan_prefix: "plan/", task_prefix: "task/" },
@@ -62,6 +69,7 @@ const DEFAULTS: Config = {
     watch: "deepseek-v4-flash-0731",
   },
   context: { enabled: true, max_chars: 20000, exclude: [] },
+  refine: { enabled: true, timeout_ms: 240000, max_tasks: 12 },
   safety: { max_stuck_building: 3, require_clean_worktree: true, skip_closed_issues: true },
   bot_identity: "",
 };
@@ -108,6 +116,9 @@ export function validateConfig(cfg: Config): void {
   }
   if (!cfg.columns.ready || !cfg.columns.building || !cfg.columns.review || !cfg.columns.done) {
     throw new ConfigError("config.columns.{ready,building,review,done} must all be set.");
+  }
+  if (!cfg.columns.needs_design) {
+    throw new ConfigError("config.columns.needs_design must be set.");
   }
   if (cfg.task_merge_strategy !== "squash" && cfg.task_merge_strategy !== "merge") {
     throw new ConfigError("config.task_merge_strategy must be 'squash' or 'merge'.");
@@ -165,11 +176,14 @@ export function readConfigTemplate(): string {
     `  number: 0`,
     `columns:`,
     `  ready: "Ready"`,
-    `  building: "Building"`,
+    `  building: "In Progress"`,
     `  review: "Review"`,
     `  done: "Done"`,
+    `  needs_design: "Needs Design"`,
+    `  backlog: "Backlog"`,
     `status_field: "Status"`,
     `plan_field: "Plan"`,
+    `type_field: "Type"`,
     `max_workers: 2`,
     `tick_seconds: 90`,
     `branches:`,
@@ -190,6 +204,10 @@ export function readConfigTemplate(): string {
     `  enabled: true`,
     `  max_chars: 20000`,
     `  exclude: []`,
+    `refine:`,
+    `  enabled: true`,
+    `  timeout_ms: 240000`,
+    `  max_tasks: 12`,
     `safety:`,
     `  max_stuck_building: 3`,
     `  require_clean_worktree: true`,

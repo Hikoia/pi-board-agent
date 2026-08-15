@@ -25,6 +25,8 @@ export interface Card {
   status?: string;
   /** Current Plan option name (e.g. "001-auth"). */
   plan?: string;
+  /** Current Type option name ("Story" | "Task"), when a Type field exists. */
+  type?: string;
   /** Current assignees (logins). Empty array if none. */
   assignees: string[];
   /** True when the underlying issue/PR is closed. */
@@ -42,6 +44,8 @@ export interface ProjectMetadata {
   statusOptions: Record<string, string>; // name -> optionId
   planFieldId?: string;
   planOptions?: Record<string, string>;  // name -> optionId
+  typeFieldId?: string;
+  typeOptions?: Record<string, string>;  // name -> optionId
 }
 
 class GhError extends Error {
@@ -102,6 +106,7 @@ export async function getProjectMetadata(
   number: number,
   statusFieldName: string,
   planFieldName?: string,
+  typeFieldName?: string,
 ): Promise<ProjectMetadata> {
   // Try as user first; fall back to organization.
   const tryUser = await tryProject(owner, number, "user");
@@ -109,7 +114,7 @@ export async function getProjectMetadata(
   if (!meta) {
     throw new Error(`Project #${number} not found for owner '${owner}' (tried user + org).`);
   }
-  return resolveFields(meta.projectId, meta.fields, statusFieldName, planFieldName);
+  return resolveFields(meta.projectId, meta.fields, statusFieldName, planFieldName, typeFieldName);
 }
 
 interface RawProject {
@@ -158,6 +163,7 @@ function resolveFields(
   fields: RawProject["fields"],
   statusFieldName: string,
   planFieldName?: string,
+  typeFieldName?: string,
 ): ProjectMetadata {
   const status = fields.find((f) => f.name.toLowerCase() === statusFieldName.toLowerCase());
   if (!status || !status.options) {
@@ -175,6 +181,13 @@ function resolveFields(
       meta.planOptions = Object.fromEntries(plan.options.map((o) => [o.name, o.id]));
     }
   }
+  if (typeFieldName) {
+    const type = fields.find((f) => f.name.toLowerCase() === typeFieldName.toLowerCase());
+    if (type?.options) {
+      meta.typeFieldId = type.id;
+      meta.typeOptions = Object.fromEntries(type.options.map((o) => [o.name, o.id]));
+    }
+  }
   return meta;
 }
 
@@ -182,7 +195,7 @@ function resolveFields(
  * List all cards in the project, hydrated with status, plan, assignees,
  * issue body and closed-state.
  */
-export async function listCards(projectId: string, statusFieldName: string, planFieldName?: string): Promise<Card[]> {
+export async function listCards(projectId: string, statusFieldName: string, planFieldName?: string, typeFieldName?: string): Promise<Card[]> {
   const cards: Card[] = [];
   let cursor: string | null = null;
   // eslint-disable-next-line no-constant-condition
@@ -243,6 +256,7 @@ export async function listCards(projectId: string, statusFieldName: string, plan
         body: c.body ?? "",
         status: fieldByName.get(statusFieldName.toLowerCase()),
         plan: planFieldName ? fieldByName.get(planFieldName.toLowerCase()) : undefined,
+        type: typeFieldName ? fieldByName.get(typeFieldName.toLowerCase()) : undefined,
         assignees: (c.assignees?.nodes ?? []).map((a: any) => a.login),
         closed: !!c.closed,
         url: c.url,
@@ -258,8 +272,19 @@ export async function listCards(projectId: string, statusFieldName: string, plan
 
 /** Move a card to a different Status option. No-op if the option is unknown. */
 export async function setStatus(meta: ProjectMetadata, itemId: string, statusName: string): Promise<void> {
-  const optionId = meta.statusOptions[statusName] ?? findCaseInsensitive(meta.statusOptions, statusName);
-  if (!optionId) throw new Error(`Status option '${statusName}' not found on project.`);
+  await setSingleSelect(meta, itemId, meta.statusFieldId, statusName, meta.statusOptions);
+}
+
+/** Set a single-select field value on an item (generic). */
+export async function setSingleSelect(
+  meta: ProjectMetadata,
+  itemId: string,
+  fieldId: string,
+  optionName: string,
+  options: Record<string, string>,
+): Promise<void> {
+  const optionId = options[optionName] ?? findCaseInsensitive(options, optionName);
+  if (!optionId) throw new Error(`Option '${optionName}' not found on field.`);
   const mutation = `
     mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
       updateProjectV2ItemFieldValue(input: {
@@ -272,9 +297,28 @@ export async function setStatus(meta: ProjectMetadata, itemId: string, statusNam
   await graphql(mutation, {
     projectId: meta.projectId,
     itemId,
-    fieldId: meta.statusFieldId,
+    fieldId,
     optionId,
   });
+}
+
+/** Set a text field value on an item (generic). */
+export async function setTextField(
+  meta: ProjectMetadata,
+  itemId: string,
+  fieldId: string,
+  text: string,
+): Promise<void> {
+  const mutation = `
+    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+      updateProjectV2ItemFieldValue(input: {
+        projectId: $projectId
+        itemId: $itemId
+        fieldId: $fieldId
+        value: { text: $text }
+      }) { projectV2Item { id } }
+    }`;
+  await graphql(mutation, { projectId: meta.projectId, itemId, fieldId, text });
 }
 
 function findCaseInsensitive(map: Record<string, string>, key: string): string | undefined {
@@ -388,3 +432,219 @@ export async function findPr(repoOwner: string, repoName: string, headBranch: st
 }
 
 export { runGh as _runGh, graphql as _graphql };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase C — project standard, issues/sub-issues, comments, field values
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface StandardFieldSpec {
+  name: string;
+  kind: "single" | "text";
+  options?: string[];
+  colors?: string[];
+}
+
+/** Create (if missing) the standard fields + options + a Board view. */
+export async function ensureStandardFields(
+  meta: ProjectMetadata,
+  specs: StandardFieldSpec[],
+  viewName: string,
+): Promise<{ created: string[]; existing: string[] }> {
+  const created: string[] = [];
+  const existing: string[] = [];
+  // Re-fetch all project fields (the metadata only carries status/plan/type).
+  const fields = await listProjectFields(meta.projectId);
+
+  for (const spec of specs) {
+    const found = fields.find((f) => f.name.toLowerCase() === spec.name.toLowerCase());
+    if (found) {
+      existing.push(spec.name);
+      // Ensure single-select options exist (add missing ones).
+      if (spec.kind === "single" && spec.options && found.options) {
+        for (const opt of spec.options) {
+          if (!found.options.some((o) => o.name.toLowerCase() === opt.toLowerCase())) {
+            await addFieldOption(found.id, opt);
+          }
+        }
+      }
+      continue;
+    }
+    const fieldId = await createField(meta.projectId, spec);
+    created.push(spec.name);
+    if (spec.kind === "single" && spec.options) {
+      for (const opt of spec.options) await addFieldOption(fieldId, opt);
+    }
+  }
+
+  // Board view grouped by Status (if a status field exists).
+  try {
+    await createBoardView(meta.projectId, viewName, meta.statusFieldId);
+  } catch {
+    // view creation is best-effort
+  }
+  return { created, existing };
+}
+
+async function listProjectFields(projectId: string): Promise<Array<{ id: string; name: string; options?: Array<{ id: string; name: string }> }>> {
+  const query = `
+    query($projectId: ID!) {
+      node(id: $projectId) {
+        ... on ProjectV2 { fields(first: 100) { nodes { ... on ProjectV2SingleSelectField { id name options { id name } } ... on ProjectV2Field { id name } } } }
+      }
+    }`;
+  const data = await graphql<any>(query, { projectId });
+  return data?.node?.fields?.nodes ?? [];
+}
+
+async function createField(projectId: string, spec: StandardFieldSpec): Promise<string> {
+  const dataType = spec.kind === "single" ? "SINGLE_SELECT" : "TEXT";
+  const mutation = `
+    mutation($projectId: ID!, $name: String!, $dataType: ProjectV2CustomFieldType!) {
+      createProjectV2Field(input: { projectId: $projectId, name: $name, dataType: $dataType }) {
+        projectV2Field { ... on ProjectV2SingleSelectField { id } ... on ProjectV2Field { id } }
+      }
+    }`;
+  const data = await graphql<any>(mutation, { projectId, name: spec.name, dataType });
+  return data?.createProjectV2Field?.projectV2Field?.id;
+}
+
+async function addFieldOption(fieldId: string, name: string, color = "GRAY"): Promise<void> {
+  const mutation = `
+    mutation($fieldId: ID!, $name: String!, $color: ProjectV2FieldColor!) {
+      createProjectV2FieldOption(input: { fieldId: $fieldId, name: $name, color: $color }) {
+        field { ... on ProjectV2SingleSelectField { id } }
+      }
+    }`;
+  await graphql(mutation, { fieldId, name, color });
+}
+
+async function createBoardView(projectId: string, name: string, groupByFieldId: string): Promise<void> {
+  const mutation = `
+    mutation($projectId: ID!, $name: String!, $layout: ProjectV2ViewLayout!, $groupBy: [ID!]!) {
+      createProjectV2View(input: { projectId: $projectId, name: $name, layout: $layout, groupBy: $groupBy }) {
+        projectV2View { id name }
+      }
+    }`;
+  await graphql(mutation, { projectId, name, layout: "BOARD_LAYOUT", groupBy: [groupByFieldId] });
+}
+
+/** Resolve repository node id from owner/name. */
+export async function resolveRepositoryId(repoOwner: string, repoName: string): Promise<string> {
+  const query = `
+    query($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) { id }
+    }`;
+  const data = await graphql<any>(query, { owner: repoOwner, name: repoName });
+  return data?.repository?.id;
+}
+
+/** Resolve issue node id from owner/name/number. */
+export async function resolveIssueId(repoOwner: string, repoName: string, number: number): Promise<string> {
+  const query = `
+    query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) { issue(number: $number) { id } }
+    }`;
+  const data = await graphql<any>(query, { owner: repoOwner, name: repoName, number });
+  return data?.repository?.issue?.id;
+}
+
+/** Create an issue; when parentId is given, it becomes a sub-issue of it. */
+export async function createIssue(opts: {
+  repoOwner: string;
+  repoName: string;
+  title: string;
+  body: string;
+  parentIssueId?: string;
+}): Promise<{ number: number; id: string; url: string }> {
+  const repoId = await resolveRepositoryId(opts.repoOwner, opts.repoName);
+  const mutation = `
+    mutation($repoId: ID!, $title: String!, $body: String!, $parentId: ID) {
+      createIssue(input: { repositoryId: $repoId, title: $title, body: $body, issueId: $parentId }) {
+        issue { number id url }
+      }
+    }`;
+  const data = await graphql<any>(mutation, {
+    repoId,
+    title: opts.title,
+    body: opts.body,
+    ...(opts.parentIssueId ? { parentId: opts.parentIssueId } : {}),
+  });
+  const issue = data?.createIssue?.issue;
+  if (!issue) throw new Error("createIssue failed (empty response).");
+  return { number: issue.number, id: issue.id, url: issue.url };
+}
+
+/** Add an existing issue/PR to the project as an item. */
+export async function addIssueToProject(projectId: string, contentId: string): Promise<string> {
+  const mutation = `
+    mutation($projectId: ID!, $contentId: ID!) {
+      addProjectV2ItemByContentId(input: { projectId: $projectId, contentId: $contentId }) {
+        item { id }
+      }
+    }`;
+  const data = await graphql<any>(mutation, { projectId, contentId });
+  return data?.addProjectV2ItemByContentId?.item?.id;
+}
+
+/** Post a comment on an issue. Returns the comment node id. */
+export async function createComment(issueId: string, body: string): Promise<string | undefined> {
+  const mutation = `
+    mutation($issueId: ID!, $body: String!) {
+      addComment(input: { subjectId: $issueId, body: $body }) { commentEdge { node { id } } }
+    }`;
+  const data = await graphql<any>(mutation, { issueId, body });
+  return data?.addComment?.commentEdge?.node?.id;
+}
+
+export interface IssueComment {
+  id: string;
+  body: string;
+  createdAt: string;
+  author?: string;
+}
+
+/** List comments of an issue (ascending). */
+export async function listIssueComments(
+  repoOwner: string,
+  repoName: string,
+  number: number,
+): Promise<IssueComment[]> {
+  const query = `
+    query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        issue(number: $number) {
+          comments(first: 50, orderBy: { field: CREATED_AT, direction: ASC }) {
+            nodes { id body createdAt author { login } }
+          }
+        }
+      }
+    }`;
+  const data = await graphql<any>(query, { owner: repoOwner, name: repoName, number });
+  return (data?.repository?.issue?.comments?.nodes ?? []).map((n: any) => ({
+    id: n.id,
+    body: n.body,
+    createdAt: n.createdAt,
+    author: n.author?.login,
+  }));
+}
+
+/** True when an open PR for headBranch exists AND is merged. */
+export async function isPrMerged(
+  repoOwner: string,
+  repoName: string,
+  headBranch: string,
+): Promise<boolean> {
+  try {
+    const out = await runGh([
+      "pr", "view",
+      "--repo", `${repoOwner}/${repoName}`,
+      "--head", headBranch,
+      "--json", "state,mergedAt",
+      "--jq", ".state + \"|\" + (.mergedAt // \"\")",
+    ]);
+    const [state] = out.trim().split("|");
+    return state === "MERGED";
+  } catch {
+    return false;
+  }
+}

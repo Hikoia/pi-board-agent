@@ -17,10 +17,13 @@ project:
 # exactly (case-insensitive).
 columns:
   ready: "Ready"
-  building: "Building"
+  building: "In Progress"
   review: "Review"
   done: "Done"
+  needs_design: "Needs Design"
+  backlog: "Backlog"
 status_field: "Status"
+type_field: "Type"
 
 # ── Plan grouping ───────────────────────────────────────────────────────────
 # Cards are grouped into "plans" by the value of `plan_field` on the project.
@@ -87,6 +90,15 @@ context:
   enabled: true
   max_chars: 20000      # ~5K tokens
   exclude: []           # extra paths/globs to exclude from the digest
+
+# ── Refine phase (stories → tasks) ─────────────────────────────────────────
+# Story cards (Type=Story) in Ready are refined with one cheap-model pass;
+# if open questions remain the story goes to Needs Design and waits for
+# human answers on the linked issue, otherwise sub-issue tasks are created.
+refine:
+  enabled: true
+  timeout_ms: 240000    # per-refine agent timeout
+  max_tasks: 12         # safety cap on tasks created per story
 
 # ── Safety rails ────────────────────────────────────────────────────────────
 safety:

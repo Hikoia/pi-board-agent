@@ -113,7 +113,7 @@ const cards = [
   { itemId: "2", title: "T002", body: "", status: "Done", plan: "001-auth", assignees: [""], closed: false },
   { itemId: "3", title: "T003", body: "", status: "Ready", plan: "001-auth", assignees: [""], closed: false },
   { itemId: "4", title: "T004", body: "", status: "Ready", plan: "002-dashboard", assignees: [""], closed: false },
-  { itemId: "5", title: "T005", body: "", status: "Building", plan: "002-dashboard", assignees: [""], closed: false },
+  { itemId: "5", title: "T005", body: "", status: "In Progress", plan: "002-dashboard", assignees: [""], closed: false },
 ];
 const plans = summarizePlans(cfg, cards as any);
 if (plans.size === 2) console.log("PASS: 2 plans detected");
@@ -195,7 +195,7 @@ execSync("git init && git config user.email t@t && git config user.name t && git
 const state = createLoopState();
 const deps: LoopDeps = {
   cwd, cfg, repoOwner: "test", repoName: "repo", botLogin: "bot",
-  meta: { projectId: "P", statusFieldId: "S", statusOptions: { Ready: "o1", Building: "o2", Review: "o3", Done: "o4" } },
+  meta: { projectId: "P", statusFieldId: "S", statusOptions: { Ready: "o1", "In Progress": "o2", Review: "o3", Done: "o4" } },
   callback: (msg) => void(0),
   dxRun: async () => "run-1",
   dxResult: async () => [{ taskKey: "T001", itemId: "c1", status: "success", branch: "t", commits: 1, summary: "ok" }],
@@ -323,3 +323,61 @@ if ((FAIL > 0)); then
 else
   echo "pi-board-agent: ALL CHECKS PASSED (${PASS}/$((PASS+FAIL)))"
 fi
+
+# ---- 7. Refine phase (Phase C) ----
+echo "--- refine ---"
+
+cat > "$GEN_DIR/test-refine.ts" <<'ENDTS'
+import { parseRefineOutput, renderRefineWorkflowSource, renderRefineComment, renderQuestionsComment, type RefineOutput } from "../../src/refine.js";
+
+// 1) parseRefineOutput: happy path
+const good = {
+  goal: "Add password reset",
+  impactedAreas: ["src/auth"],
+  decisions: ["use Clerk API"],
+  risks: ["rate limit"],
+  openQuestions: [],
+  tasks: [{ title: "Add form", acceptanceCriteria: ["validates email", "sends link"] }],
+};
+const parsed = parseRefineOutput(good);
+if (parsed && parsed.tasks.length === 1 && parsed.tasks[0].acceptanceCriteria.length === 2) console.log("PASS: parseRefineOutput happy path");
+else console.log("FAIL: parseRefineOutput happy path");
+
+// 2) parseRefineOutput: defensive
+if (parseRefineOutput(null) === null) console.log("PASS: parse null -> null");
+else console.log("FAIL: parse null -> null");
+if (parseRefineOutput({ goal: "x", tasks: "nope" }) && parseRefineOutput({ goal: "x", tasks: "nope" })!.tasks.length === 0) console.log("PASS: parse bad tasks -> []");
+else console.log("FAIL: parse bad tasks -> []");
+if (parseRefineOutput({ goal: 42 }) === null) console.log("PASS: parse non-string goal -> null");
+else console.log("FAIL: parse non-string goal -> null");
+
+// 3) cap tasks at 12
+const many = { goal: "g", impactedAreas: [], decisions: [], risks: [], openQuestions: [], tasks: Array.from({ length: 20 }, (_, i) => ({ title: `t${i}`, acceptanceCriteria: ["a"] })) };
+const capped = parseRefineOutput(many)!;
+if (capped.tasks.length === 12) console.log("PASS: parse caps tasks at 12");
+else console.log("FAIL: parse caps tasks at 12");
+
+// 4) refine workflow script embeds story + context + model
+const script = renderRefineWorkflowSource({
+  cwd: process.cwd(),
+  storyTitle: "Add password reset",
+  storyBody: "Users need to reset their password",
+  extraContext: "",
+  contextDigest: "## Repo tree\n- src/auth",
+  model: "deepseek-v4-flash-0731",
+  timeoutMs: 240000,
+});
+if (script.includes("Add password reset") && script.includes("## Repo tree") && script.includes("deepseek-v4-flash-0731") && script.includes("openQuestions")) console.log("PASS: refine workflow embeds story/context/model/schema");
+else console.log("FAIL: refine workflow embeds story/context/model/schema");
+
+// 5) comments renderers
+const refine: RefineOutput = { goal: "g", impactedAreas: [], decisions: ["d1"], risks: [], openQuestions: ["q1?", "q2?"], tasks: [] };
+const qc = renderQuestionsComment("001-auth", refine);
+if (qc.includes("Needs Design") && qc.includes("1. q1?") && qc.includes("2. q2?")) console.log("PASS: questions comment lists open questions");
+else console.log("FAIL: questions comment lists open questions");
+const rc = renderRefineComment("001-auth", { ...refine, openQuestions: [] }, [{ number: 12, url: "http://x/12", taskKey: "T001" }]);
+if (rc.includes("T001") && rc.includes("#12")) console.log("PASS: refine comment lists created tasks");
+else console.log("FAIL: refine comment lists created tasks");
+ENDTS
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-refine.ts"
+echo

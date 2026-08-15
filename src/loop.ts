@@ -27,6 +27,16 @@ import { Inflight } from "./inflight.js";
 import { summarizePlans, isPlanComplete, openPlanPr } from "./plan.js";
 import { buildTasksForWave, renderWorkflowSource, type BuilderTask } from "./workflow-prompt.js";
 import { isClean, ensurePlanBranch } from "./git-helpers.js";
+import { planSlug } from "./config.js";
+import {
+  runRefine,
+  createTasksFromRefine,
+  RefineStateStore,
+  renderRefineComment,
+  renderQuestionsComment,
+  type RefineOutput,
+} from "./refine.js";
+import { listIssueComments, createComment, isPrMerged } from "./gh.js";
 
 export type StatusCallback = (msg: string, level?: "info" | "warn" | "error") => void;
 
@@ -110,7 +120,7 @@ export class BoardLoop {
     this.busy = true;
     try {
       const { cfg, callback, repoOwner, repoName, meta } = this.deps;
-      const cards = await listCards(meta.projectId, cfg.status_field, cfg.plan_field);
+      const cards = await listCards(meta.projectId, cfg.status_field, cfg.plan_field, cfg.type_field);
       if (cards.length === 0) {
         callback("No cards on the board yet.");
         return;
@@ -132,6 +142,11 @@ export class BoardLoop {
       if (cfg.safety.require_clean_worktree && !isClean(this.deps.cwd)) {
         callback("Working tree is dirty. Skipping tick.", "warn");
         return;
+      }
+
+      // --- Stories: refine Ready stories / re-refine Needs Design / Done on merge ---
+      if (cfg.refine.enabled) {
+        await this.processStories(cards);
       }
 
       // --- Plan-level: detect completions → open PR ---
@@ -292,6 +307,184 @@ export class BoardLoop {
     } finally {
       this.busy = false;
     }
+  }
+
+  /**
+   * Story lifecycle (Phase C):
+   *  - Ready stories  → refine (1 cheap pass) → sub-issue tasks on the board,
+   *    or Needs Design if open questions remain
+   *  - Needs Design   → re-refine when the human replies on the issue thread
+   *  - In Progress    → Done when the plan PR is merged
+   */
+  private async processStories(cards: import("./gh.js").Card[]): Promise<void> {
+    const { cfg, meta, repoOwner, repoName, botLogin, callback } = this.deps;
+    const stories = cards.filter(
+      (c) => (c.type ?? "").toLowerCase() === "story",
+    );
+    if (stories.length === 0) return;
+
+    const refineState = new RefineStateStore(this.deps.cwd);
+    const readyStatus = cfg.columns.ready.toLowerCase();
+    const needsDesign = cfg.columns.needs_design.toLowerCase();
+    const inProgress = cfg.columns.building.toLowerCase();
+    const doneStatus = cfg.columns.done.toLowerCase();
+
+    const contextDigest = await this.getContextDigest();
+
+    // One story per tick (refine is sequential and can be slow).
+    const story = stories[0];
+    const status = (story.status ?? "").toLowerCase();
+    const slug = story.plan ?? "";
+    if (!slug) return;
+
+    // Needs Design: wait for human replies, then re-refine.
+    if (status === needsDesign) {
+      if (!story.number || !story.repoOwner || !story.repoName) return;
+      const state = refineState.get(story.number);
+      const comments = await listIssueComments(story.repoOwner, story.repoName, story.number).catch(() => []);
+      const lastSeen = state?.lastSeenCommentId;
+      const fresh = lastSeen
+        ? comments.filter((c) => c.id !== lastSeen)
+        : comments;
+      const humanReplies = fresh.filter((c) => c.author && c.author !== botLogin);
+      if (humanReplies.length === 0) return;
+
+      callback(`Story #${story.number} has ${humanReplies.length} new human reply/replies — re-refining…`);
+      const answers = humanReplies.map((c) => `- ${c.body}`).join("\n");
+      await this.refineStory(story, slug, contextDigest, answers, refineState, true);
+      return;
+    }
+
+    // Done when the plan PR is merged.
+    if (status === inProgress) {
+      const state = refineState.get(story.number ?? 0);
+      if (state?.refined) {
+        const merged = await isPrMerged(repoOwner, repoName, `plan/${planSlug(slug)}`);
+        if (merged) {
+          await setStatus(meta, story.itemId, cfg.columns.done).catch(() => undefined);
+          callback(`Story "${story.title}" → ${cfg.columns.done} (plan PR merged)`);
+        }
+      }
+      return;
+    }
+
+    // Ready → refine (once, guarded by the claim).
+    if (status === readyStatus) {
+      if (!story.number) {
+        callback(`Story "${story.title}" is a draft item — convert it to an issue to refine it.`, "warn");
+        return;
+      }
+      const claimed = await tryClaim(story, botLogin);
+      if (!claimed) {
+        callback(`Story "${story.title}" already claimed by someone else.`, "warn");
+        return;
+      }
+      try {
+        await setStatus(meta, story.itemId, cfg.columns.building);
+      } catch (err: any) {
+        callback(`Failed to move story to ${cfg.columns.building}: ${err.message}`, "warn");
+        await release(story, botLogin);
+        return;
+      }
+      await this.refineStory(story, slug, contextDigest, "", refineState, false);
+      await release(story, botLogin);
+    }
+  }
+
+  private async refineStory(
+    story: import("./gh.js").Card,
+    slug: string,
+    contextDigest: string,
+    extraContext: string,
+    refineState: RefineStateStore,
+    isReRefine: boolean,
+  ): Promise<void> {
+    const { cfg, meta, repoOwner, repoName, callback } = this.deps;
+    if (!story.number) return;
+    const number = story.number;
+    try {
+      const refine = await runRefine({
+        cwd: this.deps.cwd,
+        storyTitle: story.title,
+        storyBody: story.body,
+        extraContext,
+        contextDigest,
+        model: cfg.models.refine,
+        timeoutMs: cfg.refine.timeout_ms,
+      });
+
+      if (refine.openQuestions.length > 0) {
+        const questionId = await this.createCommentWithId(number, repoOwner, repoName, renderQuestionsComment(slug, refine));
+        await setStatus(meta, story.itemId, cfg.columns.needs_design).catch(() => undefined);
+        refineState.update(number, { refined: false, lastSeenCommentId: questionId });
+        callback(`Story "${story.title}" → ${cfg.columns.needs_design}: ${refine.openQuestions.length} domanda/e aperta/e.`);
+        return;
+      }
+
+      const existing = await this.countPlanTasks(slug);
+      const created = await createTasksFromRefine({
+        cfg,
+        meta,
+        repoOwner,
+        repoName,
+        storyCard: story,
+        planSlug: slug,
+        refine,
+        existingTaskCount: existing,
+        projectId: meta.projectId,
+      });
+      await this.createCommentWithId(number, repoOwner, repoName, renderRefineComment(slug, refine, created));
+      await setStatus(meta, story.itemId, cfg.columns.building).catch(() => undefined);
+      refineState.update(number, { refined: true });
+      callback(
+        `Story "${story.title}" raffinata: ${created.length} task creati (${created.map((c) => c.taskKey).join(", ")}).`,
+      );
+    } catch (err: any) {
+      // Revert to Ready so the next tick retries (or a human can inspect).
+      await setStatus(meta, story.itemId, cfg.columns.ready).catch(() => undefined);
+      await this.createCommentWithId(number, repoOwner, repoName, `❌ Refine fallito per la storia: ${err.message}`).catch(() => undefined);
+      callback(`Refine della storia "${story.title}" fallito: ${err.message}`, "error");
+    }
+  }
+
+  /** Post a comment on the story issue, returning its node id (best-effort). */
+  private async createCommentWithId(
+    issueNumber: number,
+    repoOwner: string,
+    repoName: string,
+    body: string,
+  ): Promise<string | undefined> {
+    try {
+      const { resolveIssueId } = await import("./gh.js");
+      const issueId = await resolveIssueId(repoOwner, repoName, issueNumber);
+      return await createComment(issueId, body);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async getContextDigest(): Promise<string> {
+    const { cfg } = this.deps;
+    if (!cfg.context.enabled) return "";
+    try {
+      const { generateContext } = await import("./context.js");
+      return generateContext({
+        cwd: this.deps.cwd,
+        maxChars: cfg.context.max_chars,
+        exclude: cfg.context.exclude,
+      });
+    } catch {
+      return "";
+    }
+  }
+
+  /** Count task cards already in this plan (for T-numbering). */
+  private async countPlanTasks(slug: string): Promise<number> {
+    const { cfg, meta } = this.deps;
+    const cards = await listCards(meta.projectId, cfg.status_field, cfg.plan_field, cfg.type_field).catch(() => []);
+    return cards.filter(
+      (c) => c.plan === slug && (c.type ?? "").toLowerCase() === "task",
+    ).length;
   }
 
   /**
