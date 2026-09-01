@@ -374,6 +374,14 @@ export async function release(card: Card, botLogin: string): Promise<void> {
   ]).catch(() => undefined);
 }
 
+export async function closeIssue(repoOwner: string, repoName: string, number: number): Promise<void> {
+  await runGh([
+    "issue", "close", String(number),
+    "--repo", `${repoOwner}/${repoName}`,
+    "--reason", "completed",
+  ]);
+}
+
 export interface OpenPrOptions {
   baseBranch: string;
   headBranch: string;

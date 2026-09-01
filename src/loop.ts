@@ -22,6 +22,7 @@ import {
   setStatus,
   tryClaim,
   release,
+  closeIssue,
 } from "./gh.js";
 import { Inflight } from "./inflight.js";
 import { summarizePlans, isPlanComplete, openPlanPr } from "./plan.js";
@@ -565,8 +566,9 @@ export class BoardLoop {
         });
 
         if (review.verdict === "pass") {
+          await closeIssue(card.repoOwner!, card.repoName!, card.number!);
           await setStatus(meta, card.itemId, cfg.columns.done);
-          callback(`AI review passed for "${card.title}". → ${cfg.columns.done}`);
+          callback(`AI review passed for "${card.title}". Issue closed → ${cfg.columns.done}`);
           continue;
         }
 

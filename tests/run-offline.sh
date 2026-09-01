@@ -387,6 +387,7 @@ echo
 echo "--- AI review ---"
 
 cat > "$GEN_DIR/test-review.ts" <<'ENDTS'
+import { readFileSync } from "node:fs";
 import { parseReviewOutput, renderReviewComment, renderReviewWorkflowSource } from "../../src/review.js";
 
 const pass = parseReviewOutput({ verdict: "pass", summary: "Looks good", findings: [] });
@@ -415,6 +416,18 @@ else console.log("FAIL: review workflow embeds task/model/schema");
 const comment = renderReviewComment(fail!);
 if (comment.includes("AI review") && comment.includes("src/a.ts") && comment.includes("Ready")) console.log("PASS: review failure comment");
 else console.log("FAIL: review failure comment");
+
+const loopSource = readFileSync(new URL("../../src/loop.ts", import.meta.url), "utf8");
+const passBlock = loopSource.slice(
+  loopSource.indexOf('if (review.verdict === "pass")'),
+  loopSource.indexOf('if (!card.number || !card.repoOwner || !card.repoName)', loopSource.indexOf('if (review.verdict === "pass")')),
+);
+if (passBlock.includes("await closeIssue(") && passBlock.indexOf("await closeIssue(") < passBlock.indexOf("await setStatus(")) console.log("PASS: accepted review closes issue before Done");
+else console.log("FAIL: accepted review closes issue before Done");
+
+const ghSource = readFileSync(new URL("../../src/gh.ts", import.meta.url), "utf8");
+if (ghSource.includes("export async function closeIssue") && ghSource.includes('"issue", "close"') && ghSource.includes('"--reason", "completed"')) console.log("PASS: closeIssue marks GitHub issue completed");
+else console.log("FAIL: closeIssue marks GitHub issue completed");
 ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-review.ts"
 echo
