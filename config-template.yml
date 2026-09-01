@@ -80,6 +80,7 @@ builder_retries: 1
 models:
   builder: "deepseek-v4-flash-0731"
   refine: "deepseek-v4-flash-0731"
+  review: "deepseek-v4-flash-0731"
   watch: "deepseek-v4-flash-0731"
 
 # ── Builder context (repo digest) ───────────────────────────────────────────
@@ -99,6 +100,13 @@ refine:
   enabled: true
   timeout_ms: 240000    # per-refine agent timeout
   max_tasks: 12         # safety cap on tasks created per story
+
+# ── AI review gate ──────────────────────────────────────────────────────────
+# Review cards are independently checked against their acceptance criteria.
+# PASS → Done; FAIL → a findings comment is posted and the card returns to Ready.
+review:
+  enabled: false
+  timeout_ms: 600000    # per-review agent timeout (10 min)
 
 # ── Watchdog (PR CI + mentions) ───────────────────────────────────────
 # Keeps bot-managed PRs healthy: auto-fix failing CI (max rounds, cooldown),

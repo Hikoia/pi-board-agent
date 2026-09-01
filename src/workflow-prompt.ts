@@ -116,7 +116,7 @@ const results = await parallel(
       '1. Read the board-agent skill (skills/board-agent/SKILL.md) for full details.',
       '2. Checkout the plan branch: \`git checkout ' + t.planBranch + ' && git pull --ff-only\`.',
       '3. Create your task branch off the plan branch: \`git checkout -b ' + t.taskBranch + '\`.',
-      '4. Implement the task. Add tests where applicable. Commit with a clear conventional-commit message that ends with: closes #' + (t.issueNumber ?? '<none>') + '.',
+      '4. Read the linked issue comments with \`gh issue view ' + (t.issueNumber ?? '<none>') + ' --comments\` and address any AI review findings. Then implement the task, add tests where applicable, and commit with a clear conventional-commit message that ends with: closes #' + (t.issueNumber ?? '<none>') + '.',
       '5. Push your task branch: \`git push -u origin ' + t.taskBranch + '\`.',
       '6. Merge your task branch into the plan branch. If task_merge_strategy is "squash", run:',
       '     git checkout ' + t.planBranch + ' && git pull --ff-only && git merge --squash ' + t.taskBranch + ' && git commit -m "<conventional commit closing #' + (t.issueNumber ?? '<none>') + '>"',

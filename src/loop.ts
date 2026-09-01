@@ -7,7 +7,7 @@
  *  - For each plan: detect completions → open PR
  *  - For cards in `ready`: claim, then hand them to a pi-dynamic-workflows wave
  *  - For cards in `building` past timeout: attempt recovery (re-assign)
- *  - For cards in `review` → no-op (manual approval gate)
+ *  - For cards in `review` → independent AI review when enabled
  *
  * The loop does NOT spawn subagents directly — it delegates to the
  * pi-dynamic-workflows `workflow` tool via `dx.workflow.run()`.
@@ -38,6 +38,7 @@ import {
 } from "./refine.js";
 import { listIssueComments, createComment, isPrMerged } from "./gh.js";
 import { makeNotifier } from "./notify.js";
+import { renderReviewComment, runReview } from "./review.js";
 
 export type StatusCallback = (msg: string, level?: "info" | "warn" | "error") => void;
 
@@ -171,6 +172,11 @@ export class BoardLoop {
         } catch (err: any) {
           callback(`Watchdog tick failed: ${err.message}`, "warn");
         }
+      }
+
+      // --- Review gate: independent AI review → Done or back to Ready ---
+      if (cfg.review.enabled) {
+        await this.processReviewCards(cards);
       }
 
       // --- Plan-level: detect completions → open PR ---
@@ -528,6 +534,63 @@ export class BoardLoop {
     return cards.filter(
       (c) => c.plan === slug && (c.type ?? "").toLowerCase() === "task",
     ).length;
+  }
+
+  private async processReviewCards(cards: Card[]): Promise<void> {
+    const { cfg, meta, callback } = this.deps;
+    const reviewCards = cards.filter(
+      (card) =>
+        (card.status ?? "").toLowerCase() === cfg.columns.review.toLowerCase() &&
+        card.plan &&
+        (card.type ?? "").toLowerCase() !== "story",
+    ).slice(0, cfg.max_workers);
+
+    for (const card of reviewCards) {
+      const rawPlan = card.plan;
+      if (!rawPlan || !(await tryClaim(card, this.deps.botLogin))) continue;
+      try {
+        const task = buildTasksForWave(cfg, planSlug(rawPlan), [card])[0];
+        callback(`AI reviewing task "${card.title}" on ${task.taskBranch}…`);
+        const review = await runReview({
+          cwd: this.deps.cwd,
+          taskKey: task.taskKey,
+          title: card.title,
+          body: card.body,
+          issueNumber: card.number,
+          baseBranch: cfg.branches.base,
+          planBranch: task.planBranch,
+          taskBranch: task.taskBranch,
+          model: cfg.models.review,
+          timeoutMs: cfg.review.timeout_ms,
+        });
+
+        if (review.verdict === "pass") {
+          await setStatus(meta, card.itemId, cfg.columns.done);
+          callback(`AI review passed for "${card.title}". → ${cfg.columns.done}`);
+          continue;
+        }
+
+        if (!card.number || !card.repoOwner || !card.repoName) {
+          throw new Error("Cannot post AI review findings for a draft card.");
+        }
+        const commentId = await this.createCommentWithId(
+          card.number,
+          card.repoOwner,
+          card.repoName,
+          renderReviewComment(review),
+        );
+        if (!commentId) throw new Error("Failed to post AI review findings.");
+        await setStatus(meta, card.itemId, cfg.columns.ready);
+        callback(
+          `AI review found ${review.findings.length} blocking issue(s) in "${card.title}". → ${cfg.columns.ready}`,
+          "warn",
+        );
+      } catch (err: any) {
+        callback(`AI review failed for "${card.title}": ${err.message}. Leaving in ${cfg.columns.review}.`, "warn");
+      } finally {
+        await release(card, this.deps.botLogin);
+      }
+    }
   }
 
   /**

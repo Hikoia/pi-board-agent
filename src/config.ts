@@ -30,6 +30,7 @@ export interface Config {
   models: {
     builder: string; // LLM model for builder agents (default: DeepSeek V4 Flash 0731)
     refine: string; // LLM model for the refine phase
+    review: string; // LLM model for independent code review
     watch: string; // LLM model for the watchdog
   };
   context: {
@@ -41,6 +42,10 @@ export interface Config {
     enabled: boolean; // story → refine → sub-issue tasks
     timeout_ms: number; // per-refine agent timeout
     max_tasks: number; // safety cap on tasks created per story
+  };
+  review: {
+    enabled: boolean; // Review cards → independent AI review → Done or Ready
+    timeout_ms: number; // per-review agent timeout
   };
   watchdog: {
     enabled: boolean;
@@ -82,10 +87,12 @@ const DEFAULTS: Config = {
   models: {
     builder: "deepseek-v4-flash-0731",
     refine: "deepseek-v4-flash-0731",
+    review: "deepseek-v4-flash-0731",
     watch: "deepseek-v4-flash-0731",
   },
   context: { enabled: true, max_chars: 20000, exclude: [] },
   refine: { enabled: true, timeout_ms: 240000, max_tasks: 12 },
+  review: { enabled: false, timeout_ms: 600000 },
   watchdog: {
     enabled: true,
     interval_seconds: 300,
@@ -154,6 +161,9 @@ export function validateConfig(cfg: Config): void {
   }
   if (cfg.task_merge_strategy !== "squash" && cfg.task_merge_strategy !== "merge") {
     throw new ConfigError("config.task_merge_strategy must be 'squash' or 'merge'.");
+  }
+  if (cfg.review.timeout_ms <= 0) {
+    throw new ConfigError("config.review.timeout_ms must be > 0.");
   }
 }
 
@@ -231,6 +241,7 @@ export function readConfigTemplate(): string {
     `models:`,
     `  builder: "deepseek-v4-flash-0731"`,
     `  refine: "deepseek-v4-flash-0731"`,
+    `  review: "deepseek-v4-flash-0731"`,
     `  watch: "deepseek-v4-flash-0731"`,
     `context:`,
     `  enabled: true`,
@@ -240,6 +251,9 @@ export function readConfigTemplate(): string {
     `  enabled: true`,
     `  timeout_ms: 240000`,
     `  max_tasks: 12`,
+    `review:`,
+    `  enabled: false`,
+    `  timeout_ms: 600000`,
     `watchdog:`,
     `  enabled: true`,
     `  interval_seconds: 300`,

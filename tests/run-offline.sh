@@ -53,6 +53,8 @@ if (cfg.max_workers === 2) console.log("PASS: defaults max_workers=2");
 else console.log("FAIL: defaults max_workers != 2");
 if (cfg.columns.ready === "Ready") console.log("PASS: defaults columns.ready=Ready");
 else console.log("FAIL: defaults columns.ready != Ready");
+if (!cfg.review.enabled && cfg.models.review === "deepseek-v4-flash-0731") console.log("PASS: AI review defaults disabled with model");
+else console.log("FAIL: AI review defaults");
 
 writeFileSync(resolve(dotpi, "board-agent.yml"), "max_workers: 4\ncolumns:\n  ready: Dev-Ready\n");
 const cfg2 = loadConfig(cwd);
@@ -238,7 +240,7 @@ if (normalizeWaveResults([null, { x: 1 }, { taskKey: "T3", itemId: "PVTI_c" }]).
 else console.log("FAIL: normalize skips null/malformed");
 
 // workflow-prompt: rendered script includes the configured builder model
-const cfg: Config = { ..._DEFAULTS, models: { builder: "deepseek-v4-flash-0731", refine: "deepseek-v4-flash-0731", watch: "deepseek-v4-flash-0731" } };
+const cfg: Config = { ..._DEFAULTS, models: { builder: "deepseek-v4-flash-0731", refine: "deepseek-v4-flash-0731", review: "deepseek-v4-flash-0731", watch: "deepseek-v4-flash-0731" } };
 const card = { itemId: "PVTI_x", number: 12, title: "T001 Do the thing", body: "acceptance", status: "Ready", plan: "001-auth", closed: false };
 const task = buildTasksForWave(cfg, "001-auth", [card])[0];
 const script = renderWorkflowSource({ cfg, planSlug: "001-auth", baseBranch: "main", tasks: [task], skillName: "board-agent" });
@@ -380,6 +382,43 @@ else console.log("FAIL: auto_start default false");
 ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-notify.ts"
 echo
+
+# ---- 10. AI review gate ----
+echo "--- AI review ---"
+
+cat > "$GEN_DIR/test-review.ts" <<'ENDTS'
+import { parseReviewOutput, renderReviewComment, renderReviewWorkflowSource } from "../../src/review.js";
+
+const pass = parseReviewOutput({ verdict: "pass", summary: "Looks good", findings: [] });
+if (pass?.verdict === "pass") console.log("PASS: parseReviewOutput pass");
+else console.log("FAIL: parseReviewOutput pass");
+const fail = parseReviewOutput({ verdict: "fail", summary: "Bug", findings: ["src/a.ts: missing guard"] });
+if (fail?.findings.length === 1) console.log("PASS: parseReviewOutput fail with finding");
+else console.log("FAIL: parseReviewOutput fail with finding");
+if (parseReviewOutput({ verdict: "fail", summary: "Bug", findings: [] }) === null) console.log("PASS: fail verdict requires findings");
+else console.log("FAIL: fail verdict requires findings");
+
+const source = renderReviewWorkflowSource({
+  cwd: process.cwd(),
+  taskKey: "T001",
+  title: "Add guard",
+  body: "- [ ] rejects invalid input",
+  issueNumber: 42,
+  baseBranch: "main",
+  planBranch: "plan/001-auth",
+  taskBranch: "task/t001",
+  model: "review-model",
+  timeoutMs: 600000,
+});
+if (source.includes("review-model") && source.includes("task/t001") && source.includes("rejects invalid input") && source.includes("isolation: 'worktree'")) console.log("PASS: review workflow embeds task/model/schema");
+else console.log("FAIL: review workflow embeds task/model/schema");
+const comment = renderReviewComment(fail!);
+if (comment.includes("AI review") && comment.includes("src/a.ts") && comment.includes("Ready")) console.log("PASS: review failure comment");
+else console.log("FAIL: review failure comment");
+ENDTS
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-review.ts"
+echo
+
 # ---- summary ----
 echo
 echo "---"

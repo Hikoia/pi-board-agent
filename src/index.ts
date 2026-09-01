@@ -99,6 +99,8 @@ async function startBoardLoop(
 }
 
 export default function (pi: ExtensionAPI) {
+  const subcommands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+
   // Auto-start (container/headless): start the loop as soon as the session
   // starts when config.auto_start is true.
   pi.on("session_start", async (_event, ctx) => {
@@ -112,7 +114,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
   // ----------- /board-agent init -----------
-  pi.registerCommand("board-agent init", {
+  subcommands.set("init", {
     description: "Write a default .pi/board-agent.yml for this project",
     handler: async (_args, ctx) => {
       const cwd = ctx.cwd;
@@ -130,7 +132,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ----------- /board-agent lint -----------
-  pi.registerCommand("board-agent lint", {
+  subcommands.set("lint", {
     description: "Check preconditions: config, gh auth, project exists, plan field present",
     handler: async (_args, ctx) => {
       try {
@@ -158,7 +160,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ----------- /board-agent init-project -----------
-  pi.registerCommand("board-agent init-project", {
+  subcommands.set("init-project", {
     description: "Initialize the GitHub Project with the standard board (columns, Type, Plan, Board view)",
     handler: async (_args, ctx) => {
       try {
@@ -180,7 +182,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ----------- /board-agent watchdog -----------
-  pi.registerCommand("board-agent watchdog", {
+  subcommands.set("watchdog", {
     description: "Run the standalone watchdog loop (PR CI fixes + mentions)",
     handler: async (_args, ctx) => {
       try {
@@ -218,7 +220,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("board-agent stop-watchdog", {
+  subcommands.set("stop-watchdog", {
     description: "Stop the standalone watchdog loop",
     handler: async (_args, ctx) => {
       const interval = (pi as any).watchdogInterval;
@@ -233,7 +235,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ----------- /board-agent context -----------
-  pi.registerCommand("board-agent context", {
+  subcommands.set("context", {
     description: "Generate/show the repo context digest injected into builder missions",
     handler: async (_args, ctx) => {
       try {
@@ -258,7 +260,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ----------- /board-agent status -----------
-  pi.registerCommand("board-agent status", {
+  subcommands.set("status", {
     description: "Show board snapshot and loop stats",
     handler: async (_args, ctx) => {
       try {
@@ -299,7 +301,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ----------- /board-agent run -----------
-  pi.registerCommand("board-agent run", {
+  subcommands.set("run", {
     description: "Start the autonomous loop (picks Ready cards from the GitHub Project)",
     handler: async (_args, ctx) => {
       try {
@@ -311,7 +313,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ----------- /board-agent stop -----------
-  pi.registerCommand("board-agent stop", {
+  subcommands.set("stop", {
     description: "Stop the autonomous loop gracefully",
     handler: async (_args, ctx) => {
       if (!loop) {
@@ -321,6 +323,19 @@ export default function (pi: ExtensionAPI) {
       loop.stop();
       loop = null;
       ctx.ui.notify("Loop stopped.", "info");
+    },
+  });
+
+  pi.registerCommand("board-agent", {
+    description: "Manage the autonomous GitHub Project board agent",
+    handler: async (args, ctx) => {
+      const [name = "", ...rest] = args.trim().split(/\s+/);
+      const command = subcommands.get(name);
+      if (!command) {
+        ctx.ui.notify(`Usage: /board-agent <${Array.from(subcommands.keys()).join("|")}>`, "warning");
+        return;
+      }
+      await command.handler(rest.join(" "), ctx);
     },
   });
 
