@@ -1,7 +1,7 @@
 ---
 name: board-agent
 description: Builder agent for the pi-board-agent workflow. When a card is picked from a GitHub Project (v2) Ready column, this skill tells the builder agent how to implement the task, commit it, merge it into the plan branch, and return a structured outcome. Use this skill when the orchestrator asks you to "implement task T### for plan <slug>".
-compatibility: Requires gh CLI auth with project scope, git, and a clean worktree (provided by pi-dynamic-workflows isolation: worktree).
+compatibility: "Requires gh CLI auth with project scope, git, and a clean worktree (provided by pi-dynamic-workflows isolation: worktree)."
 ---
 
 # Board Agent Builder
