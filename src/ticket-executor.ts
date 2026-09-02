@@ -113,6 +113,35 @@ function marker(runId: string, outcome: string): string {
   return `<!-- board-agent-run:${runId}:${outcome} -->`;
 }
 
+function renderNeedsHumanComment(reason: string, details?: WaveOutcome): string {
+  const problem = reason.trim() || "Automation reported an unspecified blocker.";
+  const attempted = details?.attempted?.trim() || "Board Agent preserved the current state and stopped instead of guessing.";
+  const limitations = details?.limitations?.trim() || "Automation cannot safely continue until the blocker above is resolved.";
+  const workaround = details?.workaround?.trim() || "Inspect the task branch/worktree if present, preserve useful changes, and leave the expected task branch clean.";
+  const humanAction = details?.humanAction?.trim() || "Reply with the missing decision or describe the manual fix.";
+  return [
+    "## ⚠️ Needs human input",
+    "",
+    "**Problem**",
+    problem,
+    "",
+    "**Attempted**",
+    attempted,
+    "",
+    "**Limitation**",
+    limitations,
+    "",
+    "**Workaround**",
+    workaround,
+    "",
+    "**Human input needed**",
+    humanAction,
+    "",
+    "**Resume**",
+    "After resolving the blocker, manually move this Project card to `Ready`. The next builder run will read trusted maintainer comments and continue.",
+  ].join("\n");
+}
+
 export function createWorkflowManagerAdapter(options: {
   cwd: string;
   modelRegistry?: ModelRegistry;
@@ -199,7 +228,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
   private async quarantineWithoutRecord(card: Card, reason: string): Promise<LaunchResult> {
     const uniqueMarker = `<!-- board-agent-recovery:${card.itemId}:worktree -->`;
     try {
-      await this.commentOnce(card, uniqueMarker, `⚠️ Automation requires human inspection.\n\nReason: ${reason}`);
+      await this.commentOnce(card, uniqueMarker, renderNeedsHumanComment(reason));
       await this.deps.board.setStatus(card.itemId, this.deps.cfg.columns.needs_human);
       card.status = this.deps.cfg.columns.needs_human;
       this.deps.callback(`"${card.title}" → ${this.deps.cfg.columns.needs_human}: ${reason}`, "warn");
@@ -214,12 +243,13 @@ export class ManagedTicketExecutor implements TicketExecutor {
     card: Card,
     reason: string,
     runId?: string,
-    outcome = "needs-human",
+    markerOutcome = "needs-human",
+    details?: WaveOutcome,
   ): Promise<void> {
     const uniqueMarker = runId
-      ? marker(runId, outcome)
+      ? marker(runId, markerOutcome)
       : `<!-- board-agent-recovery:${record.itemId}:${"launchingAt" in record ? record.launchingAt ?? record.createdAt : record.createdAt} -->`;
-    await this.commentOnce(card, uniqueMarker, `⚠️ Automation stopped and requires human inspection.\n\nReason: ${reason}`);
+    await this.commentOnce(card, uniqueMarker, renderNeedsHumanComment(reason, details));
     if (!statusIs(card, this.deps.cfg.columns.needs_human)) {
       await this.deps.board.setStatus(card.itemId, this.deps.cfg.columns.needs_human);
       card.status = this.deps.cfg.columns.needs_human;
@@ -413,7 +443,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         return;
       }
       if (outcome.status === "failure") {
-        await this.moveToNeedsHuman(record, card, outcome.error ?? "builder reported failure", run.runId, "failure");
+        await this.moveToNeedsHuman(record, card, outcome.error ?? "builder reported failure", run.runId, "failure", outcome);
         summary.needsHuman++;
         return;
       }

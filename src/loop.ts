@@ -46,6 +46,7 @@ export interface LoopDeps {
   botLogin: string;
   meta: ProjectMetadata;
   callback: StatusCallback;
+  onTick?: () => void;
   /** Offline adapter; production uses gh.ts. */
   listCards?: () => Promise<Card[]>;
 }
@@ -208,6 +209,7 @@ export class BoardLoop {
     } finally {
       this.state.tickCount++;
       this.state.lastTickMs = Date.now();
+      this.deps.onTick?.();
     }
   }
 

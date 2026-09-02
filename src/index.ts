@@ -26,6 +26,11 @@ import { TicketWorktrees } from "./ticket-worktree.js";
 
 let loop: BoardLoop | null = null;
 let loopState = createLoopState();
+const BOARD_WIDGET_ID = "board-agent-active";
+
+function clearBoardWidget(ctx: ExtensionContext): void {
+  if (ctx.hasUI) ctx.ui.setWidget(BOARD_WIDGET_ID, undefined);
+}
 
 function configuredStatuses(cfg: ReturnType<typeof loadConfig>): string[] {
   return [
@@ -76,8 +81,22 @@ async function startBoardLoop(ctx: ExtensionContext, admitNewWork = true): Promi
   validateStatusOptions(meta, configuredStatuses(cfg));
   const ownerLock = acquireOwnerLock(cwd, botLogin);
 
+  const updateWidget = () => {
+    if (!ctx.hasUI) return;
+    if (!loop?.isRunning()) {
+      clearBoardWidget(ctx);
+      return;
+    }
+    const active = inspectTicketExecutions(cwd, [], cfg).active;
+    ctx.ui.setWidget(BOARD_WIDGET_ID, [
+      `Board Agent ● ${active.length === 0 ? "idle" : `${active.length}/${cfg.max_workers} active`}`,
+      ...active.map((run) => `  ${run.taskKey} [${run.status}]`),
+    ], { placement: "belowEditor" });
+  };
+
   const callback = (msg: string, level: "info" | "warn" | "error" = "info") => {
     ctx.ui.notify(`[board-agent] ${statusPrefix(level)} ${msg}`, level === "warn" ? "warning" : level);
+    updateWidget();
   };
 
   try {
@@ -91,7 +110,7 @@ async function startBoardLoop(ctx: ExtensionContext, admitNewWork = true): Promi
       mainModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
       sessionId: ctx.sessionManager.getSessionId(),
     });
-    const deps: LoopDeps = { cwd, cfg, repoOwner: owner, repoName, botLogin, meta, callback };
+    const deps: LoopDeps = { cwd, cfg, repoOwner: owner, repoName, botLogin, meta, callback, onTick: updateWidget };
     loopState = createLoopState();
     const nextLoop = new BoardLoop(deps, loopState, executor, new TicketWorktrees(cwd), ownerLock, admitNewWork);
     loop = nextLoop;
@@ -103,6 +122,7 @@ async function startBoardLoop(ctx: ExtensionContext, admitNewWork = true): Promi
   } catch (error) {
     ownerLock.release();
     loop = null;
+    clearBoardWidget(ctx);
     throw error;
   }
 }
@@ -113,6 +133,7 @@ export default function (pi: ExtensionAPI) {
 
   // Resume durable ticket runs on every startup/reload; auto_start also admits new work.
   pi.on("session_start", async (_event, ctx) => {
+    clearBoardWidget(ctx);
     try {
       const cfg = loadConfig(ctx.cwd);
       if (cfg.auto_start && !loop?.isRunning()) {
@@ -338,11 +359,13 @@ export default function (pi: ExtensionAPI) {
     description: "Stop the autonomous loop gracefully",
     handler: async (_args, ctx) => {
       if (!loop) {
+        clearBoardWidget(ctx);
         ctx.ui.notify("No loop is running.", "warning");
         return;
       }
       const current = loop;
       loop = null;
+      clearBoardWidget(ctx);
       try {
         await current.stop();
         ctx.ui.notify("Loop stopped.", "info");
@@ -371,6 +394,7 @@ export default function (pi: ExtensionAPI) {
     watchdogInterval = undefined;
     const current = loop;
     loop = null;
+    clearBoardWidget(ctx);
     if (!current) return;
     try {
       await current.stop();

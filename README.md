@@ -168,6 +168,10 @@ Yes. On startup or `/reload`, active ticket records recreate their WorkflowManag
 
 Recoverable connection/empty-output failures use `builder_retries` inside the same managed run. A builder-reported failure, failed/aborted manager, or malformed/missing result moves the card to `Needs Human`; automation never loops it back to Ready.
 
+**How do I resume a `Needs Human` ticket?**
+
+Read the structured blocker comment, reply with the requested decision or manual fix, and leave the retained task worktree on its expected branch with a clean status. Then manually move the Project card to `Ready`. The fresh builder run reads trusted maintainer replies after the latest blocker comment and continues from the retained task branch.
+
 **What about merge conflicts?**
 
 Builders never merge. If finalization conflicts after the human closes the

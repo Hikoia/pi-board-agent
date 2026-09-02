@@ -311,6 +311,32 @@ if (terminalCards.every((card) => board.cards.get(card.itemId)?.status === cfg.c
   console.log("PASS: failed, aborted, malformed, and missing runs all require human");
 } else console.log("FAIL: terminal failure policy");
 
+const explained = board.add("PVTI_894", 894);
+await executor.launch(explained, "demo");
+complete(explained.itemId, [{
+  taskKey: "T894",
+  itemId: explained.itemId,
+  status: "failure",
+  error: "Deployment target is missing.",
+  attempted: "Checked repository configuration.",
+  limitations: "Choosing a target would be unsafe.",
+  workaround: "Select staging or production.",
+  humanAction: "Reply with the approved target.",
+}]);
+await executor.reconcile(board.all());
+const blockerComment = (board.comments.get(explained.itemId) ?? []).join("\n");
+if (
+  board.cards.get(explained.itemId)?.status === cfg.columns.needs_human &&
+  blockerComment.includes("## ⚠️ Needs human input") &&
+  blockerComment.includes("Deployment target is missing.") &&
+  blockerComment.includes("Checked repository configuration.") &&
+  blockerComment.includes("Choosing a target would be unsafe.") &&
+  blockerComment.includes("Select staging or production.") &&
+  blockerComment.includes("Reply with the approved target.") &&
+  blockerComment.includes("manually move this Project card to `Ready`")
+) console.log("PASS: builder failure leaves actionable human guidance");
+else console.log("FAIL: builder failure human guidance");
+
 const manuallyMoved = board.add("PVTI_895", 895);
 await executor.launch(manuallyMoved, "demo");
 complete(manuallyMoved.itemId, { malformed: true });

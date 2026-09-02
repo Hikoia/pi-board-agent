@@ -209,6 +209,7 @@ const cfg = loadConfig(cwd);
 execSync("git init && git config user.email t@t && git config user.name t && git remote add origin https://github.com/test/repo.git && git checkout -b main && git commit --allow-empty -m init", { cwd, stdio: "ignore" });
 const state = createLoopState();
 let shutdowns = 0;
+let tickUpdates = 0;
 const executor: TicketExecutor = {
   reconcile: async () => ({ active: [], resumed: 0, adopted: 0, needsHuman: 0, legacy: 0, orphans: 0, errors: 0 }),
   launch: async () => ({ status: "skipped", reason: "test" }),
@@ -219,12 +220,15 @@ const deps: LoopDeps = {
   cwd, cfg, repoOwner: "test", repoName: "repo", botLogin: "bot",
   meta: { projectId: "P", statusFieldId: "S", statusOptions: { Ready: "o1", "In Progress": "o2", "Needs Human": "o3", Review: "o4", Done: "o5" } },
   callback: () => undefined,
+  onTick: () => { tickUpdates++; },
   listCards: async () => [],
 };
 const loop = new BoardLoop(deps, state, executor);
 await loop.start();
 if (state.running) console.log("PASS: loop.start sets running=true");
 else console.log("FAIL: loop.start did not set running");
+if (tickUpdates === 1) console.log("PASS: loop tick refreshes persistent status");
+else console.log("FAIL: loop tick did not refresh persistent status");
 await loop.start();
 if (state.tickCount === 1) console.log("PASS: duplicate loop.start is a no-op");
 else console.log("FAIL: duplicate loop.start launched another tick");
@@ -247,13 +251,13 @@ import { renderWorkflowSource, buildTasksForWave } from "../../src/workflow-prom
 // normalizeWaveResults: happy path
 const raw = [
   { taskKey: "T001", itemId: "PVTI_a", status: "success", branch: "task/t001", commits: 1, summary: "done" },
-  { taskKey: "T002", itemId: "PVTI_b", status: "failure", error: "conflict" },
+  { taskKey: "T002", itemId: "PVTI_b", status: "failure", error: "conflict", attempted: "rebased", limitations: "merge is ambiguous", workaround: "resolve manually", humanAction: "choose the intended version" },
 ];
 const out = normalizeWaveResults(raw);
 if (out.length === 2 && out[0].status === "success" && out[0].branch === "task/t001") console.log("PASS: normalize happy path");
 else console.log("FAIL: normalize happy path");
-if (out[1].status === "failure" && out[1].error === "conflict") console.log("PASS: normalize failure keeps error");
-else console.log("FAIL: normalize failure keeps error");
+if (out[1].status === "failure" && out[1].error === "conflict" && out[1].attempted === "rebased" && out[1].limitations === "merge is ambiguous" && out[1].workaround === "resolve manually" && out[1].humanAction === "choose the intended version") console.log("PASS: normalize failure keeps human guidance");
+else console.log("FAIL: normalize failure keeps human guidance");
 
 // normalizeWaveResults: defensive (nulls, malformed, non-array)
 if (normalizeWaveResults(null).length === 0) console.log("PASS: normalize null -> []");
@@ -277,6 +281,10 @@ if (script.includes('"issueNumber":12')) {
 } else {
   console.log("FAIL: workflow payload embeds issue number");
 }
+if (script.includes("--json comments") && script.includes("OWNER, MEMBER, or COLLABORATOR")) console.log("PASS: workflow reads trusted human replies");
+else console.log("FAIL: workflow does not distinguish trusted human replies");
+if (script.includes("attempted") && script.includes("limitations") && script.includes("workaround") && script.includes("humanAction")) console.log("PASS: workflow requests actionable failure guidance");
+else console.log("FAIL: workflow failure guidance contract");
 ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-dispatch.ts"
 echo

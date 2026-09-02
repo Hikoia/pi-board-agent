@@ -7,6 +7,10 @@ export interface WaveOutcome {
   commits?: number;
   summary?: string;
   error?: string;
+  attempted?: string;
+  limitations?: string;
+  workaround?: string;
+  humanAction?: string;
 }
 
 /** Strictly normalize a persisted workflow result; malformed entries are not guessed. */
@@ -33,6 +37,10 @@ export function normalizeWaveResults(raw: unknown): WaveOutcome[] {
       commits: typeof result.commits === "number" ? result.commits : undefined,
       summary: typeof result.summary === "string" ? result.summary : undefined,
       error: typeof result.error === "string" ? result.error : undefined,
+      attempted: typeof result.attempted === "string" ? result.attempted : undefined,
+      limitations: typeof result.limitations === "string" ? result.limitations : undefined,
+      workaround: typeof result.workaround === "string" ? result.workaround : undefined,
+      humanAction: typeof result.humanAction === "string" ? result.humanAction : undefined,
     });
   }
   return outcomes;

@@ -686,7 +686,7 @@ export async function listIssueComments(
     query($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
         issue(number: $number) {
-          comments(first: 50, orderBy: { field: CREATED_AT, direction: ASC }) {
+          comments(first: 50, orderBy: { field: UPDATED_AT, direction: ASC }) {
             nodes { id body createdAt author { login } }
           }
         }
