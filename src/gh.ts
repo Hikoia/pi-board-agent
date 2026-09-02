@@ -194,6 +194,71 @@ function resolveFields(
   return meta;
 }
 
+export function validateStatusOptions(meta: ProjectMetadata, names: string[]): void {
+  const missing = names.filter((name) => !findCaseInsensitive(meta.statusOptions, name));
+  if (missing.length > 0) {
+    throw new Error(`Status option(s) missing from project: ${missing.join(", ")}`);
+  }
+}
+
+const CARD_FIELDS = `
+  id
+  fieldValues(first: 20) {
+    nodes {
+      ... on ProjectV2ItemFieldSingleSelectValue {
+        name
+        field { ... on ProjectV2SingleSelectField { name } }
+      }
+      ... on ProjectV2ItemFieldTextValue {
+        text
+        field { ... on ProjectV2Field { name } }
+      }
+    }
+  }
+  content {
+    __typename
+    ... on Issue {
+      number title body url closed
+      assignees(first: 10) { nodes { login } }
+      repository { owner { login } name }
+    }
+    ... on PullRequest {
+      number title body url closed
+      assignees(first: 10) { nodes { login } }
+      repository { owner { login } name }
+    }
+    ... on DraftIssue {
+      title body
+      assignees(first: 10) { nodes { login } }
+    }
+  }
+`;
+
+function hydrateCard(item: any, statusFieldName: string, planFieldName?: string, typeFieldName?: string): Card {
+  const fieldByName = new Map<string, string>();
+  for (const fv of item.fieldValues?.nodes ?? []) {
+    const name = fv?.field?.name;
+    if (!name) continue;
+    if (typeof fv.name === "string") fieldByName.set(name.toLowerCase(), fv.name);
+    else if (typeof fv.text === "string") fieldByName.set(name.toLowerCase(), fv.text);
+  }
+  const content = item.content ?? {};
+  return {
+    itemId: item.id,
+    number: content.number,
+    title: content.title ?? "(untitled)",
+    body: content.body ?? "",
+    status: fieldByName.get(statusFieldName.toLowerCase()),
+    plan: planFieldName ? fieldByName.get(planFieldName.toLowerCase()) : undefined,
+    type: typeFieldName ? fieldByName.get(typeFieldName.toLowerCase()) : undefined,
+    assignees: (content.assignees?.nodes ?? []).map((assignee: any) => assignee.login),
+    closed: !!content.closed,
+    url: content.url,
+    repoOwner: content.repository?.owner?.login,
+    repoName: content.repository?.name,
+  };
+}
+
 /**
  * List all cards in the project, hydrated with status, plan, assignees,
  * issue body and closed-state.
@@ -209,38 +274,7 @@ export async function listCards(projectId: string, statusFieldName: string, plan
           ... on ProjectV2 {
             items(first: 50, after: $cursor) {
               pageInfo { hasNextPage endCursor }
-              nodes {
-                id
-                fieldValues(first: 20) {
-                  nodes {
-                    ... on ProjectV2ItemFieldSingleSelectValue {
-                      name
-                      field { ... on ProjectV2SingleSelectField { name } }
-                    }
-                    ... on ProjectV2ItemFieldTextValue {
-                      text
-                      field { ... on ProjectV2Field { name } }
-                    }
-                  }
-                }
-                content {
-                  __typename
-                  ... on Issue {
-                    number title body url closed
-                    assignees(first: 10) { nodes { login } }
-                    repository { owner { login } name }
-                  }
-                  ... on PullRequest {
-                    number title body url closed
-                    assignees(first: 10) { nodes { login } }
-                    repository { owner { login } name }
-                  }
-                  ... on DraftIssue {
-                    title body
-                    assignees(first: 10) { nodes { login } }
-                  }
-                }
-              }
+              nodes { ${CARD_FIELDS} }
             }
           }
         }
@@ -250,34 +284,26 @@ export async function listCards(projectId: string, statusFieldName: string, plan
     const data = await graphql<any>(query, variables);
     const items = data?.node?.items;
     if (!items) break;
-    for (const item of items.nodes) {
-      const fieldByName = new Map<string, string>();
-      for (const fv of item.fieldValues.nodes) {
-        const fname = fv?.field?.name;
-        if (!fname) continue;
-        if (typeof fv.name === "string") fieldByName.set(fname.toLowerCase(), fv.name);
-        else if (typeof fv.text === "string") fieldByName.set(fname.toLowerCase(), fv.text);
-      }
-      const c = item.content ?? {};
-      cards.push({
-        itemId: item.id,
-        number: c.number,
-        title: c.title ?? "(untitled)",
-        body: c.body ?? "",
-        status: fieldByName.get(statusFieldName.toLowerCase()),
-        plan: planFieldName ? fieldByName.get(planFieldName.toLowerCase()) : undefined,
-        type: typeFieldName ? fieldByName.get(typeFieldName.toLowerCase()) : undefined,
-        assignees: (c.assignees?.nodes ?? []).map((a: any) => a.login),
-        closed: !!c.closed,
-        url: c.url,
-        repoOwner: c.repository?.owner?.login,
-        repoName: c.repository?.name,
-      });
-    }
+    for (const item of items.nodes) cards.push(hydrateCard(item, statusFieldName, planFieldName, typeFieldName));
     if (!items.pageInfo.hasNextPage) break;
     cursor = items.pageInfo.endCursor;
   }
   return cards;
+}
+
+/** Re-read one full project card by its stable Project item ID. */
+export async function getCard(
+  itemId: string,
+  statusFieldName: string,
+  planFieldName?: string,
+  typeFieldName?: string,
+): Promise<Card | undefined> {
+  const query = `
+    query($itemId: ID!) {
+      node(id: $itemId) { ... on ProjectV2Item { ${CARD_FIELDS} } }
+    }`;
+  const data = await graphql<any>(query, { itemId });
+  return data?.node ? hydrateCard(data.node, statusFieldName, planFieldName, typeFieldName) : undefined;
 }
 
 /** Move a card to a different Status option. No-op if the option is unknown. */
@@ -339,34 +365,48 @@ function findCaseInsensitive(map: Record<string, string>, key: string): string |
   return undefined;
 }
 
-/**
- * Atomically claim an issue by adding `botLogin` as assignee. Returns true
- * iff *we* won the race (i.e. nobody else is assigned). This is the only
- * mutex super-board uses, and it survives restarts because GitHub itself
- * holds the state.
- */
+/** Add the bot assignee and verify the resulting issue state. The ticket
+ * executor performs a second full Project-item refetch before launch. */
+async function readClaimState(card: Card): Promise<{ open: boolean; assignees: string[] }> {
+  const out = await runGh([
+    "issue", "view", String(card.number),
+    "--repo", `${card.repoOwner}/${card.repoName}`,
+    "--json", "state,assignees",
+  ]);
+  const value = JSON.parse(out) as { state?: string; assignees?: Array<{ login?: string }> };
+  return {
+    open: value.state === "OPEN",
+    assignees: (value.assignees ?? []).flatMap((assignee) => assignee.login ? [assignee.login] : []),
+  };
+}
+
 export async function tryClaim(card: Card, botLogin: string): Promise<boolean> {
-  if (!card.number || !card.repoOwner || !card.repoName) return false; // drafts cannot be claimed
-  // If someone else is already assigned (or we are), bail.
-  const others = card.assignees.filter((a) => a !== botLogin);
-  if (others.length > 0) return false;
-  if (card.assignees.includes(botLogin)) return true; // we already hold it
-  try {
-    await runGh([
-      "issue", "edit", String(card.number),
-      "--repo", `${card.repoOwner}/${card.repoName}`,
-      "--add-assignee", botLogin,
-    ]);
-    return true;
-  } catch (err) {
-    if (err instanceof GhError && /already assigned/i.test(err.stderr)) return true;
-    throw err;
+  if (!card.number || !card.repoOwner || !card.repoName) return false;
+  const before = await readClaimState(card);
+  if (!before.open || before.assignees.some((assignee) => assignee !== botLogin)) return false;
+
+  let mutationError: unknown;
+  if (!before.assignees.includes(botLogin)) {
+    try {
+      await runGh([
+        "issue", "edit", String(card.number),
+        "--repo", `${card.repoOwner}/${card.repoName}`,
+        "--add-assignee", botLogin,
+      ]);
+    } catch (error) {
+      mutationError = error;
+    }
   }
+
+  const after = await readClaimState(card);
+  const won = after.open && after.assignees.includes(botLogin) && after.assignees.every((assignee) => assignee === botLogin);
+  if (!won) await release(card, botLogin);
+  if (mutationError && !won) throw mutationError;
+  return won;
 }
 
 export async function release(card: Card, botLogin: string): Promise<void> {
   if (!card.number || !card.repoOwner || !card.repoName) return;
-  if (!card.assignees.includes(botLogin)) return;
   await runGh([
     "issue", "edit", String(card.number),
     "--repo", `${card.repoOwner}/${card.repoName}`,
@@ -474,35 +514,14 @@ export async function ensureStandardFields(
   const fields = await listProjectFields(meta.projectId);
 
   for (const spec of specs) {
-    const found = fields.find((f) => f.name.toLowerCase() === spec.name.toLowerCase());
+    const found = fields.find((field) => field.name.toLowerCase() === spec.name.toLowerCase());
     if (found) {
+      // Never rewrite an existing option list: GitHub's mutation replaces it.
       existing.push(spec.name);
-      // Missing options on an existing single-select field? updateProjectV2Field
-      // replaces the whole options list — set it to the desired union.
-      if (spec.kind === "single" && spec.options && found.options) {
-        // updateProjectV2Field REPLACES the option list: apply the standard
-        // exactly (no leftovers from previous setups).
-        const desired = spec.options.map((o) => o.toLowerCase()).sort().join("|");
-        const current = found.options.map((o) => o.name.toLowerCase()).sort().join("|");
-        if (desired !== current) {
-          await updateFieldOptions(
-            found.id,
-            spec.options.map((name, i) => ({ name, color: fieldColor(spec, i) })),
-          );
-        }
-      }
       continue;
     }
-    const fieldId = await createField(meta.projectId, spec);
+    await createField(meta.projectId, spec);
     created.push(spec.name);
-    if (spec.kind === "single" && spec.options) {
-      // GitHub has no createProjectV2FieldOption mutation: options are only set
-      // via updateProjectV2Field(singleSelectOptions).
-      await updateFieldOptions(
-        fieldId,
-        spec.options.map((name, i) => ({ name, color: fieldColor(spec, i) })),
-      );
-    }
   }
 
   // Board view grouped by Status (if a status field exists).
@@ -514,21 +533,18 @@ export async function ensureStandardFields(
   return { created, existing };
 }
 
-async function listProjectFields(projectId: string): Promise<Array<{ id: string; name: string; options?: Array<{ id: string; name: string }> }>> {
+async function listProjectFields(projectId: string): Promise<Array<{ id: string; name: string }>> {
   const query = `
     query($projectId: ID!) {
       node(id: $projectId) {
-        ... on ProjectV2 { fields(first: 100) { nodes { ... on ProjectV2SingleSelectField { id name options { id name } } ... on ProjectV2Field { id name } } } }
+        ... on ProjectV2 { fields(first: 100) { nodes { ... on ProjectV2SingleSelectField { id name } ... on ProjectV2Field { id name } } } }
       }
     }`;
   const data = await graphql<any>(query, { projectId });
   return data?.node?.fields?.nodes ?? [];
 }
 
-/** Create a field. SINGLE_SELECT requires its options at creation time
- * (inlined as GraphQL literals — the gh CLI does not parse complex -F
- * variables). Existing fields instead get missing options via
- * updateProjectV2Field. */
+/** Create a field, including all options for a new single-select field. */
 async function createField(projectId: string, spec: StandardFieldSpec): Promise<string> {
   const dataType = spec.kind === "single" ? "SINGLE_SELECT" : "TEXT";
   if (spec.kind === "single") {
@@ -565,28 +581,6 @@ async function createField(projectId: string, spec: StandardFieldSpec): Promise<
 function fieldColor(spec: StandardFieldSpec, i: number): string {
   const palette = ["GRAY", "BLUE", "YELLOW", "ORANGE", "PURPLE", "GREEN", "PINK", "RED"];
   return spec.colors?.[i] ?? palette[i % palette.length];
-}
-
-/** Replace (or set for the first time) the options of a single-select field.
- * Options are inlined as GraphQL literals: the gh CLI does not parse complex
- * -F variables (arrays/objects), so variables are avoided here. */
-async function updateFieldOptions(
-  fieldId: string,
-  options: Array<{ name: string; color: string }>,
-): Promise<void> {
-  const literals = options
-    .map((o) => `{ name: ${JSON.stringify(o.name)}, color: ${o.color}, description: \"\" }`)
-    .join(", ");
-  const mutation = `
-    mutation($fieldId: ID!) {
-      updateProjectV2Field(input: {
-        fieldId: $fieldId
-        singleSelectOptions: [${literals}]
-      }) {
-        projectV2Field { ... on ProjectV2SingleSelectField { id } }
-      }
-    }`;
-  await graphql(mutation, { fieldId });
 }
 
 async function createBoardView(projectId: string, name: string, groupByFieldId: string): Promise<void> {

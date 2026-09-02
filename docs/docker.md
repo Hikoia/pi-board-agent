@@ -11,11 +11,11 @@ Telegram notifications to the same bot/channel used by the releases.
 docker-compose.yml
  └─ board-agent container (linux/arm64)
      ├─ gh CLI authenticated with GH_TOKEN (git credential helper too)
-     ├─ pi headless (--print) with pi-board-agent + pi-dynamic-workflows
+     ├─ pi headless (--print) with pi-board-agent (WorkflowManager bundled)
      │    └─ extension auto_start: true → BoardLoop starts at session start
      │         └─ the loop's setInterval keeps the pi process alive forever
      ├─ /workspace  ← the target repo (e.g. board-game-organizer), mounted
-     └─ /root/.pi/agent ← named volume: sessions, context, inflight, state
+     └─ /root/.pi/agent ← named volume: sessions, context, workflow journals
 ```
 
 The pi `--print` mode does **not** force-exit on completion (it only sets the
@@ -58,10 +58,6 @@ docker compose exec board-agent gh api user --jq .login
 
 ## Persistence & safety
 
-- The board is the source of truth: if the container dies mid-task, the next
-  start re-reads cards; inflight lockfiles + the assignee mutex prevent
-  double-dispatch.
-- `watchdog-state.json` / `refine-state.json` live under `.pi/board-agent/` in
-  the target repo; the pi home volume keeps sessions/context.
-- Stop gracefully: `docker compose stop` (SIGTERM → extension stops the loop
-  and releases claims).
+- Ticket execution records live under `.pi/board-agent/ticket-worktrees/`; WorkflowManager journals and leases live in the Pi home volume. Restart reconciliation adopts or resumes clean managed runs and quarantines unsafe state in `Needs Human`.
+- `watchdog-state.json` / `refine-state.json` live under `.pi/board-agent/` in the target repo.
+- Stop gracefully: `docker compose stop` lets the extension stop admissions, pause active managers, settle their journals, and release the owner lock. Ticket assignees remain until a terminal outcome is applied.

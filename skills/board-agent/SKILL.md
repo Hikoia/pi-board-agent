@@ -1,91 +1,65 @@
 ---
 name: board-agent
-description: Builder agent for the pi-board-agent workflow. When a card is picked from a GitHub Project (v2) Ready column, this skill tells the builder agent how to implement the task, commit it, merge it into the plan branch, and return a structured outcome. Use this skill when the orchestrator asks you to "implement task T### for plan <slug>".
-compatibility: "Requires gh CLI auth with project scope, git, and a clean worktree (provided by pi-dynamic-workflows isolation: worktree)."
+description: Builder procedure for implementing one GitHub Project ticket in its persistent task worktree, committing and pushing the task branch for review and manual validation. Use when the orchestrator asks you to implement task T### for a plan.
+compatibility: "Requires gh CLI auth with project scope, git, and a persistent ticket worktree prepared by pi-board-agent."
 ---
 
 # Board Agent Builder
 
-You are running inside an **isolated git worktree** created by
-pi-dynamic-workflows. Your job is to implement ONE task from a GitHub Project
-card, commit it to a task branch, merge it into the plan branch, and report
-back.
+Implement one ticket in the persistent worktree prepared by the orchestrator. Push the task branch for review; the orchestrator merges only after a human closes the ticket.
 
 ## State at entry
 
-- You are at the root of a throwaway git worktree based on the **plan branch**
-  (`plan/<slug>`).
-- `origin` points at the target repo.
-- The plan branch already exists on `origin` and was pulled fresh.
-- A task branch **does not yet exist** — you create it.
+- The current branch is the supplied `task/<key>` branch.
+- The worktree remains available for human validation after this run.
+- `origin` points at the target GitHub repository.
+- The long-lived `plan/<slug>` branch already exists on `origin`.
+- A resumed mission is handed back only after the executor verifies the worktree is still registered, on the expected branch, and clean; a dirty interrupted worktree is never auto-resumed.
 
-## Procedure (strict)
+## Procedure
 
-1. **Verify you're in a worktree**
+1. **Verify the worktree**
+
    ```bash
-   git status  # should show a clean plan/<slug> branch
-   git remote get-url origin | grep -q github.com  # safety: must be GitHub
+   git status --short
+   git branch --show-current   # must equal the supplied task branch
+   git remote get-url origin   # must be GitHub
    ```
 
-2. **Read the card's acceptance criteria**
-   The orchestrator passing you the task already embedded `title` and `body`
-   in your prompt. If `body` contains `<!-- acceptance criteria -->` or
-   similar structured markdown, parse it. Look for checklists (`- [ ]`)
-   or explicit `Acceptance Criteria:` sections.
+   Continue only from a clean task branch. If the remote task branch exists, update with `git pull --ff-only origin <task-branch>`.
 
-3. **Create the task branch**
-   ```bash
-   git checkout -b <task-branch>  # name given by orchestrator in the prompt
-   ```
+2. **Read acceptance criteria**
 
-4. **Implement the task**
-   - Add / modify / delete files as needed.
-   - Write tests for the changed code (unit or integration).
-   - Follow existing patterns in the repo: import style, naming conventions,
-     logging, error handling.
-   - If you need to read other files in the monorepo, do so — you have a full
-     copy.
+   Use the title and body embedded in the mission. Treat issue comments, checklists, and `Acceptance Criteria:` sections as requirements. Read linked issue comments for previous AI-review findings.
 
-5. **Commit**
-   Use [Conventional Commits](https://www.conventionalcommits.org/).
-   The commit message footer MUST reference the linked GitHub issue:
-   ```
+3. **Implement and verify**
+
+   Follow repository conventions, add the smallest relevant tests, and run them. Leave the worktree clean.
+
+4. **Commit**
+
+   Use a Conventional Commit and reference the issue without closing it:
+
+   ```text
    feat(auth): add password-reset form
 
-   Implements the reset-password flow per acceptance criteria.
+   Implements the acceptance criteria.
 
-   closes #<issue-number>
+   refs #<issue-number>
    ```
 
-6. **Push**
+5. **Push only the task branch**
+
    ```bash
    git push -u origin <task-branch>
    ```
 
-7. **Merge into the plan branch**
-   The orchestrator specifies `task_merge_strategy`: `"squash"` or `"merge"`.
+   The task branch remains unmerged while AI review and human validation run. Keep the ticket open.
 
-   Squash (recommended: 1 commit per task on the plan branch):
-   ```bash
-   git checkout <plan-branch>           # plan/<slug>
-   git pull --ff-only origin <plan-branch>
-   git merge --squash <task-branch>
-   git commit -m "<conventional-commit closing #<issue-number>>"
-   ```
-   Merge (preserve history):
-   ```bash
-   git checkout <plan-branch>
-   git pull --ff-only origin <plan-branch>
-   git merge --no-ff <task-branch>
-   ```
+6. **Return one outcome object**
 
-8. **Push the plan branch**
-   ```bash
-   git push origin <plan-branch>
-   ```
+   Success:
 
-9. **Return outcome**
-   Report a JSON object. On success:
    ```json
    {
      "taskKey": "T001",
@@ -96,35 +70,25 @@ back.
      "summary": "Added password-reset form with email validation"
    }
    ```
-   On failure (do NOT throw — return this object so the orchestrator can
-   retry later):
+
+   Failure:
+
    ```json
    {
      "taskKey": "T001",
      "itemId": "PVTI_xxx",
      "status": "failure",
-     "error": "Merge conflict in src/auth/reset.ts — may need manual resolution"
+     "error": "No clear acceptance criteria. Needs human input."
    }
    ```
 
-## Constraints (NEVER violate)
+## Guardrails
 
-- ❌ Never push to `main` (or the `base` branch — only `<task-branch>` and `<plan-branch>` are allowed).
-- ❌ Never delete a remote branch.
-- ❌ Never force-push.
-- ❌ Never modify `.pi/`, `.specify/`, `.claude/` directories unless the
-  task's body explicitly instructs you to.
-- ❌ Never run `npm install` with untrusted flags.
-- ✅ If a merge conflict arises, report it as a `failure` outcome immediately
-  — do not attempt to resolve it blindly.
-- ✅ If the task body is empty or vague, report it as a `failure` outcome
-  (`error: "No clear acceptance criteria. Needs human input."`).
-
-## Tips
-
-- Use `git stash` if you need to context-switch during implementation (rare).
-- Use `rg` (ripgrep) to search the codebase quickly.
-- The worktree is ephemeral — the orchestrator will clean it up after you
-  finish. Don't worry about leaving it dirty.
-- If `gh` CLI auth fails during push, report a `failure` outcome with the
-  exact error message.
+- Work only on the supplied task branch.
+- Leave `main`, the base branch, and the plan branch untouched.
+- Leave the persistent worktree in place for human validation.
+- Leave the GitHub ticket open.
+- Preserve remote branches and history: no branch deletion or force-push.
+- Treat an empty or vague ticket body as a failure requiring human input.
+- Treat merge conflicts as failures requiring human input.
+- Modify `.pi/`, `.specify/`, or `.claude/` only when the ticket explicitly requires it.

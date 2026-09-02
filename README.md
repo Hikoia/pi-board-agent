@@ -7,9 +7,7 @@
 > An autonomous GitHub Project (v2) board executor for [Pi](https://pi.dev/).
 > Drag a card into the `Ready` column, walk away, come back to a PR.
 
-Built on **pi-dynamic-workflows** for parallel git-worktree-isolated builders,
-with assignee-based card claiming, plan-level PR batching, and a review gate
-before PR handoff.
+Built on **pi-dynamic-workflows 3.10** for journaled, resumable builders in persistent per-ticket worktrees, with an owner lock, startup reconciliation, assignee-based claiming, AI review, human validation, and plan-level PR batching.
 
 ## Watch it run
 
@@ -17,30 +15,31 @@ before PR handoff.
 ┌─ Board ─────────────────────────────────────────────────────┐
 │ Columns                                      │                │
 ├──────────────────────────────────────────────┼────────────────┤
-│ Backlog │ Ready │ Building │ Review │ Done   │                │
+│ Backlog │ Ready │ In Progress │ Needs Design │ Needs Human │ Review │ Done │
 │  …  …   │ T001  │ T003     │        │        │  ↙ T001 Ready  │
 │         │ T002  │          │        │        │ ° picked       │
 │         │ T007  │          │        │        │                │
 ├──────────────────────────────────────────────┼────────────────┤
-│  T001 → plan/001-feature → task/T001 → build → merge → Done  │
-│  T002 → plan/001-feature → task/T002 → build → merge → Done  │
-│  T003 → plan/001-feature → task/T003 → build → merge → Done  │
+│  T001 → build task/T001 → Review → Done → human closes issue │
+│       → merge into plan/001-feature → clean ticket worktree   │
+│  T002/T003 follow the same human-gated lifecycle              │
 │                                                              │
-│  All 3 Done → gh pr create plan/001-feature → main           │
+│  All tasks closed + merged → plan/001-feature PR → main       │
 │  Reviewers: @reviewer1 @reviewer2                            │
 │  Labels: board-agent                                         │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Every card for a plan, once done, lands together in one PR.
-PR generation is per-plan: when all cards reach `Done`, a PR opens from
-`plan/<slug>` into `main`.
+Review PASS moves a card to `Done` without merging or closing its issue. The
+persistent ticket worktree stays available for manual validation. When the
+human closes the issue, board-agent merges its task branch into `plan/<slug>`
+and removes the worktree. The plan PR opens only after every task is Done,
+manually closed, merged, and cleaned.
 
 ## Quickstart
 
 ```bash
-# 1. Install board-agent AND its peer dep
-pi install npm:@quintinshaw/pi-dynamic-workflows
+# 1. Install board-agent (pi-dynamic-workflows is bundled)
 pi install npm:@mancioshell/pi-board-agent
 /reload
 
@@ -63,16 +62,15 @@ pi install npm:@mancioshell/pi-board-agent
 
 ## Prerequisites
 
-- [Pi](https://pi.dev/) (any recent version)
-- [pi-dynamic-workflows](https://pi.dev/packages/@quintinshaw/pi-dynamic-workflows) `>=2.0.0` (installed as peer)
+- [Pi](https://pi.dev/) `>=0.80.8`
+- Bundled [pi-dynamic-workflows](https://pi.dev/packages/@quintinshaw/pi-dynamic-workflows) `^3.10.0`
 - `gh` CLI authenticated with the `project` scope:
   ```bash
   gh auth login
   gh auth refresh -s project
   ```
-- A **GitHub Project (v2)** with these column names on a `Status` single-select
-  field: `Backlog`, `Ready`, `Building`, `Review`, `Done`.
-- A `Plan` single-select field whose values match your spec-kit feature slugs
+- A **GitHub Project (v2)** with these `Status` options: `Backlog`, `Ready`, `In Progress`, `Needs Design`, `Needs Human`, `Review`, `Done`. Add `Needs Human` manually to an existing Project; `init-project` intentionally does not rewrite existing option lists.
+- A `Plan` text or single-select field whose values match your feature slugs
   (e.g. `001-auth`, `002-dashboard`).
 
 ## Configuration
@@ -85,13 +83,16 @@ project:
 
 columns:
   ready: "Ready"
-  building: "Building"
+  building: "In Progress"
+  needs_design: "Needs Design"
+  needs_human: "Needs Human"
   review: "Review"
   done: "Done"
+  backlog: "Backlog"
 status_field: "Status"
 plan_field: "Plan"
 
-max_workers: 2     # 1-16, parallel builder agents
+max_workers: 2     # global cap across running/paused/resuming builders
 tick_seconds: 90   # 60-120 recommended (safe for GraphQL rate limit)
 branches:
   base: "main"
@@ -108,45 +109,44 @@ builder_timeout_ms: 1800000     # 30 min, omit for no cap
 builder_retries: 1
 
 safety:
-  max_stuck_building: 3
   require_clean_worktree: true
   skip_closed_issues: true
 
-bot_identity: ""   # login for the assignee mutex; empty = gh user
+bot_identity: ""   # login for the assignee claim guard; empty = gh user
 ```
 
 ## How it works
 
 | Component | Role |
 |-----------|------|
-| `/board-agent run` | Polling loop. Every `tick_seconds`: fetch all cards, pick `Ready` cards (max `max_workers`), claim via assignee, dispatch a pi-dynamic-workflows wave. |
-| `skills/board-agent/SKILL.md` | Builder procedure: worktree → task branch → implement → commit → push → merge into plan branch → return JSON outcome. |
-| pi-dynamic-workflows `workflow` tool | Fan-out `agent()` calls with `isolation: "worktree"`. Each builder runs in its own throwaway worktree. |
-| `plan.ts` | Detects when all cards in a plan are `Done`, then opens `gh pr create plan/<slug> -> main`. |
-| `inflight.ts` | Lockfile registry under `.pi/board-agent/inflight/` to survive crashes and avoid double-dispatch. |
-| `/board-agent stop` | Stops the loop, posts comments on in-flight cards, releases assignee mutexes. |
+| `/board-agent run` | Starts one owner. Every tick reconciles persisted runs, then fills `max_workers - activeCount()` globally. Calling it again is a no-op unless it promotes a startup recovery-only loop. |
+| `ticket-executor.ts` | Owns final card refetch, claim, worktree/run association, recovery, and idempotent outcome transitions. |
+| `ticket-worktree.ts` | Atomically stores the v2 execution record and retains the worktree through review and human validation. |
+| pi-dynamic-workflows `WorkflowManager` | Persists run status, args, journal, result, and lease; one manager/agent per ticket worktree. |
+| `owner-lock.ts` | Native `fs.open(..., "wx")` lock prevents a second local board-agent owner. |
+| `inflight.ts` | Compatibility only: quarantines and archives legacy inflight JSON; new runs do not write it. |
+| `/board-agent stop` | Waits for the current tick, pauses managed runs durably, then releases the owner lock. |
 
-### Three safety layers
+### Recovery and safety
 
-1. **Assignee mutex**: before spawning a builder, board-agent claims the card
-   as an assignee on GitHub. No two agents can claim the same card.
-2. **Local lockfiles**: `.pi/board-agent/inflight/<itemId>.json` — the
-   lockfile is written **before** the assignee claim, survives crashes.
-3. **Orphan scan**: on startup, the loop detects existing lockfiles and
-   reports stale cards without re-dispatching.
+1. **Owner + claim guards**: one local owner lock, followed by an assignee mutation and a second full card refetch.
+2. **Durable managed runs**: WorkflowManager persists the run before its agent starts. The ticket record associates that run with the retained worktree.
+3. **Fail-closed reconciliation**: only a clean, matching paused worktree resumes. Dirty, missing, malformed, failed, or ambiguous state moves that ticket to `Needs Human` without blocking siblings.
+4. **Idempotent terminal mutations**: run markers prevent duplicate comments, and the active record remains until GitHub status/comment updates succeed.
 
 ### Branch model
 
 ```
 main
- └─ plan/001-auth   ← long-lived plan branch, re-used across waves
-     ├─ task/T001   ← worktree subagent #1, merged with --squash/--no-ff
-     ├─ task/T002   ← worktree subagent #2
-     └─ task/T003   ← worktree subagent #3
+ └─ plan/001-auth   ← long-lived plan branch
+     ├─ task/t001   ← persistent worktree until issue #1 is closed
+     ├─ task/t002   ← persistent worktree until issue #2 is closed
+     └─ task/t003   ← persistent worktree until issue #3 is closed
 ```
 
-When all 3 reach Done → **one PR**: `plan/001-auth` → `main`, with
-reviewers from config.
+AI review moves each task to Done but leaves it unmerged. Closing the linked
+issue is the human approval signal. Once all tasks are closed, merged, and
+cleaned, board-agent opens **one PR**: `plan/001-auth` → `main`.
 
 ## Commands
 
@@ -154,36 +154,29 @@ reviewers from config.
 |---------|-------------|
 | `/board-agent init` | Write `.pi/board-agent.yml` template |
 | `/board-agent lint` | Check: config, `gh` auth, project exists, fields present |
-| `/board-agent status` | Board snapshot: cards per column, plans, loop stats |
+| `/board-agent status` | Board snapshot plus each active run ID/status/worktree and legacy/orphan/Needs Human counts |
 | `/board-agent run` | Start autonomous polling loop |
-| `/board-agent stop` | Graceful stop — releases assignees, posts status comments |
+| `/board-agent stop` | Graceful stop — pause runs, settle persistence, release owner lock |
 
 ## FAQ
 
 **Can I resume after a crash?**
 
-Yes. The board is the source of truth. Re-run `/board-agent run` and the
-loop will pick up cards in the `Building` column as stale items and skip
-them. Move them back to `Ready` manually to retry, or inspect the comments
-on the linked issue.
+Yes. On startup or `/reload`, active ticket records recreate their WorkflowManagers. A clean paused worktree resumes from its journal; a completed persisted result is applied once. Unsafe or ambiguous state goes to `Needs Human` and keeps the worktree for inspection.
 
 **What if a builder fails?**
 
-The card is moved back to `Ready`. The next wave will pick it up and retry
-(up to `builder_retries` times). If it keeps failing, the error message is
-posted as a comment on the linked issue.
+Recoverable connection/empty-output failures use `builder_retries` inside the same managed run. A builder-reported failure, failed/aborted manager, or malformed/missing result moves the card to `Needs Human`; automation never loops it back to Ready.
 
 **What about merge conflicts?**
 
-The builder reports a `failure` outcome. The card goes back to `Ready`.
-A comment is posted on the linked issue with the conflict details so a
-human can resolve it.
+Builders never merge. If finalization conflicts after the human closes the
+issue, board-agent leaves the ticket worktree and state intact, skips the plan
+PR, and retries on a later tick after a human resolves the conflict.
 
 **Do I need to keep pi running the whole time?**
 
-For v0.1, yes — the loop runs in the foreground TUI session. At some point
-you will need to manually switch Done cards to Done (the review gate).
-A future version will support daemonized execution.
+No agent can execute while Pi is off, but managed state survives normal shutdown and process restarts. The next Pi session automatically reconciles any active ticket record; `auto_start: true` also keeps admitting new Ready cards.
 
 ## Development
 
@@ -204,16 +197,16 @@ the autonomous GitHub Project board executor for Claude Code.
 | Area | super-board | pi-board-agent |
 |---|---|---|
 | **Host agent** | Claude Code | [Pi](https://pi.dev/) |
-| **Worker model** | Dynamic workflows (`workflows/super-board-wave.js`) or `claude -p` headless | [pi-dynamic-workflows](https://github.com/QuintinShaw/pi-dynamic-workflows) fan-out with `parallel()` + `isolation: "worktree"` |
+| **Worker model** | Dynamic workflows (`workflows/super-board-wave.js`) or `claude -p` headless | [pi-dynamic-workflows](https://github.com/QuintinShaw/pi-dynamic-workflows) builders run in board-agent's persistent ticket worktrees; reviewers use ephemeral isolation |
 | **Plan grouping** | No plan concept — cards are independent | Cards are grouped by a `plan_field` on the project (e.g. `Plan: 001-auth`). When ALL cards of a plan reach `Done`, a single cumulative PR from `plan/<slug>` → `main` is opened |
-| **PR model** | One PR per card (opened by builder) | **One PR per plan** — all cards of a plan share a long-lived `plan/<slug>` branch. Each builder merges its task into that branch; the PR is opened once by the orchestrator |
-| **Review gate** | `super-review` skill runs automated review, with optional `human_approves_merge` | Cards land in `Review` after build; the orchestrator leaves them there (manual approval column). The PR reviewers from config are requested on the plan PR |
+| **PR model** | One PR per card (opened by builder) | **One PR per plan** — builders push task branches; manual issue closure triggers task→plan merge; the orchestrator opens the cumulative plan PR |
+| **Review gate** | `super-review` skill runs automated review, with optional `human_approves_merge` | AI PASS moves the card to Done without closing or merging. The human validates the persistent worktree and closes the issue to approve merge |
 | **QA lane** | `super-qa` skill runs Playwright path specs on the worker's branch | Not built (v0.1). The `Review` column is the sole post-build gate. A future version will add a `super-qa` equivalent via pi-dynamic-workflows |
-| **Mutex / claim** | Assignee claim on GitHub issue + `.claude/super-board/inflight/` lockfile | Same double-layer: assignee claim via `gh issue edit --add-assignee` + `.pi/board-agent/inflight/<itemId>.json` lockfile |
-| **Worktree** | Manual `git worktree` management in `super-board-wave.js` | Delegated to pi-dynamic-workflows' built-in `isolation: "worktree"` — one throwaway worktree per agent, cleaned up automatically |
-| **Saved workflows** | None — scripts are generated inline | The workflow script generated by `workflow-prompt.ts` can be saved as a `/board-agent-wave-<slug>` command via `/workflows save` |
-| **Stop/resume** | `/super-board stop` posts comments + releases mutexes. `/super-board run <slug>` resumes from board state | Same pattern: `/board-agent stop` releases assignees + clears inflight lockfiles. `/board-agent run` always resumes from the board as source of truth |
-| **Offline test** | `tests/test-wave-plan.sh` + `tests/test_status_parse.py` | `tests/run-offline.sh` — 30 assertions covering config parsing, inflight lifecycle, plan-summary computation, workflow-source generation, and loop tick orchestration |
+| **Mutex / claim** | Assignee claim on GitHub issue + `.claude/super-board/inflight/` lockfile | Owner lock + assignee claim/refetch + WorkflowManager run lease; legacy inflight files are quarantine-only |
+| **Worktree** | Manual `git worktree` management in `super-board-wave.js` | One persistent worktree per ticket, retained through review and human validation, then removed after manual-close merge |
+| **Execution persistence** | Wave scripts are process-local | Each ticket script, args, journal, and result are persisted by WorkflowManager and associated with its v2 ticket record |
+| **Stop/resume** | `/super-board stop` posts comments + releases mutexes. `/super-board run <slug>` resumes from board state | `/board-agent stop` pauses managers and journals before releasing ownership; startup reconciles persisted runs/results |
+| **Offline test** | `tests/test-wave-plan.sh` + `tests/test_status_parse.py` | `tests/run-offline.sh` — durable executor, fake-agent WorkflowManager persistence, worktree retention/finalization, and recovery checks |
 
 ## License
 

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Replaced process-local workflow promises and inflight locks with one durable WorkflowManager run per retained ticket worktree.
+- Added startup reconciliation, launch-window adoption, owner locking, global worker accounting, idempotent outcomes, and the `Needs Human` recovery lane.
+- Graceful stop now pauses and settles managed runs; legacy inflight files are quarantine-only.
+- Bundled `@quintinshaw/pi-dynamic-workflows` 3.10 and raised the Pi peer minimum to 0.80.8.
+
 ## [0.1.1] - 2026-06-22
 
 ### Added

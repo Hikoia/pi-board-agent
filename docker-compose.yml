@@ -30,9 +30,9 @@ services:
       # The target repository the board-agent operates on (must have a
       # .pi/board-agent.yml with project.number, columns, auto_start: true).
       - ./repos/board-game-organizer:/workspace
-      # Board-agent + pi-dynamic-workflows source (for dev: edit and reload).
+      # Board-agent source (for dev: edit and reload).
       - .:/app/pi-board-agent
-      # Persistent pi + board state (sessions, context, inflight, etc).
+      # Persistent Pi sessions and WorkflowManager journals.
       - pi-agent-home:/root/.pi/agent
     logging:
       driver: json-file

@@ -21,6 +21,7 @@ columns:
   review: "Review"
   done: "Done"
   needs_design: "Needs Design"
+  needs_human: "Needs Human"
   backlog: "Backlog"
 status_field: "Status"
 type_field: "Kind"
@@ -32,7 +33,7 @@ type_field: "Kind"
 plan_field: "Plan"
 
 # ── Concurrency ─────────────────────────────────────────────────────────────
-# Max parallel builder workers per wave. Capped at 16 by pi-dynamic-workflows.
+# Global cap across running, paused, and resuming ticket builders. Capped at 16.
 max_workers: 2
 
 # Polling interval (seconds) of the autonomous loop. 60-120 is recommended
@@ -45,7 +46,7 @@ branches:
   plan_prefix: "plan/"          # branch prefix for the long-lived plan branch
   task_prefix: "task/"          # branch prefix for short-lived per-task branches
 
-# How per-task branches get merged into the plan branch:
+# How a manually accepted task is merged after its GitHub issue is closed:
 #   "squash" -> one commit per task on plan/<slug> (recommended, clean PR)
 #   "merge"  -> preserve full commit history of each task branch
 task_merge_strategy: "squash"
@@ -136,15 +137,13 @@ auto_start: false
 
 # ── Safety rails ────────────────────────────────────────────────────────────
 safety:
-  # Never start a wave if more than this many cards are stuck in `building`
-  # (from a previous crashed run). The user must manually unstick them.
-  max_stuck_building: 3
-  # Refuse to run if the working tree is dirty.
+  # Refuse to launch new work if the main working tree is dirty. Existing
+  # managed runs are still reconciled so one ticket cannot block the board.
   require_clean_worktree: true
   # Skip cards whose linked issue is already closed.
   skip_closed_issues: true
 
 # ── Bot identity (optional) ─────────────────────────────────────────────────
-# When set, board-agent uses this login for the assignee mutex (atomic claim).
+# When set, board-agent uses this login for the assignee claim + refetch guard.
 # Leave empty to use the gh-authenticated user.
 bot_identity: ""

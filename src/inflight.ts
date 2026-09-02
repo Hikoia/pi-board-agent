@@ -1,16 +1,7 @@
-/**
- * Local inflight registry: lockfiles under `.pi/board-agent/inflight/`.
- *
- * Purpose:
- *  - Survive a pi restart: if a wave was interrupted, the lockfile tells us
- *    which cards were in-flight so we can rehydrate state from GitHub.
- *  - Close the 10-30s race between "claim assignee" and the worker being
- *    spawned by pi-dynamic-workflows. The lockfile is written *before*
- *    the assignee claim is attempted; if the process dies in between, the
- *    next tick's orphan-scan will detect it and clean up.
- */
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+/** Legacy inflight registry. New execution uses TicketWorktrees + WorkflowManager;
+ * these files are read only for one-time quarantine and forensic archival. */
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 
 export interface InflightRecord {
   itemId: string;          // ProjectV2 item id
@@ -47,12 +38,36 @@ export class Inflight {
     const p = this.pathFor(itemId);
     if (existsSync(p)) rmSync(p, { force: true });
   }
+  archive(itemId: string): string | undefined {
+    const source = this.pathFor(itemId);
+    if (!existsSync(source)) return undefined;
+    const archiveDir = resolve(dirname(this.dir), "forensic-archive", "inflight");
+    mkdirSync(archiveDir, { recursive: true });
+    const target = join(archiveDir, `${Date.now()}-${itemId.replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+    renameSync(source, target);
+    return target;
+  }
   list(): InflightRecord[] {
     if (!existsSync(this.dir)) return [];
     const out: InflightRecord[] = [];
     for (const f of readdirSync(this.dir)) {
       if (!f.endsWith(".json")) continue;
-      try { out.push(JSON.parse(readFileSync(join(this.dir, f), "utf-8")) as InflightRecord); } catch { /* skip */ }
+      const itemId = f.slice(0, -5);
+      try {
+        const record = JSON.parse(readFileSync(join(this.dir, f), "utf-8")) as InflightRecord;
+        if (!record || record.itemId !== itemId) throw new Error("legacy inflight identity mismatch");
+        out.push(record);
+      } catch {
+        out.push({
+          itemId,
+          issueNumber: 0,
+          cardTitle: "(corrupt legacy inflight record)",
+          plan: "",
+          taskBranch: "",
+          planBranch: "",
+          startedAt: 0,
+        });
+      }
     }
     return out;
   }

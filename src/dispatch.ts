@@ -1,17 +1,4 @@
-/**
- * Real dispatch for builder waves via pi-dynamic-workflows.
- *
- * v0.1 had a placeholder dxRun/dxResult because the `workflow` tool is
- * LLM-callable only. pi-dynamic-workflows also exports a plain programmatic
- * API (`runWorkflow`) that extensions can call directly: it executes the same
- * workflow script the LLM would run — parallel `agent()` fan-out with
- * git-worktree isolation, per-phase/per-agent model routing, token/cost
- * accounting and resume — and returns the script's return value (our
- * per-card outcomes).
- */
-import { runWorkflow } from "@quintinshaw/pi-dynamic-workflows";
-
-/** Outcome shape the builder agents return (schema in workflow-prompt.ts). */
+/** Outcome shape returned by one persisted builder workflow. */
 export interface WaveOutcome {
   taskKey: string;
   itemId: string;
@@ -22,52 +9,31 @@ export interface WaveOutcome {
   error?: string;
 }
 
-export interface DispatchOptions {
-  cwd: string;
-  script: string;
-  maxAgents: number;
-  agentTimeoutMs?: number;
-  runId: string;
-  onLog?: (line: string) => void;
-}
-
-/**
- * Normalize the raw workflow result to WaveOutcome[].
- * The script returns an array (one entry per agent); entries can be null
- * when a parallel thunk threw, and defensive parsing keeps malformed items
- * out without failing the whole wave.
- */
+/** Strictly normalize a persisted workflow result; malformed entries are not guessed. */
 export function normalizeWaveResults(raw: unknown): WaveOutcome[] {
-  if (!Array.isArray(raw)) return [];
-  const out: WaveOutcome[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== "object") continue;
-    const r = item as Record<string, unknown>;
-    if (typeof r.taskKey !== "string" || typeof r.itemId !== "string") continue;
-    out.push({
-      taskKey: r.taskKey,
-      itemId: r.itemId,
-      status: r.status === "success" ? "success" : "failure",
-      branch: typeof r.branch === "string" ? r.branch : undefined,
-      commits: typeof r.commits === "number" ? r.commits : undefined,
-      summary: typeof r.summary === "string" ? r.summary : undefined,
-      error: typeof r.error === "string" ? r.error : undefined,
+  const value = raw && typeof raw === "object" && !Array.isArray(raw) && "result" in raw
+    ? (raw as { result?: unknown }).result
+    : raw;
+  if (!Array.isArray(value)) return [];
+
+  const outcomes: WaveOutcome[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") return [];
+    const result = item as Record<string, unknown>;
+    if (
+      typeof result.taskKey !== "string" ||
+      typeof result.itemId !== "string" ||
+      (result.status !== "success" && result.status !== "failure")
+    ) return [];
+    outcomes.push({
+      taskKey: result.taskKey,
+      itemId: result.itemId,
+      status: result.status,
+      branch: typeof result.branch === "string" ? result.branch : undefined,
+      commits: typeof result.commits === "number" ? result.commits : undefined,
+      summary: typeof result.summary === "string" ? result.summary : undefined,
+      error: typeof result.error === "string" ? result.error : undefined,
     });
   }
-  return out;
-}
-
-/** Run a builder wave with pi-dynamic-workflows and return normalized outcomes. */
-export async function dispatchWave(opts: DispatchOptions): Promise<WaveOutcome[]> {
-  const res = await runWorkflow(opts.script, {
-    cwd: opts.cwd,
-    runId: opts.runId,
-    maxAgents: opts.maxAgents,
-    ...(opts.agentTimeoutMs !== undefined
-      ? { agentTimeoutMs: opts.agentTimeoutMs }
-      : {}),
-    persistLogs: true,
-    ...(opts.onLog ? { onLog: opts.onLog } : {}),
-  });
-  return normalizeWaveResults(res.result);
+  return outcomes;
 }

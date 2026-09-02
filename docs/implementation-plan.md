@@ -1,5 +1,7 @@
 # pi-board-agent — Implementation Plan (v0.2) — REV 2
 
+> **Historical design document.** The dispatch, inflight, and shutdown design below is superseded by the durable per-ticket executor in [`architecture.md`](architecture.md).
+
 > Revisione del design dopo le decisioni architetturali dell'utente.
 > Documento di lavoro — nessuna modifica al codice prima dell'approvazione.
 

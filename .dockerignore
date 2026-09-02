@@ -1,0 +1,5 @@
+.git
+.pi
+node_modules
+tests/gen
+*.tgz

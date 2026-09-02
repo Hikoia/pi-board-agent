@@ -42,6 +42,7 @@ echo "--- config ---"
 
 cat >"$GEN_DIR/test-config.ts" <<'ENDTS'
 import { _DEFAULTS, loadConfig, validateConfig, ConfigError } from "../../src/config.js";
+import { buildStandardSpecs } from "../../src/init-project.js";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -53,7 +54,12 @@ if (cfg.max_workers === 2) console.log("PASS: defaults max_workers=2");
 else console.log("FAIL: defaults max_workers != 2");
 if (cfg.columns.ready === "Ready") console.log("PASS: defaults columns.ready=Ready");
 else console.log("FAIL: defaults columns.ready != Ready");
-if (!cfg.review.enabled && cfg.models.review === "deepseek-v4-flash-0731") console.log("PASS: AI review defaults disabled with model");
+if (cfg.columns.needs_human === "Needs Human") console.log("PASS: defaults columns.needs_human=Needs Human");
+else console.log("FAIL: defaults columns.needs_human");
+const statuses = buildStandardSpecs(cfg)[0].options ?? [];
+if (statuses.length === 7 && statuses.includes("Needs Human")) console.log("PASS: init-project creates seven statuses including Needs Human");
+else console.log("FAIL: init-project status spec");
+if (!_DEFAULTS.review.enabled && _DEFAULTS.models.review === "deepseek-v4-flash-0731") console.log("PASS: AI review defaults disabled with model");
 else console.log("FAIL: AI review defaults");
 
 writeFileSync(resolve(dotpi, "board-agent.yml"), "max_workers: 4\ncolumns:\n  ready: Dev-Ready\n");
@@ -67,6 +73,12 @@ try { validateConfig({ ...cfg, project: { owner: "", number: 0 } }); console.log
 catch(e) { if (e instanceof ConfigError) console.log("PASS: validateConfig rejects number=0"); else console.log("FAIL: wrong error type"); }
 try { validateConfig({ ...cfg, max_workers: 20 }); console.log("FAIL: validateConfig accepted max_workers=20"); }
 catch(e) { if (e instanceof ConfigError) console.log("PASS: validateConfig rejects max_workers>16"); else console.log("FAIL: wrong error type"); }
+try { validateConfig({ ...cfg, max_workers: 1.5 }); console.log("FAIL: validateConfig accepted fractional max_workers"); }
+catch(e) { if (e instanceof ConfigError) console.log("PASS: validateConfig requires integer max_workers"); else console.log("FAIL: wrong error type"); }
+try { validateConfig({ ...cfg, columns: { ...cfg.columns, needs_human: "" } }); console.log("FAIL: validateConfig accepted empty needs_human"); }
+catch(e) { if (e instanceof ConfigError) console.log("PASS: validateConfig requires needs_human"); else console.log("FAIL: wrong error type"); }
+try { validateConfig({ ...cfg, columns: { ...cfg.columns, needs_human: cfg.columns.review } }); console.log("FAIL: validateConfig accepted duplicate statuses"); }
+catch(e) { if (e instanceof ConfigError) console.log("PASS: validateConfig requires distinct statuses"); else console.log("FAIL: wrong error type"); }
 ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-config.ts"
 echo
@@ -95,7 +107,10 @@ else console.log("FAIL: inflight list length != 1");
 const byPlan = inf.listByPlan("test-plan");
 if (byPlan.length === 1) console.log("PASS: inflight listByPlan length=1");
 else console.log("FAIL: inflight listByPlan length != 1");
-
+const archived = inf.archive("PVTI_abc");
+if (archived && !inf.has("PVTI_abc")) console.log("PASS: legacy inflight archives out of active directory");
+else console.log("FAIL: legacy inflight archive");
+inf.write(rec);
 inf.clear("PVTI_abc");
 if (!inf.has("PVTI_abc")) console.log("PASS: inflight clear removes item");
 else console.log("FAIL: inflight clear did not remove");
@@ -162,17 +177,15 @@ if (tasks[0].taskKey === "T001") console.log("PASS: task[0].taskKey=T001");
 else console.log("FAIL: task[0].taskKey != T001");
 if (tasks[1].taskBranch === "task/t002") console.log("PASS: task[1].taskBranch=task/t002");
 else console.log("FAIL: task[1].taskBranch != task/t002");
-const src = renderWorkflowSource({ cfg, planSlug: "001-auth", baseBranch: "main", tasks, skillName: "board-agent" });
-if (src.includes("parallel(")) console.log("PASS: source contains parallel()");
-else console.log("FAIL: source missing parallel()");
-if (src.includes("isolation: 'worktree'")) console.log("PASS: source contains worktree isolation");
-else console.log("FAIL: source missing worktree isolation");
+const src = renderWorkflowSource({ cfg, planSlug: "001-auth", baseBranch: "main", tasks: [tasks[0]], skillName: "board-agent" });
+if (!src.includes("parallel(") && !src.includes("isolation: 'worktree'")) console.log("PASS: builder uses the prepared persistent worktree");
+else console.log("FAIL: builder still creates an ephemeral worktree");
 if (src.includes("[T001] Add login form")) console.log("PASS: source embeds card title");
 else console.log("FAIL: source missing card title");
-if (src.includes("task_merge_strategy")) console.log("PASS: source embeds merge strategy");
-else console.log("FAIL: source missing merge strategy");
-if (src.includes("closes #' + (t.issueNumber")) console.log("PASS: source references issue number in commit instructions");
-else console.log("FAIL: source missing issue reference");
+if (src.includes("Do NOT merge") && !src.includes("git merge --")) console.log("PASS: builder leaves task branch unmerged");
+else console.log("FAIL: builder may merge before manual close");
+try { renderWorkflowSource({ cfg, planSlug: "001-auth", baseBranch: "main", tasks, skillName: "board-agent" }); console.log("FAIL: multi-task workflow accepted"); }
+catch { console.log("PASS: persistent worktree workflow requires one task"); }
 ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-wf.ts"
 echo
@@ -182,7 +195,7 @@ echo "--- loop tick (dry-run) ---"
 
 cat >"$GEN_DIR/test-loop.ts" <<'ENDTS'
 import { createLoopState, BoardLoop, type LoopDeps } from "../../src/loop.js";
-import { Inflight } from "../../src/inflight.js";
+import type { TicketExecutor } from "../../src/ticket-executor.js";
 import { loadConfig } from "../../src/config.js";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
@@ -191,24 +204,33 @@ import { execSync } from "node:child_process";
 const cwd = process.env.TMP_DIR!;
 const dotpi = resolve(cwd, ".pi");
 mkdirSync(dotpi, { recursive: true });
-writeFileSync(resolve(dotpi, "board-agent.yml"), `project:\n  owner: "test"\n  number: 1\nmax_workers: 1\ntick_seconds: 9999\n`);
+writeFileSync(resolve(dotpi, "board-agent.yml"), `project:\n  owner: "test"\n  number: 1\nmax_workers: 1\ntick_seconds: 9999\nrefine:\n  enabled: false\nwatchdog:\n  enabled: false\nreview:\n  enabled: false\n`);
 const cfg = loadConfig(cwd);
 execSync("git init && git config user.email t@t && git config user.name t && git remote add origin https://github.com/test/repo.git && git checkout -b main && git commit --allow-empty -m init", { cwd, stdio: "ignore" });
 const state = createLoopState();
+let shutdowns = 0;
+const executor: TicketExecutor = {
+  reconcile: async () => ({ active: [], resumed: 0, adopted: 0, needsHuman: 0, legacy: 0, orphans: 0, errors: 0 }),
+  launch: async () => ({ status: "skipped", reason: "test" }),
+  activeCount: () => 0,
+  shutdown: async () => { shutdowns++; },
+};
 const deps: LoopDeps = {
   cwd, cfg, repoOwner: "test", repoName: "repo", botLogin: "bot",
-  meta: { projectId: "P", statusFieldId: "S", statusOptions: { Ready: "o1", "In Progress": "o2", Review: "o3", Done: "o4" } },
-  callback: (msg) => void(0),
-  dxRun: async () => "run-1",
-  dxResult: async () => [{ taskKey: "T001", itemId: "c1", status: "success", branch: "t", commits: 1, summary: "ok" }],
+  meta: { projectId: "P", statusFieldId: "S", statusOptions: { Ready: "o1", "In Progress": "o2", "Needs Human": "o3", Review: "o4", Done: "o5" } },
+  callback: () => undefined,
+  listCards: async () => [],
 };
-const loop = new BoardLoop(deps, state, new Inflight(cwd));
-loop.start();
+const loop = new BoardLoop(deps, state, executor);
+await loop.start();
 if (state.running) console.log("PASS: loop.start sets running=true");
 else console.log("FAIL: loop.start did not set running");
-loop.stop();
-if (!state.running) console.log("PASS: loop.stop clears running");
-else console.log("FAIL: loop.stop did not clear running");
+await loop.start();
+if (state.tickCount === 1) console.log("PASS: duplicate loop.start is a no-op");
+else console.log("FAIL: duplicate loop.start launched another tick");
+await loop.stop();
+if (!state.running && shutdowns === 1) console.log("PASS: async loop.stop pauses executor and clears running");
+else console.log("FAIL: loop.stop did not settle executor");
 ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-loop.ts"
 echo
@@ -236,8 +258,10 @@ else console.log("FAIL: normalize failure keeps error");
 // normalizeWaveResults: defensive (nulls, malformed, non-array)
 if (normalizeWaveResults(null).length === 0) console.log("PASS: normalize null -> []");
 else console.log("FAIL: normalize null -> []");
-if (normalizeWaveResults([null, { x: 1 }, { taskKey: "T3", itemId: "PVTI_c" }]).length === 1) console.log("PASS: normalize skips null/malformed");
-else console.log("FAIL: normalize skips null/malformed");
+if (normalizeWaveResults([null, { x: 1 }, { taskKey: "T3", itemId: "PVTI_c" }]).length === 0) console.log("PASS: normalize rejects null/malformed");
+else console.log("FAIL: normalize rejects null/malformed");
+if (normalizeWaveResults([raw[0], null]).length === 0) console.log("PASS: normalize rejects a partly malformed result");
+else console.log("FAIL: normalize accepted a partly malformed result");
 
 // workflow-prompt: rendered script includes the configured builder model
 const cfg: Config = { ..._DEFAULTS, models: { builder: "deepseek-v4-flash-0731", refine: "deepseek-v4-flash-0731", review: "deepseek-v4-flash-0731", watch: "deepseek-v4-flash-0731" } };
@@ -246,8 +270,8 @@ const task = buildTasksForWave(cfg, "001-auth", [card])[0];
 const script = renderWorkflowSource({ cfg, planSlug: "001-auth", baseBranch: "main", tasks: [task], skillName: "board-agent" });
 if (script.includes("deepseek-v4-flash-0731")) console.log("PASS: workflow script embeds builder model");
 else console.log("FAIL: workflow script embeds builder model");
-if (script.includes("isolation: 'worktree'")) console.log("PASS: workflow script uses worktree isolation");
-else console.log("FAIL: workflow script uses worktree isolation");
+if (!script.includes("isolation: 'worktree'") && script.includes("persistent worktree")) console.log("PASS: workflow script uses prepared persistent worktree");
+else console.log("FAIL: workflow script does not use prepared persistent worktree");
 if (script.includes('"issueNumber":12')) {
   console.log("PASS: workflow payload embeds issue number");
 } else {
@@ -411,19 +435,17 @@ const source = renderReviewWorkflowSource({
   model: "review-model",
   timeoutMs: 600000,
 });
-if (source.includes("review-model") && source.includes("task/t001") && source.includes("rejects invalid input") && source.includes("isolation: 'worktree'")) console.log("PASS: review workflow embeds task/model/schema");
+if (source.includes("review-model") && source.includes("task/t001") && source.includes("rejects invalid input") && source.includes("git checkout --detach origin/") && source.includes("isolation: 'worktree'")) console.log("PASS: review workflow embeds task/model/schema");
 else console.log("FAIL: review workflow embeds task/model/schema");
 const comment = renderReviewComment(fail!);
 if (comment.includes("AI review") && comment.includes("src/a.ts") && comment.includes("Ready")) console.log("PASS: review failure comment");
 else console.log("FAIL: review failure comment");
 
 const loopSource = readFileSync(new URL("../../src/loop.ts", import.meta.url), "utf8");
-const passBlock = loopSource.slice(
-  loopSource.indexOf('if (review.verdict === "pass")'),
-  loopSource.indexOf('if (!card.number || !card.repoOwner || !card.repoName)', loopSource.indexOf('if (review.verdict === "pass")')),
-);
-if (passBlock.includes("await closeIssue(") && passBlock.indexOf("await closeIssue(") < passBlock.indexOf("await setStatus(")) console.log("PASS: accepted review closes issue before Done");
-else console.log("FAIL: accepted review closes issue before Done");
+const passStart = loopSource.indexOf('if (review.verdict === "pass")');
+const passBlock = loopSource.slice(passStart, loopSource.indexOf("        const commentId", passStart));
+if (!passBlock.includes("closeIssue(") && passBlock.includes("cfg.columns.done") && passBlock.includes("close issue #")) console.log("PASS: accepted review moves to Done and waits for manual close");
+else console.log("FAIL: accepted review does not wait for manual close");
 
 const ghSource = readFileSync(new URL("../../src/gh.ts", import.meta.url), "utf8");
 if (ghSource.includes("export async function closeIssue") && ghSource.includes('"issue", "close"') && ghSource.includes('"--reason", "completed"')) console.log("PASS: closeIssue marks GitHub issue completed");
@@ -432,15 +454,103 @@ ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-review.ts"
 echo
 
-# ---- summary ----
+# ---- 11. Persistent ticket worktree ----
+echo "--- ticket worktree ---"
+
+cat > "$GEN_DIR/test-ticket-worktree.ts" <<'ENDTS'
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { TicketWorktrees } from "../../src/ticket-worktree.js";
+
+const root = process.env.TMP_DIR!;
+const origin = join(root, "origin.git");
+const repo = join(root, "repo");
+mkdirSync(repo, { recursive: true });
+const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+git(root, "init", "--bare", origin);
+git(repo, "init", "-b", "main");
+git(repo, "config", "user.email", "test@example.com");
+git(repo, "config", "user.name", "Test");
+writeFileSync(join(repo, "README.md"), "base\n");
+git(repo, "add", ".");
+git(repo, "commit", "-m", "init");
+git(repo, "remote", "add", "origin", origin);
+git(repo, "push", "-u", "origin", "main");
+git(repo, "branch", "plan/demo", "main");
+git(repo, "push", "-u", "origin", "plan/demo");
+
+const task = {
+  itemId: "PVTI_demo",
+  taskKey: "T001",
+  issueNumber: 42,
+  title: "Validated change",
+  body: "acceptance",
+  taskBranch: "task/t001",
+  planBranch: "plan/demo",
+};
+const store = new TicketWorktrees(repo);
+const worktree = store.ensure(task, "demo");
+if (existsSync(worktree.path) && git(worktree.path, "branch", "--show-current") === "task/t001") console.log("PASS: ticket worktree persists on task branch");
+else console.log("FAIL: ticket worktree was not prepared");
+if (store.ensure(task, "demo").path === worktree.path) console.log("PASS: ticket worktree resumes deterministically");
+else console.log("FAIL: ticket worktree did not resume");
+const recordPath = join(repo, ".pi", "board-agent", "ticket-worktrees", "pvti_demo.json");
+const legacy = JSON.parse(readFileSync(recordPath, "utf8"));
+delete legacy.schemaVersion;
+delete legacy.issueNumber;
+writeFileSync(recordPath, JSON.stringify(legacy));
+if (store.read(task.itemId)?.schemaVersion === undefined) console.log("PASS: v1 ticket-worktree record remains readable");
+else console.log("FAIL: v1 ticket-worktree record unreadable");
+const upgraded = store.ensure(task, "demo");
+if (upgraded.schemaVersion === 2 && upgraded.issueNumber === 42) console.log("PASS: v1 record upgrades to v2");
+else console.log("FAIL: v1 record did not upgrade");
+store.beginLaunch(task.itemId, 123);
+store.setActiveRun(task.itemId, "run-test", 456);
+if (store.read(task.itemId)?.schemaVersion === 2 && (store.read(task.itemId) as any).activeRunId === "run-test") console.log("PASS: v2 active run round-trip");
+else console.log("FAIL: v2 active run round-trip");
+store.clearExecution(task.itemId, "run-test");
+writeFileSync(join(worktree.path, "feature.txt"), "validated\n");
+git(worktree.path, "add", "feature.txt");
+git(worktree.path, "commit", "-m", "feat: validated change");
+git(worktree.path, "push", "-u", "origin", "task/t001");
+let visibleBeforeClose = true;
+try { git(repo, "show", "origin/plan/demo:feature.txt"); } catch { visibleBeforeClose = false; }
+if (!visibleBeforeClose && existsSync(worktree.path)) console.log("PASS: task stays unmerged and worktree stays available");
+else console.log("FAIL: task merged or worktree disappeared before close");
+git(repo, "worktree", "lock", worktree.path);
+store.mergeAndRemove(worktree, "squash", 42, "Validated change");
+git(repo, "fetch", "origin", "plan/demo");
+if (git(repo, "show", "origin/plan/demo:feature.txt") === "validated") console.log("PASS: manual-close finalization merges task into plan");
+else console.log("FAIL: task was not merged into plan");
+if (!existsSync(worktree.path) && !store.has(task.itemId) && store.isMerged(task.itemId, task.planBranch, task.taskBranch)) console.log("PASS: finalized ticket worktree and state are cleaned");
+else console.log("FAIL: finalized ticket worktree or state remains");
+git(repo, "checkout", "-b", "task/legacy", "plan/demo");
+writeFileSync(join(repo, "legacy.txt"), "already merged\n");
+git(repo, "add", "legacy.txt");
+git(repo, "commit", "-m", "feat: legacy task");
+git(repo, "push", "-u", "origin", "task/legacy");
+git(repo, "checkout", "plan/demo");
+git(repo, "merge", "--squash", "task/legacy");
+git(repo, "commit", "-m", "legacy squash without board marker");
+git(repo, "push", "origin", "plan/demo");
+if (store.isMerged("legacy-item", "plan/demo", "task/legacy")) console.log("PASS: legacy squash merge is not applied twice");
+else console.log("FAIL: legacy squash merge was not detected");
+ENDTS
+TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-ticket-worktree.ts"
 echo
-echo "---"
-if ((FAIL > 0)); then
-  echo "pi-board-agent: ${FAIL} FAILED, ${PASS} passed"
-  exit 1
-else
-  echo "pi-board-agent: ALL CHECKS PASSED (${PASS}/$((PASS+FAIL)))"
-fi
+
+# ---- 12. Durable ticket executor ----
+echo "--- ticket executor ---"
+TMP_DIR="$(mktemp -d)" run_ts "$ROOT/tests/test-ticket-executor.ts"
+echo
+
+# ---- 13. WorkflowManager fake-agent integration ----
+echo "--- WorkflowManager persistence ---"
+MANAGER_TMP="$(mktemp -d)"
+mkdir -p "$MANAGER_TMP/home"
+TMP_DIR="$MANAGER_TMP" USERPROFILE="$MANAGER_TMP/home" run_ts "$ROOT/tests/test-workflow-manager.ts"
+echo
 
 # ---- 7. Refine phase (Phase C) ----
 echo "--- refine ---"
@@ -499,4 +609,13 @@ else console.log("FAIL: refine comment lists created tasks");
 ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-refine.ts"
 echo
+
+# ---- summary ----
+echo "---"
+if ((FAIL > 0)); then
+  echo "pi-board-agent: ${FAIL} FAILED, ${PASS} passed"
+  exit 1
+else
+  echo "pi-board-agent: ALL CHECKS PASSED (${PASS}/$((PASS+FAIL)))"
+fi
 

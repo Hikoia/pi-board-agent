@@ -141,8 +141,11 @@ project:
   number: $PROJECT_NUMBER
 
 columns:
+  backlog: "Backlog"
   ready: "$READY_COL"
-  building: "Building"
+  building: "In Progress"
+  needs_design: "Needs Design"
+  needs_human: "Needs Human"
   review: "Review"
   done: "$DONE_COL"
 status_field: "$STATUS_FIELD"
@@ -165,7 +168,6 @@ builder_timeout_ms: 1800000
 builder_retries: 1
 
 safety:
-  max_stuck_building: 3
   require_clean_worktree: true
   skip_closed_issues: true
 
@@ -180,8 +182,7 @@ echo "→ Running /board-agent lint..."
 echo "  (start pi and run '/board-agent lint' to verify everything works)"
 echo
 echo "Setup complete! Next steps:"
-echo "  1. pi install npm:@quintinshaw/pi-dynamic-workflows (if not already installed)"
-echo "  2. pi install npm:@mancioshell/pi-board-agent"
-echo "  3. /reload"
-echo "  4. /board-agent lint"
-echo "  5. /board-agent run"
+echo "  1. pi install npm:@mancioshell/pi-board-agent"
+echo "  2. /reload"
+echo "  3. /board-agent lint"
+echo "  4. /board-agent run"

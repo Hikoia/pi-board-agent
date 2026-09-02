@@ -50,16 +50,14 @@
     "LICENSE"
   ],
   "dependencies": {
+    "@quintinshaw/pi-dynamic-workflows": "^3.10.0",
     "yaml": "^2.5.0"
   },
+  "bundledDependencies": [
+    "@quintinshaw/pi-dynamic-workflows"
+  ],
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@quintinshaw/pi-dynamic-workflows": ">=2.0.0"
-  },
-  "peerDependenciesMeta": {
-    "@quintinshaw/pi-dynamic-workflows": {
-      "optional": false
-    }
+    "@earendil-works/pi-coding-agent": ">=0.80.8"
   },
   "engines": {
     "node": ">=18.0.0"

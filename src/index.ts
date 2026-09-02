@@ -17,100 +17,111 @@ import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 
 import { loadConfig, validateConfig, resolveOwner } from "./config.js";
-import { getProjectMetadata, whoami } from "./gh.js";
+import { getProjectMetadata, validateStatusOptions, whoami } from "./gh.js";
 import { createLoopState, BoardLoop, type LoopDeps } from "./loop.js";
 import { Inflight } from "./inflight.js";
-import { dispatchWave, type WaveOutcome } from "./dispatch.js";
+import { acquireOwnerLock } from "./owner-lock.js";
+import { createProductionTicketExecutor, inspectTicketExecutions } from "./ticket-executor.js";
+import { TicketWorktrees } from "./ticket-worktree.js";
 
 let loop: BoardLoop | null = null;
 let loopState = createLoopState();
 
-// Start the autonomous loop (shared by /board-agent run and auto_start).
-async function startBoardLoop(
-  cwd: string,
-  ui: { notify: (msg: string, level?: "info" | "warning" | "error") => void },
-): Promise<void> {
+function configuredStatuses(cfg: ReturnType<typeof loadConfig>): string[] {
+  return [
+    cfg.columns.backlog,
+    cfg.columns.ready,
+    cfg.columns.building,
+    cfg.columns.needs_design,
+    cfg.columns.needs_human,
+    cfg.columns.review,
+    cfg.columns.done,
+  ];
+}
+
+function hasRecoveryState(cwd: string): boolean {
+  const stateDir = resolve(cwd, CONFIG_DIR_NAME, "board-agent");
+  if (!existsSync(stateDir)) return false;
+  return new TicketWorktrees(cwd).list().some((record) =>
+    record.schemaVersion === 2 && Boolean(record.activeRunId || record.launchingAt)
+  ) || new Inflight(cwd).list().length > 0;
+}
+
+function statusPrefix(level: "info" | "warn" | "error"): string {
+  if (level === "error") return "❌";
+  if (level === "warn") return "⚠️";
+  return "✓";
+}
+
+// Start the autonomous loop (shared by /board-agent run, auto_start, and recovery).
+async function startBoardLoop(ctx: ExtensionContext, admitNewWork = true): Promise<void> {
+  if (loop?.isRunning()) {
+    if (admitNewWork && !loop.isAdmittingNewWork()) {
+      loop.enableAdmissions();
+      await loop.tickNow();
+      await loop.tickNow();
+      ctx.ui.notify(`[board-agent] Recovery loop promoted to autonomous mode.`, "info");
+    } else {
+      ctx.ui.notify(`[board-agent] Loop already running (tick=${loopState.tickCount}, active recovery preserved).`, "info");
+    }
+    return;
+  }
+
+  const cwd = ctx.cwd;
   const cfg = loadConfig(cwd);
   validateConfig(cfg);
   const { owner, repoName } = resolveOwner(cfg, cwd);
-
   const botLogin = cfg.bot_identity || (await whoami());
   const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
+  validateStatusOptions(meta, configuredStatuses(cfg));
+  const ownerLock = acquireOwnerLock(cwd, botLogin);
 
   const callback = (msg: string, level: "info" | "warn" | "error" = "info") => {
-    const prefix = level === "error" ? "❌" : level === "warn" ? "⚠️" : "✓";
-    ui.notify(`[board-agent] ${prefix} ${msg}`, level === "warn" ? "warning" : level);
+    ctx.ui.notify(`[board-agent] ${statusPrefix(level)} ${msg}`, level === "warn" ? "warning" : level);
   };
 
-  const inflight = new Inflight(cwd);
-
-  // Real dispatch (v0.2): pi-dynamic-workflows exposes a programmatic API
-  // (runWorkflow) usable directly from the extension — no LLM round-trip.
-  const pendingWaves = new Map<string, Promise<WaveOutcome[]>>();
-
-  const deps: LoopDeps = {
-    cwd,
-    cfg,
-    repoOwner: owner,
-    repoName,
-    botLogin,
-    meta,
-    callback,
-    dxRun: async (script: string): Promise<string> => {
-      const runId = `wave-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      callback(`Dispatching wave ${runId} (pi-dynamic-workflows)…`);
-      const wave = dispatchWave({
-        cwd,
-        script,
-        maxAgents: cfg.max_workers,
-        agentTimeoutMs: cfg.builder_timeout_ms,
-        runId,
-        onLog: (line) => callback(`[wave] ${line}`, "info"),
-      }).catch((err: Error) => {
-        callback(`Wave ${runId} failed to run: ${err.message}`, "error");
-        return [];
-      });
-      pendingWaves.set(runId, wave);
-      return runId;
-    },
-    dxResult: async (runId: string): Promise<any[]> => {
-      const wave = pendingWaves.get(runId);
-      if (!wave) {
-        callback(`No pending wave for ${runId}`, "warn");
-        return [];
-      }
-      pendingWaves.delete(runId);
-      const outcomes = await wave;
-      for (const o of outcomes) {
-        if (o.status === "success") callback(`Task ${o.taskKey} → ${o.status} (${o.summary ?? ""})`);
-        else callback(`Task ${o.taskKey} → ${o.status}: ${o.error ?? "unknown"}`, "warn");
-      }
-      return outcomes;
-    },
-  };
-
-  loopState = createLoopState();
-  loop = new BoardLoop(deps, loopState, inflight);
-  loop.start();
-  ui.notify(
-    `[board-agent] Loop started. Ticking every ${cfg.tick_seconds}s. Project: ${owner}/#${cfg.project.number}. Use /board-agent stop to stop.`,
-    "info",
-  );
+  try {
+    const executor = createProductionTicketExecutor({
+      cwd,
+      cfg,
+      meta,
+      botLogin,
+      callback,
+      modelRegistry: ctx.modelRegistry,
+      mainModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+      sessionId: ctx.sessionManager.getSessionId(),
+    });
+    const deps: LoopDeps = { cwd, cfg, repoOwner: owner, repoName, botLogin, meta, callback };
+    loopState = createLoopState();
+    const nextLoop = new BoardLoop(deps, loopState, executor, new TicketWorktrees(cwd), ownerLock, admitNewWork);
+    loop = nextLoop;
+    await nextLoop.start();
+    ctx.ui.notify(
+      `[board-agent] ${admitNewWork ? "Loop" : "Recovery loop"} started. Ticking every ${cfg.tick_seconds}s. Project: ${owner}/#${cfg.project.number}.`,
+      "info",
+    );
+  } catch (error) {
+    ownerLock.release();
+    loop = null;
+    throw error;
+  }
 }
 
 export default function (pi: ExtensionAPI) {
   const subcommands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+  let watchdogInterval: ReturnType<typeof setInterval> | undefined;
 
-  // Auto-start (container/headless): start the loop as soon as the session
-  // starts when config.auto_start is true.
+  // Resume durable ticket runs on every startup/reload; auto_start also admits new work.
   pi.on("session_start", async (_event, ctx) => {
     try {
       const cfg = loadConfig(ctx.cwd);
       if (cfg.auto_start && !loop?.isRunning()) {
-        await startBoardLoop(ctx.cwd, ctx.ui);
+        await startBoardLoop(ctx, true);
+      } else if (hasRecoveryState(ctx.cwd) && !loop?.isRunning()) {
+        await startBoardLoop(ctx, false);
       }
-    } catch {
-      // auto-start is best-effort: the user can still start via /board-agent run
+    } catch (error: any) {
+      ctx.ui.notify(`[board-agent] Startup/recovery failed: ${error.message}`, "error");
     }
   });
   // ----------- /board-agent init -----------
@@ -145,12 +156,14 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`gh user: ${login} ✓`, "info");
 
         try {
-          await getProjectMetadata(cfg.project.owner || login, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
-          ctx.ui.notify(`Project #${cfg.project.number}: accessible ✓`, "info");
-        } catch (err: any) {
+          const meta = await getProjectMetadata(cfg.project.owner || login, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
+          validateStatusOptions(meta, configuredStatuses(cfg));
+          ctx.ui.notify(`Project #${cfg.project.number}: accessible with all configured statuses ✓`, "info");
+        } catch {
           const { owner } = resolveOwner(cfg, cwd);
-          await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
-          ctx.ui.notify(`Project #${cfg.project.number} (owner ${owner}): accessible ✓`, "info");
+          const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
+          validateStatusOptions(meta, configuredStatuses(cfg));
+          ctx.ui.notify(`Project #${cfg.project.number} (owner ${owner}): accessible with all configured statuses ✓`, "info");
         }
         ctx.ui.notify("All checks passed.", "info");
       } catch (err: any) {
@@ -185,6 +198,10 @@ export default function (pi: ExtensionAPI) {
   subcommands.set("watchdog", {
     description: "Run the standalone watchdog loop (PR CI fixes + mentions)",
     handler: async (_args, ctx) => {
+      if (watchdogInterval) {
+        ctx.ui.notify("Watchdog loop is already running.", "info");
+        return;
+      }
       try {
         const cwd = ctx.cwd;
         const cfg = loadConfig(cwd);
@@ -201,19 +218,17 @@ export default function (pi: ExtensionAPI) {
           botLogin,
           meta,
           callback: (msg, level = "info") => {
-            const prefix = level === "error" ? "❌" : level === "warn" ? "⚠️" : "✓";
-            ctx.ui.notify(`[watchdog] ${prefix} ${msg}`, level === "warn" ? "warning" : level);
+            ctx.ui.notify(`[watchdog] ${statusPrefix(level)} ${msg}`, level === "warn" ? "warning" : level);
           },
         });
         const tick = () =>
           wd.tick().catch((err: Error) => ctx.ui.notify(`[watchdog] ${err.message}`, "error"));
         await tick();
-        const interval = setInterval(tick, cfg.watchdog.interval_seconds * 1000);
+        watchdogInterval = setInterval(tick, cfg.watchdog.interval_seconds * 1000);
         ctx.ui.notify(
           `Watchdog loop started (every ${cfg.watchdog.interval_seconds}s). /board-agent stop-watchdog to stop.`,
           "info",
         );
-        (pi as any).watchdogInterval = interval;
       } catch (err: any) {
         ctx.ui.notify(`Watchdog failed to start: ${err.message}`, "error");
       }
@@ -223,10 +238,9 @@ export default function (pi: ExtensionAPI) {
   subcommands.set("stop-watchdog", {
     description: "Stop the standalone watchdog loop",
     handler: async (_args, ctx) => {
-      const interval = (pi as any).watchdogInterval;
-      if (interval) {
-        clearInterval(interval);
-        (pi as any).watchdogInterval = undefined;
+      if (watchdogInterval) {
+        clearInterval(watchdogInterval);
+        watchdogInterval = undefined;
         ctx.ui.notify("Watchdog loop stopped.", "info");
       } else {
         ctx.ui.notify("No watchdog loop is running.", "warning");
@@ -268,12 +282,13 @@ export default function (pi: ExtensionAPI) {
         const cfg = loadConfig(cwd);
         validateConfig(cfg);
         const { owner, repoName } = resolveOwner(cfg, cwd);
-        const login = await whoami();
         const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
+        validateStatusOptions(meta, configuredStatuses(cfg));
         const { listCards } = await import("./gh.js");
         const cards = await listCards(meta.projectId, cfg.status_field, cfg.plan_field, cfg.type_field);
         const { summarizePlans } = await import("./plan.js");
         const plans = summarizePlans(cfg, cards);
+        const execution = inspectTicketExecutions(cwd, cards, cfg);
 
         const colCounts: Record<string, number> = {};
         for (const c of cards) {
@@ -289,8 +304,14 @@ export default function (pi: ExtensionAPI) {
             `    ${s.rawName}: ${s.doneCards}/${s.totalCards} done  ready=${s.readyCards} building=${s.buildingCards} review=${s.reviewCards}`,
           ]),
         ];
+        lines.push(
+          `  execution: active=${execution.active.length} legacy=${execution.legacy} orphan=${execution.orphans} needs-human=${execution.needsHuman}`,
+          ...execution.active.map((run) => `    ${run.taskKey}: ${run.runId} [${run.status}] ${run.worktree}`),
+        );
         if (loopState.running) {
-          lines.push(`Loop: RUNNING  tick=${loopState.tickCount}  waves=${loopState.wavesLaunched}  prs=${loopState.prsOpened}  cards=${loopState.cardsCompleted}`);
+          lines.push(`Loop: RUNNING (${loop?.isAdmittingNewWork() ? "autonomous" : "recovery-only"})  tick=${loopState.tickCount}  launches=${loopState.wavesLaunched}  prs=${loopState.prsOpened}`);
+        } else {
+          lines.push("Loop: STOPPED");
         }
         const output = lines.join("\n");
         ctx.ui.notify(output, "info");
@@ -305,7 +326,7 @@ export default function (pi: ExtensionAPI) {
     description: "Start the autonomous loop (picks Ready cards from the GitHub Project)",
     handler: async (_args, ctx) => {
       try {
-        await startBoardLoop(ctx.cwd, ctx.ui);
+        await startBoardLoop(ctx);
       } catch (err: any) {
         ctx.ui.notify(`[board-agent] Failed to start: ${err.message}`, "error");
       }
@@ -320,9 +341,14 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("No loop is running.", "warning");
         return;
       }
-      loop.stop();
+      const current = loop;
       loop = null;
-      ctx.ui.notify("Loop stopped.", "info");
+      try {
+        await current.stop();
+        ctx.ui.notify("Loop stopped.", "info");
+      } catch (error: any) {
+        ctx.ui.notify(`Loop stopped with recovery warning: ${error.message}`, "warning");
+      }
     },
   });
 
@@ -340,8 +366,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ----------- Cleanup on shutdown -----------
-  pi.on("session_shutdown", async () => {
-    loop?.stop();
+  pi.on("session_shutdown", async (_event, ctx) => {
+    if (watchdogInterval) clearInterval(watchdogInterval);
+    watchdogInterval = undefined;
+    const current = loop;
     loop = null;
+    if (!current) return;
+    try {
+      await current.stop();
+    } catch (error: any) {
+      ctx.ui.notify(`[board-agent] Shutdown recovery failed: ${error.message}`, "error");
+    }
   });
 }

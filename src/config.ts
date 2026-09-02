@@ -5,13 +5,13 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { parse as parseYaml } from "yaml";
 
 export interface Config {
   project: { owner: string; number: number };
-  columns: { ready: string; building: string; review: string; done: string; needs_design: string; backlog: string };
+  columns: { ready: string; building: string; review: string; done: string; needs_design: string; needs_human: string; backlog: string };
   status_field: string;
   plan_field: string;
   type_field: string;
@@ -64,7 +64,6 @@ export interface Config {
   };
   auto_start: boolean; // start the loop automatically at session start (container)
   safety: {
-    max_stuck_building: number;
     require_clean_worktree: boolean;
     skip_closed_issues: boolean;
   };
@@ -73,7 +72,7 @@ export interface Config {
 
 const DEFAULTS: Config = {
   project: { owner: "", number: 0 },
-  columns: { ready: "Ready", building: "In Progress", review: "Review", done: "Done", needs_design: "Needs Design", backlog: "Backlog" },
+  columns: { ready: "Ready", building: "In Progress", review: "Review", done: "Done", needs_design: "Needs Design", needs_human: "Needs Human", backlog: "Backlog" },
   status_field: "Status",
   plan_field: "Plan",
   type_field: "Kind",
@@ -109,7 +108,7 @@ const DEFAULTS: Config = {
     on: ["pr_opened", "ci_fixed", "needs_human", "task_failed", "refine_questions", "refine_done"],
   },
   auto_start: false,
-  safety: { max_stuck_building: 3, require_clean_worktree: true, skip_closed_issues: true },
+  safety: { require_clean_worktree: true, skip_closed_issues: true },
   bot_identity: "",
 };
 
@@ -150,14 +149,23 @@ export function validateConfig(cfg: Config): void {
   if (!cfg.project.number || cfg.project.number <= 0) {
     throw new ConfigError("config.project.number is required and must be > 0. Edit .pi/board-agent.yml");
   }
-  if (cfg.max_workers < 1 || cfg.max_workers > 16) {
-    throw new ConfigError("config.max_workers must be between 1 and 16 (pi-dynamic-workflows hard cap).");
+  if (!Number.isInteger(cfg.max_workers) || cfg.max_workers < 1 || cfg.max_workers > 16) {
+    throw new ConfigError("config.max_workers must be an integer between 1 and 16 (pi-dynamic-workflows hard cap).");
   }
-  if (!cfg.columns.ready || !cfg.columns.building || !cfg.columns.review || !cfg.columns.done) {
-    throw new ConfigError("config.columns.{ready,building,review,done} must all be set.");
+  const statuses = [
+    cfg.columns.backlog,
+    cfg.columns.ready,
+    cfg.columns.building,
+    cfg.columns.needs_design,
+    cfg.columns.needs_human,
+    cfg.columns.review,
+    cfg.columns.done,
+  ];
+  if (statuses.some((status) => !status)) {
+    throw new ConfigError("config.columns must define all seven board statuses.");
   }
-  if (!cfg.columns.needs_design) {
-    throw new ConfigError("config.columns.needs_design must be set.");
+  if (new Set(statuses.map((status) => status.toLowerCase())).size !== statuses.length) {
+    throw new ConfigError("config.columns status names must be distinct.");
   }
   if (cfg.task_merge_strategy !== "squash" && cfg.task_merge_strategy !== "merge") {
     throw new ConfigError("config.task_merge_strategy must be 'squash' or 'merge'.");
@@ -222,6 +230,7 @@ export function readConfigTemplate(): string {
     `  review: "Review"`,
     `  done: "Done"`,
     `  needs_design: "Needs Design"`,
+    `  needs_human: "Needs Human"`,
     `  backlog: "Backlog"`,
     `status_field: "Status"`,
     `plan_field: "Plan"`,
@@ -269,7 +278,6 @@ export function readConfigTemplate(): string {
     `  on: ["pr_opened", "ci_fixed", "needs_human", "task_failed", "refine_questions", "refine_done"]`,
     `auto_start: false`,
     `safety:`,
-    `  max_stuck_building: 3`,
     `  require_clean_worktree: true`,
     `  skip_closed_issues: true`,
     `bot_identity: ""`,

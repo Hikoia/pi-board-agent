@@ -1,7 +1,6 @@
 /**
- * Thin git wrappers. We use them only for plan-branch lifecycle (create / push /
- * detect dirty). Per-task branches and worktrees are entirely managed by
- * pi-dynamic-workflows when the builder agent runs with `isolation: "worktree"`.
+ * Thin git wrappers for plan-branch lifecycle and main-worktree safety checks.
+ * Persistent per-ticket worktrees live in ticket-worktree.ts.
  */
 import { spawnSync } from "node:child_process";
 

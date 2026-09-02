@@ -38,10 +38,10 @@ RUN ARCH="$${TARGETARCH:-amd64}"; \
 # Pi coding agent.
 RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 
-# pi-dynamic-workflows (peer) + pi-board-agent (this repo, from the build context).
+# Local Pi packages are not dependency-installed automatically.
 COPY . /app/pi-board-agent
-RUN pi install /app/pi-board-agent \
-  && pi install npm:@quintinshaw/pi-dynamic-workflows
+RUN npm ci --omit=dev --prefix /app/pi-board-agent \
+  && pi install /app/pi-board-agent
 
 WORKDIR /workspace
 COPY entrypoint.sh /usr/local/bin/board-agent-entrypoint

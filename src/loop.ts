@@ -1,63 +1,43 @@
-/**
- * Core polling loop.
- *
- * Responsibilities:
- *  - Tick every `cfg.tick_seconds` seconds
- *  - Fetch all cards from the configured project
- *  - For each plan: detect completions → open PR
- *  - For cards in `ready`: claim, then hand them to a pi-dynamic-workflows wave
- *  - For cards in `building` past timeout: attempt recovery (re-assign)
- *  - For cards in `review` → independent AI review when enabled
- *
- * The loop does NOT spawn subagents directly — it delegates to the
- * pi-dynamic-workflows `workflow` tool via `dx.workflow.run()`.
- */
-
+/** Core polling loop: reconcile durable ticket runs, then fill global worker slots. */
 import type { Config } from "./config.js";
+import { planSlug } from "./config.js";
 import {
   type Card,
   type ProjectMetadata,
-  getProjectMetadata,
+  createComment,
+  isPrMerged,
   listCards,
+  listIssueComments,
+  release,
   setStatus,
   tryClaim,
-  release,
-  closeIssue,
 } from "./gh.js";
-import { Inflight } from "./inflight.js";
-import { summarizePlans, isPlanComplete, openPlanPr } from "./plan.js";
-import { buildTasksForWave, renderWorkflowSource, type BuilderTask } from "./workflow-prompt.js";
-import { isClean, ensurePlanBranch } from "./git-helpers.js";
-import { planSlug } from "./config.js";
-import {
-  runRefine,
-  createTasksFromRefine,
-  RefineStateStore,
-  renderRefineComment,
-  renderQuestionsComment,
-  type RefineOutput,
-} from "./refine.js";
-import { listIssueComments, createComment, isPrMerged } from "./gh.js";
+import { ensurePlanBranch, isClean } from "./git-helpers.js";
 import { makeNotifier } from "./notify.js";
+import { isPlanComplete, openPlanPr, summarizePlans } from "./plan.js";
+import {
+  RefineStateStore,
+  createTasksFromRefine,
+  renderQuestionsComment,
+  renderRefineComment,
+  runRefine,
+} from "./refine.js";
 import { renderReviewComment, runReview } from "./review.js";
+import type { TicketExecutor } from "./ticket-executor.js";
+import { TicketWorktrees } from "./ticket-worktree.js";
+import { buildTasksForWave } from "./workflow-prompt.js";
+import type { OwnerLock } from "./owner-lock.js";
 
 export type StatusCallback = (msg: string, level?: "info" | "warn" | "error") => void;
 
 export interface LoopState {
   running: boolean;
-  /** pi-dynamic-workflows run ID of the currently active wave, if any. */
-  activeWorkflowRunId?: string;
   tickCount: number;
   wavesLaunched: number;
   prsOpened: number;
-  cardsCompleted: number;
   lastTickMs: number;
 }
 
-/**
- * Dependencies the loop needs from the outside world (injected so we can test
- * offline). `Dx` is short for "dynamic execution".
- */
 export interface LoopDeps {
   cwd: string;
   cfg: Config;
@@ -66,12 +46,8 @@ export interface LoopDeps {
   botLogin: string;
   meta: ProjectMetadata;
   callback: StatusCallback;
-
-  /** Run a pi-dynamic-workflows script and return the run id. */
-  dxRun: (script: string) => Promise<string>;
-
-  /** Wait for a pi-dynamic-workflows run to finish, then return its result. */
-  dxResult: (runId: string) => Promise<any[]>;
+  /** Offline adapter; production uses gh.ts. */
+  listCards?: () => Promise<Card[]>;
 }
 
 export function createLoopState(): LoopState {
@@ -80,87 +56,100 @@ export function createLoopState(): LoopState {
     tickCount: 0,
     wavesLaunched: 0,
     prsOpened: 0,
-    cardsCompleted: 0,
     lastTickMs: 0,
   };
 }
 
 export class BoardLoop {
   private intervalId: ReturnType<typeof setInterval> | null = null;
-  private busy = false;
+  private currentTick: Promise<void> | null = null;
+  private stopped = false;
 
   constructor(
-    private deps: LoopDeps,
-    private state: LoopState,
-    private inflight: Inflight,
+    private readonly deps: LoopDeps,
+    private readonly state: LoopState,
+    private readonly executor: TicketExecutor,
+    private readonly ticketWorktrees = new TicketWorktrees(deps.cwd),
+    private readonly ownerLock?: OwnerLock,
+    private admitNewWork = true,
   ) {}
 
-  start(): void {
+  async start(): Promise<void> {
     if (this.state.running) return;
     this.state.running = true;
-    const ms = this.deps.cfg.tick_seconds * 1000;
-    this.tick().catch(
-      (err) => this.deps.callback(`start tick failed: ${err.message}`, "error"),
-    );
-    this.intervalId = setInterval(() => {
-      if (!this.busy) {
-        this.tick().catch(
-          (err) => this.deps.callback(`tick failed: ${err.message}`, "error"),
-        );
-      }
-    }, ms);
     this.deps.callback(`Loop started (tick=${this.deps.cfg.tick_seconds}s)`);
+    await this.tickNow().catch((error: Error) => this.deps.callback(`start tick failed: ${error.message}`, "error"));
+    if (!this.state.running || this.stopped) return;
+    this.intervalId = setInterval(() => {
+      void this.tickNow().catch((error: Error) => this.deps.callback(`tick failed: ${error.message}`, "error"));
+    }, this.deps.cfg.tick_seconds * 1000);
   }
 
   isRunning(): boolean {
     return this.state.running;
   }
 
-  stop(): void {
+  isAdmittingNewWork(): boolean {
+    return this.admitNewWork;
+  }
+
+  enableAdmissions(): void {
+    this.admitNewWork = true;
+  }
+
+  async tickNow(): Promise<void> {
+    if (this.currentTick) return this.currentTick;
+    const running = this.tick().finally(() => {
+      if (this.currentTick === running) this.currentTick = null;
+    });
+    this.currentTick = running;
+    return running;
+  }
+
+  async stop(): Promise<void> {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.admitNewWork = false;
     if (this.intervalId) clearInterval(this.intervalId);
     this.intervalId = null;
     this.state.running = false;
+    try {
+      await this.currentTick;
+      await this.executor.shutdown();
+    } finally {
+      this.ownerLock?.release();
+    }
     this.deps.callback("Loop stopped.", "info");
   }
 
+  private fetchCards(): Promise<Card[]> {
+    const { cfg, meta } = this.deps;
+    return this.deps.listCards?.() ?? listCards(meta.projectId, cfg.status_field, cfg.plan_field, cfg.type_field);
+  }
+
   private async tick(): Promise<void> {
-    this.busy = true;
     try {
       const { cfg, callback, repoOwner, repoName, meta } = this.deps;
-      const cards = await listCards(meta.projectId, cfg.status_field, cfg.plan_field, cfg.type_field);
+      const cards = await this.fetchCards();
+      await this.executor.reconcile(cards);
+      if (!this.admitNewWork) return;
       if (cards.length === 0) {
         callback("No cards on the board yet.");
         return;
       }
 
-      // Safety check: too many stuck in building?
-      const stuckBuilding = cards.filter(
-        (c) => (c.status ?? "").toLowerCase() === cfg.columns.building.toLowerCase(),
-      );
-      if (stuckBuilding.length > cfg.safety.max_stuck_building) {
-        callback(
-          `${stuckBuilding.length} cards stuck in ${cfg.columns.building} (max ${cfg.safety.max_stuck_building}). Pausing — please unstick manually.`,
-          "warn",
-        );
-        return;
-      }
-
-      // Safety: require clean worktree?
+      // Recovery must run even when the main checkout is dirty; only new launches stop here.
       if (cfg.safety.require_clean_worktree && !isClean(this.deps.cwd)) {
-        callback("Working tree is dirty. Skipping tick.", "warn");
+        callback("Working tree is dirty. Reconciled existing runs but skipped new work.", "warn");
         return;
       }
 
-      // --- Stories: refine Ready stories / re-refine Needs Design / Done on merge ---
-      if (cfg.refine.enabled) {
-        await this.processStories(cards);
-      }
+      if (cfg.refine.enabled) await this.processStories(cards);
 
-      // --- Watchdog: healthy bot PRs (CI fixes + mentions) ---
       if (cfg.watchdog.enabled) {
         try {
           const { Watchdog } = await import("./watchdog.js");
-          const wd = new Watchdog({
+          await new Watchdog({
             cwd: this.deps.cwd,
             cfg,
             repoOwner,
@@ -168,183 +157,57 @@ export class BoardLoop {
             botLogin: this.deps.botLogin,
             meta,
             callback,
-          });
-          await wd.tick();
-        } catch (err: any) {
-          callback(`Watchdog tick failed: ${err.message}`, "warn");
+          }).tick();
+        } catch (error: any) {
+          callback(`Watchdog tick failed: ${error.message}`, "warn");
         }
       }
 
-      // --- Review gate: independent AI review → Done or back to Ready ---
-      if (cfg.review.enabled) {
-        await this.processReviewCards(cards);
-      }
+      if (cfg.review.enabled) await this.processReviewCards(cards);
+      const finalizationFailures = await this.processClosedDoneCards(cards);
 
-      // --- Plan-level: detect completions → open PR ---
       const plans = summarizePlans(cfg, cards);
       for (const [, summary] of plans) {
-        if (isPlanComplete(summary)) {
-          // Ensure the plan branch exists so there is something to PR.
-          ensurePlanBranch(
-            `plan/${summary.slug}`,
-            cfg.branches.base,
-            this.deps.cwd,
+        const tasksFinalized = summary.cards
+          .filter((card) => (card.type ?? "").toLowerCase() !== "story")
+          .every((card) => card.closed && !this.ticketWorktrees.has(card.itemId));
+        if (!isPlanComplete(summary) || !tasksFinalized || finalizationFailures.has(summary.slug)) continue;
+
+        ensurePlanBranch(`${cfg.branches.plan_prefix}${summary.slug}`, cfg.branches.base, this.deps.cwd);
+        const result = await openPlanPr({ cwd: this.deps.cwd, cfg, repoOwner, repoName, summary });
+        if (result.status !== "opened" && result.status !== "exists") continue;
+        this.state.prsOpened++;
+        callback(`Plan PR ${result.status}: ${result.url ?? summary.slug}`);
+        if (result.status === "opened") {
+          await makeNotifier(cfg)(
+            "pr_opened",
+            `PR aperta: ${summary.rawName}`,
+            `#${result.number} — ${result.url}`,
+            [result.url ?? ""],
           );
-          const result = await openPlanPr({
-            cwd: this.deps.cwd,
-            cfg,
-            repoOwner,
-            repoName,
-            summary,
-          });
-          if (result.status === "opened" || result.status === "exists") {
-            this.state.prsOpened++;
-            callback(
-              `Plan PR ${result.status === "opened" ? "opened" : "exists"}: ${result.url ?? summary.slug}`,
-            );
-            if (result.status === "opened") {
-              await makeNotifier(cfg)(
-                "pr_opened",
-                `PR aperta: ${summary.rawName}`,
-                `#${result.number} — ${result.url}`,
-                [result.url ?? ""],
-              );
-            }
-          }
         }
       }
 
-      // --- Card-level: pick ready cards, claim, dispatch wave ---
-      const readyCards = cards.filter(
-        (c) =>
-          (c.status ?? "").toLowerCase() === cfg.columns.ready.toLowerCase() &&
-          c.plan &&
-          (!cfg.safety.skip_closed_issues || !c.closed),
+      if (!this.admitNewWork) return;
+      let slots = Math.max(0, cfg.max_workers - this.executor.activeCount());
+      if (slots <= 0) return;
+      const ready = cards.filter((card) =>
+        (card.type ?? "").toLowerCase() !== "story" &&
+        (card.status ?? "").toLowerCase() === cfg.columns.ready.toLowerCase() &&
+        !!card.plan &&
+        (!cfg.safety.skip_closed_issues || !card.closed)
       );
 
-      // Group by plan — we can only dispatch ONE wave per plan at a time
-      // (otherwise two parallel waves would clobber the same plan branch).
-      for (const [, summary] of plans) {
-        if (summary.readyCards === 0) continue;
-        // Any existing inflight cards for this plan? Skip.
-        const inflightCards = this.inflight.listByPlan(summary.slug);
-        if (inflightCards.length > 0) continue;
-
-        const planReadyCards = summary.cards.filter(
-          (c) => (c.status ?? "").toLowerCase() === cfg.columns.ready.toLowerCase(),
-        );
-        const batch = planReadyCards.slice(0, cfg.max_workers);
-        if (batch.length === 0) continue;
-
-        // Claim each card atomically (assignee mutex).
-        const claimed: { card: Card; task: BuilderTask }[] = [];
-        for (const card of batch) {
-          const claimed_ = await tryClaim(card, this.deps.botLogin);
-          if (!claimed_) {
-            callback(`Card "${card.title}" could not be claimed — another worker holds it.`, "warn");
-            continue;
-          }
-          // Ensure the plan branch exists on origin before the wave runs.
-          try {
-            ensurePlanBranch(
-              `plan/${summary.slug}`,
-              cfg.branches.base,
-              this.deps.cwd,
-            );
-          } catch (err: any) {
-            callback(`Failed to ensure plan branch: ${err.message}`, "error");
-            await release(card, this.deps.botLogin);
-            continue;
-          }
-          const task = buildTasksForWave(cfg, summary.slug, [card])[0];
-          claimed.push({ card, task });
-
-          // Write inflight record immediately (before dispatch).
-          this.inflight.write({
-            itemId: card.itemId,
-            issueNumber: card.number,
-            cardTitle: card.title,
-            plan: summary.slug,
-            taskBranch: task.taskBranch,
-            planBranch: task.planBranch,
-            startedAt: Date.now(),
-          });
-
-          // Move card to Building.
-          try {
-            await setStatus(meta, card.itemId, cfg.columns.building);
-          } catch (err: any) {
-            callback(`Failed to move card to ${cfg.columns.building}: ${err.message}`, "warn");
-            this.inflight.clear(card.itemId);
-            await release(card, this.deps.botLogin);
-          }
-        }
-
-        if (claimed.length === 0) continue;
-
-        // Dispatch the wave.
-        const tasks = claimed.map((x) => x.task);
-        let context: string | undefined;
-        if (cfg.context.enabled) {
-          try {
-            const { generateContext } = await import("./context.js");
-            context = generateContext({
-              cwd: this.deps.cwd,
-              maxChars: cfg.context.max_chars,
-              exclude: cfg.context.exclude,
-            });
-            callback(
-              `Repo context digest: ${context.length} chars injected into the wave`,
-            );
-          } catch (err: any) {
-            callback(`Context generation failed: ${err.message}`, "warn");
-          }
-        }
-        const script = renderWorkflowSource({
-          cfg,
-          planSlug: summary.slug,
-          baseBranch: cfg.branches.base,
-          tasks,
-          skillName: "board-agent",
-          context,
-        });
-
+      for (const card of ready) {
+        if (!this.admitNewWork || slots <= 0) break;
+        const result = await this.executor.launch(card, planSlug(card.plan!));
+        if (result.status !== "launched") continue;
+        slots--;
         this.state.wavesLaunched++;
-        callback(
-          `Launching wave for plan ${summary.slug}: ${claimed.length} builder(s) → ${cfg.columns.ready}→${cfg.columns.building}→(merge)→${cfg.columns.review}`,
-        );
-
-        let runId: string;
-        try {
-          runId = await this.deps.dxRun(script);
-        } catch (err: any) {
-          callback(`Failed to launch workflow: ${err.message}`, "error");
-          // Clean up: release all claimed cards.
-          for (const { card } of claimed) {
-            this.inflight.clear(card.itemId);
-            await setStatus(meta, card.itemId, cfg.columns.ready)
-              .catch(() => {});
-            await release(card, this.deps.botLogin);
-          }
-          continue;
-        }
-
-        // Wait for the wave to finish (this blocks the tick, but only
-        // one wave per plan is active, so it's fine).
-        try {
-          const outcomes = await this.deps.dxResult(runId);
-          await this.handleWaveResults(outcomes ?? [], claimed);
-        } catch (err: any) {
-          callback(`Wave failed: ${err.message}`, "error");
-          // Leave inflight records — the next tick will see them and let the
-          // user manually unstick.
-        }
       }
-
+    } finally {
       this.state.tickCount++;
       this.state.lastTickMs = Date.now();
-    } finally {
-      this.busy = false;
     }
   }
 
@@ -355,88 +218,77 @@ export class BoardLoop {
    *  - Needs Design   → re-refine when the human replies on the issue thread
    *  - In Progress    → Done when the plan PR is merged
    */
-  private async processStories(cards: import("./gh.js").Card[]): Promise<void> {
+  private async processStories(cards: Card[]): Promise<void> {
     const { cfg, meta, repoOwner, repoName, botLogin, callback } = this.deps;
-    const stories = cards.filter(
-      (c) => (c.type ?? "").toLowerCase() === "story",
-    );
+    const stories = cards.filter((c) => (c.type ?? "").toLowerCase() === "story");
     if (stories.length === 0) return;
 
     const refineState = new RefineStateStore(this.deps.cwd);
     const readyStatus = cfg.columns.ready.toLowerCase();
     const needsDesign = cfg.columns.needs_design.toLowerCase();
     const inProgress = cfg.columns.building.toLowerCase();
-    const doneStatus = cfg.columns.done.toLowerCase();
-
     const contextDigest = await this.getContextDigest();
 
-    // One story per tick (refine is sequential and can be slow).
     const story = stories[0];
     const status = (story.status ?? "").toLowerCase();
     const slug = story.plan ?? "";
     if (!slug) return;
 
-    // Needs Design: wait for human replies, then re-refine.
     if (status === needsDesign) {
       if (!story.number || !story.repoOwner || !story.repoName) return;
       const state = refineState.get(story.number);
       const comments = await listIssueComments(story.repoOwner, story.repoName, story.number).catch(() => []);
-      const lastSeen = state?.lastSeenCommentId;
-      const fresh = lastSeen
-        ? comments.filter((c) => c.id !== lastSeen)
+      const fresh = state?.lastSeenCommentId
+        ? comments.filter((comment) => comment.id !== state.lastSeenCommentId)
         : comments;
-      const humanReplies = fresh.filter((c) => c.author && c.author !== botLogin);
+      const humanReplies = fresh.filter((comment) => comment.author && comment.author !== botLogin);
       if (humanReplies.length === 0) return;
-
       callback(`Story #${story.number} has ${humanReplies.length} new human reply/replies — re-refining…`);
-      const answers = humanReplies.map((c) => `- ${c.body}`).join("\n");
-      await this.refineStory(story, slug, contextDigest, answers, refineState, true);
+      await this.refineStory(
+        story,
+        slug,
+        contextDigest,
+        humanReplies.map((comment) => `- ${comment.body}`).join("\n"),
+        refineState,
+      );
       return;
     }
 
-    // Done when the plan PR is merged.
     if (status === inProgress) {
       const state = refineState.get(story.number ?? 0);
-      if (state?.refined) {
-        const merged = await isPrMerged(repoOwner, repoName, `plan/${planSlug(slug)}`);
-        if (merged) {
-          await setStatus(meta, story.itemId, cfg.columns.done).catch(() => undefined);
-          callback(`Story "${story.title}" → ${cfg.columns.done} (plan PR merged)`);
-        }
+      if (state?.refined && await isPrMerged(repoOwner, repoName, `${cfg.branches.plan_prefix}${planSlug(slug)}`)) {
+        await setStatus(meta, story.itemId, cfg.columns.done).catch(() => undefined);
+        callback(`Story "${story.title}" → ${cfg.columns.done} (plan PR merged)`);
       }
       return;
     }
 
-    // Ready → refine (once, guarded by the claim).
-    if (status === readyStatus) {
-      if (!story.number) {
-        callback(`Story "${story.title}" is a draft item — convert it to an issue to refine it.`, "warn");
-        return;
-      }
-      const claimed = await tryClaim(story, botLogin);
-      if (!claimed) {
-        callback(`Story "${story.title}" already claimed by someone else.`, "warn");
-        return;
-      }
-      try {
-        await setStatus(meta, story.itemId, cfg.columns.building);
-      } catch (err: any) {
-        callback(`Failed to move story to ${cfg.columns.building}: ${err.message}`, "warn");
-        await release(story, botLogin);
-        return;
-      }
-      await this.refineStory(story, slug, contextDigest, "", refineState, false);
-      await release(story, botLogin);
+    if (status !== readyStatus) return;
+    if (!story.number) {
+      callback(`Story "${story.title}" is a draft item — convert it to an issue to refine it.`, "warn");
+      return;
     }
+    if (!(await tryClaim(story, botLogin))) {
+      callback(`Story "${story.title}" already claimed by someone else.`, "warn");
+      return;
+    }
+    try {
+      await setStatus(meta, story.itemId, cfg.columns.building);
+    } catch (error: any) {
+      callback(`Failed to move story to ${cfg.columns.building}: ${error.message}`, "warn");
+      await release(story, botLogin);
+      return;
+    }
+    await this.refineStory(story, slug, contextDigest, "", refineState);
+    await release(story, botLogin);
   }
 
   private async refineStory(
-    story: import("./gh.js").Card,
+    story: Card,
     slug: string,
     contextDigest: string,
     extraContext: string,
     refineState: RefineStateStore,
-    isReRefine: boolean,
   ): Promise<void> {
     const { cfg, meta, repoOwner, repoName, callback } = this.deps;
     if (!story.number) return;
@@ -457,15 +309,10 @@ export class BoardLoop {
         await setStatus(meta, story.itemId, cfg.columns.needs_design).catch(() => undefined);
         refineState.update(number, { refined: false, lastSeenCommentId: questionId });
         callback(`Story "${story.title}" → ${cfg.columns.needs_design}: ${refine.openQuestions.length} domanda/e aperta/e.`);
-        await makeNotifier(cfg)(
-          "refine_questions",
-          `Domande di design: ${story.title}`,
-          refine.openQuestions.join("\n"),
-        );
+        await makeNotifier(cfg)("refine_questions", `Domande di design: ${story.title}`, refine.openQuestions.join("\n"));
         return;
       }
 
-      const existing = await this.countPlanTasks(slug);
       const created = await createTasksFromRefine({
         cfg,
         meta,
@@ -474,30 +321,23 @@ export class BoardLoop {
         storyCard: story,
         planSlug: slug,
         refine,
-        existingTaskCount: existing,
+        existingTaskCount: await this.countPlanTasks(slug),
         projectId: meta.projectId,
       });
       await this.createCommentWithId(number, repoOwner, repoName, renderRefineComment(slug, refine, created));
       await setStatus(meta, story.itemId, cfg.columns.building).catch(() => undefined);
       refineState.update(number, { refined: true });
-      callback(
-        `Story "${story.title}" raffinata: ${created.length} task creati (${created.map((c) => c.taskKey).join(", ")}).`,
-      );
-      await makeNotifier(cfg)(
-        "refine_done",
-        `Storia raffinata: ${story.title}`,
-        `${created.length} task creati: ${created.map((c) => c.taskKey).join(", ")}`,
-        created.map((c) => c.url),
-      );
-    } catch (err: any) {
-      // Revert to Ready so the next tick retries (or a human can inspect).
+      callback(`Story "${story.title}" raffinata: ${created.length} task creati (${created.map((item) => item.taskKey).join(", ")}).`);
+      await makeNotifier(
+        cfg,
+      )("refine_done", `Storia raffinata: ${story.title}`, `${created.length} task creati: ${created.map((item) => item.taskKey).join(", ")}`, created.map((item) => item.url));
+    } catch (error: any) {
       await setStatus(meta, story.itemId, cfg.columns.ready).catch(() => undefined);
-      await this.createCommentWithId(number, repoOwner, repoName, `❌ Refine fallito per la storia: ${err.message}`).catch(() => undefined);
-      callback(`Refine della storia "${story.title}" fallito: ${err.message}`, "error");
+      await this.createCommentWithId(number, repoOwner, repoName, `❌ Refine fallito per la storia: ${error.message}`).catch(() => undefined);
+      callback(`Refine della storia "${story.title}" fallito: ${error.message}`, "error");
     }
   }
 
-  /** Post a comment on the story issue, returning its node id (best-effort). */
   private async createCommentWithId(
     issueNumber: number,
     repoOwner: string,
@@ -506,8 +346,7 @@ export class BoardLoop {
   ): Promise<string | undefined> {
     try {
       const { resolveIssueId } = await import("./gh.js");
-      const issueId = await resolveIssueId(repoOwner, repoName, issueNumber);
-      return await createComment(issueId, body);
+      return await createComment(await resolveIssueId(repoOwner, repoName, issueNumber), body);
     } catch {
       return undefined;
     }
@@ -518,32 +357,24 @@ export class BoardLoop {
     if (!cfg.context.enabled) return "";
     try {
       const { generateContext } = await import("./context.js");
-      return generateContext({
-        cwd: this.deps.cwd,
-        maxChars: cfg.context.max_chars,
-        exclude: cfg.context.exclude,
-      });
+      return generateContext({ cwd: this.deps.cwd, maxChars: cfg.context.max_chars, exclude: cfg.context.exclude });
     } catch {
       return "";
     }
   }
 
-  /** Count task cards already in this plan (for T-numbering). */
   private async countPlanTasks(slug: string): Promise<number> {
-    const { cfg, meta } = this.deps;
-    const cards = await listCards(meta.projectId, cfg.status_field, cfg.plan_field, cfg.type_field).catch(() => []);
-    return cards.filter(
-      (c) => c.plan === slug && (c.type ?? "").toLowerCase() === "task",
+    return (await this.fetchCards().catch(() => [])).filter(
+      (card) => card.plan === slug && (card.type ?? "").toLowerCase() === "task",
     ).length;
   }
 
   private async processReviewCards(cards: Card[]): Promise<void> {
     const { cfg, meta, callback } = this.deps;
-    const reviewCards = cards.filter(
-      (card) =>
-        (card.status ?? "").toLowerCase() === cfg.columns.review.toLowerCase() &&
-        card.plan &&
-        (card.type ?? "").toLowerCase() !== "story",
+    const reviewCards = cards.filter((card) =>
+      (card.status ?? "").toLowerCase() === cfg.columns.review.toLowerCase() &&
+      card.plan &&
+      (card.type ?? "").toLowerCase() !== "story"
     ).slice(0, cfg.max_workers);
 
     for (const card of reviewCards) {
@@ -566,74 +397,67 @@ export class BoardLoop {
         });
 
         if (review.verdict === "pass") {
-          await closeIssue(card.repoOwner!, card.repoName!, card.number!);
+          if (!card.number || !card.repoOwner || !card.repoName) {
+            throw new Error("A manually validated task must be backed by a GitHub issue.");
+          }
           await setStatus(meta, card.itemId, cfg.columns.done);
-          callback(`AI review passed for "${card.title}". Issue closed → ${cfg.columns.done}`);
+          const worktree = this.ticketWorktrees.read(card.itemId);
+          callback(`AI review passed for "${card.title}" → ${cfg.columns.done}. Validate ${worktree?.path ?? task.taskBranch}, then close issue #${card.number} to merge.`);
           continue;
         }
 
-        if (!card.number || !card.repoOwner || !card.repoName) {
-          throw new Error("Cannot post AI review findings for a draft card.");
-        }
-        const commentId = await this.createCommentWithId(
-          card.number,
-          card.repoOwner,
-          card.repoName,
-          renderReviewComment(review),
-        );
+        if (!card.number || !card.repoOwner || !card.repoName) throw new Error("Cannot post AI review findings for a draft card.");
+        const commentId = await this.createCommentWithId(card.number, card.repoOwner, card.repoName, renderReviewComment(review));
         if (!commentId) throw new Error("Failed to post AI review findings.");
         await setStatus(meta, card.itemId, cfg.columns.ready);
-        callback(
-          `AI review found ${review.findings.length} blocking issue(s) in "${card.title}". → ${cfg.columns.ready}`,
-          "warn",
-        );
-      } catch (err: any) {
-        callback(`AI review failed for "${card.title}": ${err.message}. Leaving in ${cfg.columns.review}.`, "warn");
+        callback(`AI review found ${review.findings.length} blocking issue(s) in "${card.title}". → ${cfg.columns.ready}`, "warn");
+      } catch (error: any) {
+        callback(`AI review failed for "${card.title}": ${error.message}. Leaving in ${cfg.columns.review}.`, "warn");
       } finally {
         await release(card, this.deps.botLogin);
       }
     }
   }
 
-  /**
-   * After a wave finishes, update card statuses based on outcomes.
-   */
-  private async handleWaveResults(
-    outcomes: any[],
-    claimed: Array<{ card: Card; task: BuilderTask }>,
-  ): Promise<void> {
-    const { cfg, meta } = this.deps;
-    for (const item of claimed) {
-      const outcome = outcomes?.find(
-        (o) => o?.itemId === item.card.itemId,
-      );
-      this.inflight.clear(item.card.itemId);
+  private async processClosedDoneCards(cards: Card[]): Promise<Set<string>> {
+    const { cfg, callback } = this.deps;
+    const failedPlans = new Set<string>();
+    const closed = cards.filter((card) =>
+      card.closed &&
+      card.plan &&
+      (card.status ?? "").toLowerCase() === cfg.columns.done.toLowerCase() &&
+      (card.type ?? "").toLowerCase() !== "story"
+    );
 
-      if (!outcome || outcome.status === "failure") {
-        // Move back to Ready so a future wave retries.
-        await setStatus(meta, item.card.itemId, cfg.columns.ready)
-          .catch(() => {});
-        await release(item.card, this.deps.botLogin);
-        this.deps.callback(
-          `Task "${item.card.title}" failed: ${outcome?.error ?? "unknown"}. Returned to ${cfg.columns.ready}.`,
-          "warn",
-        );
-        await makeNotifier(cfg)(
-          "task_failed",
-          `Task fallito: ${item.card.title}`,
-          `${outcome?.error ?? "unknown"} — rimesso in ${cfg.columns.ready} per riprovare.`,
-        );
+    for (const card of closed) {
+      const slug = planSlug(card.plan!);
+      const task = buildTasksForWave(cfg, slug, [card])[0];
+      if (this.ticketWorktrees.isMerged(card.itemId, task.planBranch, task.taskBranch) && !this.ticketWorktrees.has(card.itemId)) continue;
+      if (!card.number || !card.repoOwner || !card.repoName) {
+        failedPlans.add(slug);
+        callback(`Cannot finalize draft card "${card.title}"; a closed GitHub issue is required.`, "warn");
         continue;
       }
 
-      // Success → move to Review.
-      await setStatus(meta, item.card.itemId, cfg.columns.review)
-        .catch(() => {});
-      await release(item.card, this.deps.botLogin);
-      this.state.cardsCompleted++;
-      this.deps.callback(
-        `Task "${item.card.title}" succeeded (branch=${outcome.branch ?? item.task.taskBranch}). → ${cfg.columns.review}`,
-      );
+      let claimed = false;
+      try {
+        claimed = await tryClaim(card, this.deps.botLogin);
+        if (!claimed) {
+          failedPlans.add(slug);
+          continue;
+        }
+        ensurePlanBranch(task.planBranch, cfg.branches.base, this.deps.cwd);
+        const worktree = this.ticketWorktrees.ensure(task, slug);
+        callback(`Issue #${card.number} is closed. Merging ${task.taskBranch} → ${task.planBranch}…`);
+        this.ticketWorktrees.mergeAndRemove(worktree, cfg.task_merge_strategy, card.number, card.title);
+        callback(`Merged "${card.title}" and removed ${worktree.path}`);
+      } catch (error: any) {
+        failedPlans.add(slug);
+        callback(`Finalization failed for "${card.title}": ${error.message}`, "warn");
+      } finally {
+        if (claimed) await release(card, this.deps.botLogin);
+      }
     }
+    return failedPlans;
   }
 }
