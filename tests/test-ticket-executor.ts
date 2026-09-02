@@ -288,14 +288,22 @@ if ((board.comments.get(card79.itemId)?.length ?? 0) === successCommentCount) co
 else console.log("FAIL: duplicate terminal comment");
 
 const dirty = board.add("PVTI_85", 85);
+const cleanSibling = board.add("PVTI_851", 851);
 await executor.launch(dirty, "demo");
+await executor.launch(cleanSibling, "demo");
 runFor(dirty.itemId).status = "paused";
-writeFileSync(join(recordFor(dirty.itemId).path, "dirty.txt"), "partial\n");
+const dirtyPath = recordFor(dirty.itemId).path;
+writeFileSync(join(dirtyPath, "dirty.txt"), "partial\n");
 await executor.shutdown();
 executor = makeExecutor(true);
 const dirtySummary = await executor.reconcile(board.all());
-if (board.cards.get(dirty.itemId)?.status === cfg.columns.needs_human && dirtySummary.needsHuman >= 1 && existsSync(recordFor(dirty.itemId).path)) {
-  console.log("PASS: dirty paused worktree is preserved in Needs Human");
+if (
+  board.cards.get(dirty.itemId)?.status === cfg.columns.needs_human &&
+  dirtySummary.needsHuman >= 1 &&
+  existsSync(join(dirtyPath, "dirty.txt")) &&
+  runFor(cleanSibling.itemId).status === "running"
+) {
+  console.log("PASS: dirty paused worktree is preserved without blocking sibling recovery");
 } else console.log("FAIL: dirty paused worktree recovery");
 
 const terminalCards = [86, 87, 88, 89].map((number) => board.add(`PVTI_${number}`, number));

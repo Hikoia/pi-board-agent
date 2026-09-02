@@ -78,6 +78,15 @@ const unrelated = await processNeedsDesignTask({
 }, { ...ops, listComments: async () => comments.filter((comment) => comment.id !== "gate") });
 check(unrelated === "waiting" && claims === 0 && designRuns === 0, "task designer ignores Needs Design cards without a requirements gate");
 
+const undecided = await processNeedsDesignTask({
+  card,
+  cfg: _DEFAULTS,
+  cwd: process.cwd(),
+  contextDigest: "## Repo tree\n- src/providers.ts",
+  callback: () => undefined,
+}, { ...ops, listComments: async () => comments.filter((comment) => comment.id !== "decision") });
+check(undecided === "waiting" && claims === 0 && designRuns === 0, "requirements gate without a trusted decision waits without claiming");
+
 const result = await processNeedsDesignTask({
   card,
   cfg: _DEFAULTS,

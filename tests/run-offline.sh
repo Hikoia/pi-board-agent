@@ -475,7 +475,12 @@ ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-review.ts"
 echo
 
-# ---- 11. Persistent ticket worktree ----
+# ---- 11. GitHub issue comments ----
+echo "--- GitHub issue comments ---"
+TMP_DIR="$(mktemp -d)" run_ts "$ROOT/tests/test-gh-comments.ts"
+echo
+
+# ---- 12. Persistent ticket worktree ----
 echo "--- ticket worktree ---"
 
 cat > "$GEN_DIR/test-ticket-worktree.ts" <<'ENDTS'
