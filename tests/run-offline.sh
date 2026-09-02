@@ -246,8 +246,12 @@ ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-loop.ts"
 echo
 
+# ---- 6. Runtime revision gate ----
+echo "--- runtime revision gate ---"
+TMP_DIR="$(mktemp -d)" run_ts "$ROOT/tests/test-runtime-revision.ts"
+echo
 
-# ---- 4. Dispatch (normalizeWaveResults) + workflow-prompt (model) ----
+# ---- 7. Dispatch (normalizeWaveResults) + workflow-prompt (model) ----
 echo '--- dispatch ---'
 
 cat >"$GEN_DIR/test-dispatch.ts" <<'ENDTS'

@@ -33,6 +33,19 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
+/** Keep non-owner Pi processes from overwriting the active owner's runtime heartbeat. */
+export function ownerLockHeldByOther(cwd: string): boolean {
+  const path = join(repoRoot(cwd), ".pi", "board-agent", "owner.lock");
+  if (!existsSync(path)) return false;
+  try {
+    const record = JSON.parse(readFileSync(path, "utf8")) as OwnerLockRecord;
+    if (record.hostname.toLowerCase() !== hostname().toLowerCase()) return true;
+    return record.pid !== process.pid && processIsAlive(record.pid);
+  } catch {
+    return true;
+  }
+}
+
 export function acquireOwnerLock(cwd: string, botLogin: string): OwnerLock {
   const dir = join(repoRoot(cwd), ".pi", "board-agent");
   const path = join(dir, "owner.lock");

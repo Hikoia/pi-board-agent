@@ -53,6 +53,7 @@ export interface LoopDeps {
   meta: ProjectMetadata;
   callback: StatusCallback;
   onTick?: () => void;
+  revisionCheck?: () => { ok: boolean; reason?: string } | Promise<{ ok: boolean; reason?: string }>;
   /** Offline adapter; production uses gh.ts. */
   listCards?: () => Promise<Card[]>;
 }
@@ -278,6 +279,13 @@ export class BoardLoop {
       const { cfg, callback, repoOwner, repoName, meta } = this.deps;
       const cards = await this.fetchCards();
       await this.executor.reconcile(cards);
+      const revision = await this.deps.revisionCheck?.();
+      if (revision && !revision.ok) {
+        const wasAdmitting = this.admitNewWork;
+        this.admitNewWork = false;
+        if (wasAdmitting) callback(revision.reason ?? "Package revision changed; continuing recovery without new work.", "error");
+        return;
+      }
       if (!this.admitNewWork) return;
       if (cards.length === 0) {
         callback("No cards on the board yet.");
