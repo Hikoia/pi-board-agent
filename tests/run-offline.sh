@@ -251,7 +251,12 @@ echo "--- runtime revision gate ---"
 TMP_DIR="$(mktemp -d)" run_ts "$ROOT/tests/test-runtime-revision.ts"
 echo
 
-# ---- 7. Dispatch (normalizeWaveResults) + workflow-prompt (model) ----
+# ---- 7. Fleet verifier ----
+echo "--- fleet verifier ---"
+TMP_DIR="$(mktemp -d)" run_ts "$ROOT/tests/test-fleet-verifier.mjs"
+echo
+
+# ---- 8. Dispatch (normalizeWaveResults) + workflow-prompt (model) ----
 echo '--- dispatch ---'
 
 cat >"$GEN_DIR/test-dispatch.ts" <<'ENDTS'

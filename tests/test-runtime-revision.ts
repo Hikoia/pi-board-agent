@@ -151,6 +151,29 @@ const boardLoop = new BoardLoop(deps, createLoopState(), executor);
 await boardLoop.tickNow();
 check(reconciles === 1 && launches === 0 && !boardLoop.isAdmittingNewWork(), "revision mismatch allows settlement reconcile but blocks new ticket launch");
 
+const settledSummary: ReconcileSummary = { active: [], resumed: 0, adopted: 0, needsHuman: 0, legacy: 0, orphans: 0, errors: 0 };
+let releaseReconcile = (_summary: ReconcileSummary): void => undefined;
+let heartbeatChecks = 0;
+const heartbeatLoop = new BoardLoop(
+  {
+    ...deps,
+    cfg: { ...cfg, tick_seconds: 0.01 },
+    listCards: async () => [],
+    revisionCheck: () => { heartbeatChecks++; return { ok: true }; },
+  },
+  createLoopState(),
+  {
+    ...executor,
+    reconcile: () => new Promise<ReconcileSummary>((resolve) => { releaseReconcile = resolve; }),
+  },
+);
+const starting = heartbeatLoop.start();
+await new Promise((resolve) => setTimeout(resolve, 45));
+check(heartbeatChecks >= 2, "long-running ticks keep checking revision and refreshing the runtime heartbeat");
+releaseReconcile(settledSummary);
+await starting;
+await heartbeatLoop.stop();
+
 const indexSource = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
 const startSource = indexSource.slice(indexSource.indexOf("async function startBoardLoop"), indexSource.indexOf("export default function"));
 check(startSource.indexOf("currentRevision(cwd)") < startSource.indexOf("loadConfig(cwd)"), "start path checks package revision before GitHub setup or mutation");

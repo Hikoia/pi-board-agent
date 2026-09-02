@@ -39,9 +39,9 @@ manually closed, merged, and cleaned.
 ## Quickstart
 
 ```bash
-# 1. Install board-agent (pi-dynamic-workflows is bundled)
-pi install npm:@mancioshell/pi-board-agent
-/reload
+# 1. Install one reviewed, immutable revision (pi-dynamic-workflows is bundled)
+pi install git:github.com/Hikoia/pi-board-agent@<FULL_40_CHARACTER_GIT_SHA>
+# Restart Pi so the loaded code and configured revision are identical.
 
 # 2. Scaffold config
 /board-agent init
@@ -124,15 +124,17 @@ bot_identity: ""   # login for the assignee claim guard; empty = gh user
 | `ticket-worktree.ts` | Atomically stores the v2 execution record and retains the worktree through review and human validation. |
 | pi-dynamic-workflows `WorkflowManager` | Persists run status, args, journal, result, and lease; one manager/agent per ticket worktree. |
 | `owner-lock.ts` | Native `fs.open(..., "wx")` lock prevents a second local board-agent owner. |
+| `runtime.ts` | Fails closed unless the effective package pin, loaded module, and clean deployment checkout share one full Git SHA; atomically maintains `.pi/board-agent/runtime.json`. |
 | `inflight.ts` | Compatibility only: quarantines and archives legacy inflight JSON; new runs do not write it. |
 | `/board-agent stop` | Waits for the current tick, pauses managed runs durably, then releases the owner lock. |
 
 ### Recovery and safety
 
-1. **Owner + claim guards**: one local owner lock, followed by an assignee mutation and a second full card refetch.
-2. **Durable managed runs**: WorkflowManager persists the run before its agent starts. The ticket record associates that run with the retained worktree.
-3. **Fail-closed reconciliation**: only a clean, matching paused worktree resumes. Dirty, missing, malformed, failed, or ambiguous state moves that ticket to `Needs Human` without blocking siblings.
-4. **Idempotent terminal mutations**: run markers prevent duplicate comments, and the active record remains until GitHub status/comment updates succeed.
+1. **Revision guard**: new work starts only when the effective package setting is a full Git SHA matching both the loaded module and a clean checkout. Revision drift leaves the process recovery-only until restart.
+2. **Owner + claim guards**: one local owner lock, followed by an assignee mutation and a second full card refetch.
+3. **Durable managed runs**: WorkflowManager persists the run before its agent starts. The ticket record associates that run with the retained worktree.
+4. **Fail-closed reconciliation**: only a clean, matching paused worktree resumes. Dirty, missing, malformed, failed, or ambiguous state moves that ticket to `Needs Human` without blocking siblings.
+5. **Idempotent terminal mutations**: run markers prevent duplicate comments, and the active record remains until GitHub status/comment updates succeed.
 
 ### Branch model
 
@@ -153,8 +155,8 @@ cleaned, board-agent opens **one PR**: `plan/001-auth` → `main`.
 | Command | Description |
 |---------|-------------|
 | `/board-agent init` | Write `.pi/board-agent.yml` template |
-| `/board-agent lint` | Check: config, `gh` auth, project exists, fields present |
-| `/board-agent status` | Board snapshot plus each active run ID/status/worktree and legacy/orphan/Needs Human counts |
+| `/board-agent lint` | Check: exact loaded revision, config, `gh` auth, project, fields, and statuses |
+| `/board-agent status` | Revision identity/runtime state plus board snapshot, active runs, and legacy/orphan/Needs Human counts |
 | `/board-agent run` | Start autonomous polling loop |
 | `/board-agent stop` | Graceful stop — pause runs, settle persistence, release owner lock |
 
@@ -188,12 +190,16 @@ No agent can execute while Pi is off, but managed state survives normal shutdown
 
 ## Development
 
+Never develop in Pi's package cache. Use a normal clone or isolated worktree:
+
 ```bash
-git clone https://github.com/mancioshell/pi-board-agent.git
+git clone https://github.com/Hikoia/pi-board-agent.git
 cd pi-board-agent
 npm install
 bash tests/run-offline.sh
 ```
+
+For exact-SHA foreground deployment and fleet verification, follow [the local rollout runbook](docs/runbook.md).
 
 ## Credits
 

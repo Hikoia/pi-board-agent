@@ -225,11 +225,11 @@ export class BoardLoop {
     if (this.state.running) return;
     this.state.running = true;
     this.deps.callback(`Loop started (tick=${this.deps.cfg.tick_seconds}s)`);
-    await this.tickNow().catch((error: Error) => this.deps.callback(`start tick failed: ${error.message}`, "error"));
-    if (!this.state.running || this.stopped) return;
     this.intervalId = setInterval(() => {
-      void this.tickNow().catch((error: Error) => this.deps.callback(`tick failed: ${error.message}`, "error"));
+      const update = this.currentTick ? this.revisionAllowsNewWork() : this.tickNow();
+      void update.catch((error: Error) => this.deps.callback(`tick failed: ${error.message}`, "error"));
     }, this.deps.cfg.tick_seconds * 1000);
+    await this.tickNow().catch((error: Error) => this.deps.callback(`start tick failed: ${error.message}`, "error"));
   }
 
   isRunning(): boolean {
@@ -242,6 +242,15 @@ export class BoardLoop {
 
   enableAdmissions(): void {
     this.admitNewWork = true;
+  }
+
+  private async revisionAllowsNewWork(): Promise<boolean> {
+    const revision = await this.deps.revisionCheck?.();
+    if (!revision || revision.ok) return true;
+    const wasAdmitting = this.admitNewWork;
+    this.admitNewWork = false;
+    if (wasAdmitting) this.deps.callback(revision.reason ?? "Package revision changed; continuing recovery without new work.", "error");
+    return false;
   }
 
   async tickNow(): Promise<void> {
@@ -279,14 +288,7 @@ export class BoardLoop {
       const { cfg, callback, repoOwner, repoName, meta } = this.deps;
       const cards = await this.fetchCards();
       await this.executor.reconcile(cards);
-      const revision = await this.deps.revisionCheck?.();
-      if (revision && !revision.ok) {
-        const wasAdmitting = this.admitNewWork;
-        this.admitNewWork = false;
-        if (wasAdmitting) callback(revision.reason ?? "Package revision changed; continuing recovery without new work.", "error");
-        return;
-      }
-      if (!this.admitNewWork) return;
+      if (!(await this.revisionAllowsNewWork()) || !this.admitNewWork) return;
       if (cards.length === 0) {
         callback("No cards on the board yet.");
         return;
