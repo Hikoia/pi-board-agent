@@ -106,6 +106,7 @@ const result = await agent(
   [
     'You are a fixing agent. PR #' + PAYLOAD.prNumber + ' has failing CI and you must make the minimal fix.',
     'You run inside an isolated git worktree; the repo is checked out there.',
+    'MINIMALISM: Fix the root cause at the narrowest shared seam with the smallest safe diff. Reuse existing code, platform features, and installed dependencies; limit abstractions, configuration, cleanup, and flexibility to what the failing checks require. Preserve validation, security, error handling, and the smallest relevant regression check.',
     '',
     'STEPS:',
     '1. git fetch origin ' + PAYLOAD.headBranch + ' && git checkout ' + PAYLOAD.headBranch + ' (create from origin/' + PAYLOAD.headBranch + ' if missing).',
@@ -174,6 +175,7 @@ const result = await agent(
   [
     'You answer for pi-board-agent on PR #' + PAYLOAD.prNumber + '. A human mentioned the bot.',
     'Be concise, technical, in the same language as the mention.',
+    'MINIMALISM: Recommend the smallest action supported by the current PR context. Introduce broader redesigns, abstractions, dependencies, or configuration only when the question or a demonstrated constraint requires them.',
     'If the human asks for a change, say you will apply it (the watchdog acts on CI).',
     'If the human asks a question about the PR, answer it from the context.',
     'Return ONLY the reply text as { reply: string }.',

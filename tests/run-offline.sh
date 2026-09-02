@@ -161,6 +161,7 @@ echo "--- workflow prompt ---"
 cat >"$GEN_DIR/test-wf.ts" <<'ENDTS'
 import { renderWorkflowSource, buildTasksForWave, extractTaskKey } from "../../src/workflow-prompt.js";
 import { loadConfig } from "../../src/config.js";
+import { readFileSync } from "node:fs";
 const cfg = loadConfig(process.env.TMP_DIR!);
 const cards = [
   { itemId: "PVTI_1", number: 42, title: "[T001] Add login form", body: "Acceptance:\n- [ ] form renders\n- [ ] validates email", status: "Ready", plan: "001-auth", assignees: [""], closed: false, url: "", repoOwner: "org", repoName: "repo" },
@@ -182,6 +183,12 @@ if (!src.includes("parallel(") && !src.includes("isolation: 'worktree'")) consol
 else console.log("FAIL: builder still creates an ephemeral worktree");
 if (src.includes("[T001] Add login form")) console.log("PASS: source embeds card title");
 else console.log("FAIL: source missing card title");
+if (src.includes("MINIMALISM:") && src.includes("standard-library/native") && src.includes("required now")) console.log("PASS: builder prompt requires minimal implementation");
+else console.log("FAIL: builder prompt missing minimal implementation policy");
+const agentPrompt = readFileSync(new URL("../../agents/board-agent-builder.md", import.meta.url), "utf8");
+const builderSkill = readFileSync(new URL("../../skills/board-agent/SKILL.md", import.meta.url), "utf8");
+if (agentPrompt.includes("minimal implementation ladder") && builderSkill.includes("## Minimal implementation")) console.log("PASS: builder agent definition and skill require minimal implementation");
+else console.log("FAIL: builder agent definition or skill missing minimal implementation policy");
 if (src.includes("Do NOT merge") && !src.includes("git merge --")) console.log("PASS: builder leaves task branch unmerged");
 else console.log("FAIL: builder may merge before manual close");
 try { renderWorkflowSource({ cfg, planSlug: "001-auth", baseBranch: "main", tasks, skillName: "board-agent" }); console.log("FAIL: multi-task workflow accepted"); }
@@ -379,6 +386,8 @@ const fix = renderFixWorkflowSource({
 });
 if (fix.includes('PR #42') && fix.includes('plan/001-auth') && fix.includes('pr-ci') && fix.includes('"repoOwner":"mancioshell"') && fix.includes('deepseek-v4-flash-0731')) console.log("PASS: fix workflow embeds PR/branch/checks/repo/model");
 else console.log("FAIL: fix workflow embeds PR/branch/checks/repo/model");
+if (fix.includes("MINIMALISM:") && fix.includes("narrowest shared seam")) console.log("PASS: fix prompt requires minimal root-cause changes");
+else console.log("FAIL: fix prompt missing minimal implementation policy");
 
 // 3) reply workflow source
 const reply = renderReplyWorkflowSource({
@@ -390,6 +399,8 @@ const reply = renderReplyWorkflowSource({
 });
 if (reply.includes("PR #7") && reply.includes("@board-bot what is the plan?") && reply.includes("reply")) console.log("PASS: reply workflow embeds mention + schema");
 else console.log("FAIL: reply workflow embeds mention + schema");
+if (reply.includes("MINIMALISM:") && reply.includes("smallest action")) console.log("PASS: reply prompt avoids speculative redesign");
+else console.log("FAIL: reply prompt missing minimalism policy");
 ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-watchdog.ts"
 echo
@@ -445,6 +456,8 @@ const source = renderReviewWorkflowSource({
 });
 if (source.includes("review-model") && source.includes("task/t001") && source.includes("rejects invalid input") && source.includes("git checkout --detach origin/") && source.includes("isolation: 'worktree'")) console.log("PASS: review workflow embeds task/model/schema");
 else console.log("FAIL: review workflow embeds task/model/schema");
+if (source.includes("MINIMALISM:") && source.includes("not an idealized architecture")) console.log("PASS: review prompt rejects speculative architecture findings");
+else console.log("FAIL: review prompt missing minimalism policy");
 const comment = renderReviewComment(fail!);
 if (comment.includes("AI review") && comment.includes("src/a.ts") && comment.includes("Ready")) console.log("PASS: review failure comment");
 else console.log("FAIL: review failure comment");
@@ -605,6 +618,8 @@ const script = renderRefineWorkflowSource({
 });
 if (script.includes("Add password reset") && script.includes("## Repo tree") && script.includes("deepseek-v4-flash-0731") && script.includes("openQuestions")) console.log("PASS: refine workflow embeds story/context/model/schema");
 else console.log("FAIL: refine workflow embeds story/context/model/schema");
+if (script.includes("MINIMALISM:") && script.includes("fewest dependency-ordered tasks")) console.log("PASS: refine prompt requires minimal design");
+else console.log("FAIL: refine prompt missing minimalism policy");
 
 // 5) comments renderers
 const refine: RefineOutput = { goal: "g", impactedAreas: [], decisions: ["d1"], risks: [], openQuestions: ["q1?", "q2?"], tasks: [] };

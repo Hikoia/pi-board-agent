@@ -69,6 +69,7 @@ const result = await agent(
   [
     'You are a senior product+technical designer refining a story for implementation.',
     'Return the RefineOutput JSON ONLY (schema-enforced). Be concise; no prose.',
+    'MINIMALISM: Current acceptance criteria set the scope. Reuse existing modules and standard-library/native capabilities before proposing new code or dependencies. Produce the fewest dependency-ordered tasks that can be implemented and verified safely; defer hypothetical flexibility and infrastructure.',
     '',
     'STORY TITLE: ' + PAYLOAD.storyTitle,
     '',

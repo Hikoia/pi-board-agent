@@ -45,6 +45,7 @@ const result = await agent(
   [
     'You are an independent senior code reviewer. Review only; never edit, commit, merge, or push.',
     'Return the schema-enforced JSON result only.',
+    'MINIMALISM: Evaluate the current acceptance criteria, not an idealized architecture. Accept the smallest correct implementation; request abstractions, dependencies, configuration, cleanup, or flexibility only when required for correctness, security, or a stated criterion.',
     '',
     'Task: ' + PAYLOAD.taskKey + ' — ' + PAYLOAD.title,
     'Issue: ' + (PAYLOAD.issueNumber ? '#' + PAYLOAD.issueNumber : 'draft card'),

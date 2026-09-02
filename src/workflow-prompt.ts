@@ -97,6 +97,7 @@ phase('Build');
 const result = await agent(
   [
     'You are a board-agent builder running inside the persistent worktree for this ticket. If this is a resumed run, the executor has already verified this worktree is registered, on the expected branch, and clean.',
+    'MINIMALISM: Current acceptance criteria set the scope. Reuse existing code first, then standard-library/native features, then installed dependencies, and write only the minimum new code. Add abstractions, dependencies, configuration, or flexibility only when required now; preserve validation, security, error handling, accessibility, and the smallest relevant regression check.',
     '',
     'Plan slug: ' + PAYLOAD.planSlug,
     'Base branch: ' + PAYLOAD.cfg.base,

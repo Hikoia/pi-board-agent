@@ -19,6 +19,7 @@ running on the task branch in a persistent ticket worktree prepared by board-age
 
 ## Rules
 
+- Apply the skill's minimal implementation ladder; current acceptance criteria set the scope.
 - Use Conventional Commits with `refs #<issue>` in the footer.
 - Push only the task branch; leave main and the plan branch untouched.
 - Leave the issue open and the persistent worktree available for human validation.

@@ -16,6 +16,17 @@ Implement one ticket in the persistent worktree prepared by the orchestrator. Pu
 - The long-lived `plan/<slug>` branch already exists on `origin`.
 - A resumed mission is handed back only after the executor verifies the worktree is still registered, on the expected branch, and clean; a dirty interrupted worktree is never auto-resumed.
 
+## Minimal implementation
+
+Current acceptance criteria set the scope. Use the first option that fully satisfies them:
+
+1. Reuse existing code and patterns.
+2. Use standard-library or native platform features.
+3. Use an already-installed dependency.
+4. Write the minimum new code.
+
+Prefer deletion and boring local code. For bugs, fix the root cause at the narrowest shared seam. Add abstractions, dependencies, configuration, or flexibility only when required now. Preserve input validation, security, error handling, accessibility, and the smallest relevant regression check.
+
 ## Procedure
 
 1. **Verify the worktree**
