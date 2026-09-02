@@ -633,6 +633,11 @@ ENDTS
 TMP_DIR="$(mktemp -d)" run_ts "$GEN_DIR/test-refine.ts"
 echo
 
+# ---- 14. Needs Design task flow ----
+echo "--- task design ---"
+TMP_DIR="$(mktemp -d)" run_ts "$ROOT/tests/test-task-design.ts"
+echo
+
 # ---- summary ----
 echo "---"
 if ((FAIL > 0)); then

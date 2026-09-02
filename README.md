@@ -172,6 +172,10 @@ Recoverable connection/empty-output failures use `builder_retries` inside the sa
 
 Read the structured blocker comment, reply with the requested decision or manual fix, and leave the retained task worktree on its expected branch with a clean status. Then manually move the Project card to `Ready`. The fresh builder run reads trusted maintainer replies after the latest blocker comment and continues from the retained task branch.
 
+**What happens in `Needs Design`?**
+
+Stories re-run refinement after a trusted maintainer reply. Tasks sent there by the requirements gate are claimed by the designer, which rewrites the issue contract from repository owner/member/collaborator comments and returns the card to `Ready`. If a real decision is still missing, it posts the questions and waits for another trusted reply.
+
 **What about merge conflicts?**
 
 Builders never merge. If finalization conflicts after the human closes the

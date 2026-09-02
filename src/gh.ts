@@ -80,6 +80,14 @@ function runGh(args: string[], opts: { input?: string; cwd?: string } = {}): Pro
   });
 }
 
+function parseGhJson<T>(output: string, command: string): T {
+  try {
+    return JSON.parse(output) as T;
+  } catch {
+    throw new Error(`gh ${command} returned invalid JSON.`);
+  }
+}
+
 async function graphql<T = unknown>(query: string, variables: Record<string, unknown> = {}): Promise<T> {
   const args = ["api", "graphql", "-f", `query=${query}`];
   for (const [k, v] of Object.entries(variables)) {
@@ -88,7 +96,7 @@ async function graphql<T = unknown>(query: string, variables: Record<string, unk
     else args.push("-F", `${k}=${JSON.stringify(v)}`); // objects/arrays → typed JSON
   }
   const out = await runGh(args);
-  const parsed = JSON.parse(out);
+  const parsed = parseGhJson<{ data: T; errors?: unknown }>(out, "api graphql");
   if (parsed.errors) {
     throw new Error(`GraphQL error: ${JSON.stringify(parsed.errors)}`);
   }
@@ -373,7 +381,7 @@ async function readClaimState(card: Card): Promise<{ open: boolean; assignees: s
     "--repo", `${card.repoOwner}/${card.repoName}`,
     "--json", "state,assignees",
   ]);
-  const value = JSON.parse(out) as { state?: string; assignees?: Array<{ login?: string }> };
+  const value = parseGhJson<{ state?: string; assignees?: Array<{ login?: string }> }>(out, "issue view");
   return {
     open: value.state === "OPEN",
     assignees: (value.assignees ?? []).flatMap((assignee) => assignee.login ? [assignee.login] : []),
@@ -412,6 +420,15 @@ export async function release(card: Card, botLogin: string): Promise<void> {
     "--repo", `${card.repoOwner}/${card.repoName}`,
     "--remove-assignee", botLogin,
   ]).catch(() => undefined);
+}
+
+export async function updateIssueBody(repoOwner: string, repoName: string, number: number, body: string): Promise<void> {
+  if (!body.trim()) throw new Error("Issue body cannot be empty.");
+  await runGh([
+    "issue", "edit", String(number),
+    "--repo", `${repoOwner}/${repoName}`,
+    "--body-file", "-",
+  ], { input: body });
 }
 
 export async function closeIssue(repoOwner: string, repoName: string, number: number): Promise<void> {
@@ -674,6 +691,7 @@ export interface IssueComment {
   body: string;
   createdAt: string;
   author?: string;
+  authorAssociation?: string;
 }
 
 /** List comments of an issue (ascending). */
@@ -686,19 +704,21 @@ export async function listIssueComments(
     query($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
         issue(number: $number) {
-          comments(first: 50, orderBy: { field: UPDATED_AT, direction: ASC }) {
-            nodes { id body createdAt author { login } }
+          comments(first: 50) {
+            nodes { id body createdAt authorAssociation author { login } }
           }
         }
       }
     }`;
   const data = await graphql<any>(query, { owner: repoOwner, name: repoName, number });
-  return (data?.repository?.issue?.comments?.nodes ?? []).map((n: any) => ({
+  const comments: IssueComment[] = (data?.repository?.issue?.comments?.nodes ?? []).map((n: any) => ({
     id: n.id,
     body: n.body,
     createdAt: n.createdAt,
     author: n.author?.login,
+    authorAssociation: n.authorAssociation,
   }));
+  return comments.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
 /** True when an open PR for headBranch exists AND is merged. */
@@ -748,14 +768,7 @@ export async function listPrsWithLabel(
     "--json", "number,title,headRefName,headRefOid,url",
     "--limit", "50",
   ]);
-  const arr = JSON.parse(out) as Array<{
-    number: number;
-    title: string;
-    headRefName: string;
-    headRefOid: string;
-    url: string;
-  }>;
-  return arr;
+  return parseGhJson<AgentPr[]>(out, "pr list");
 }
 
 export interface CheckRunInfo {

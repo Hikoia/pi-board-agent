@@ -3,23 +3,29 @@ import type { Config } from "./config.js";
 import { planSlug } from "./config.js";
 import {
   type Card,
+  type IssueComment,
   type ProjectMetadata,
   createComment,
+  getCard,
   isPrMerged,
   listCards,
   listIssueComments,
   release,
   setStatus,
   tryClaim,
+  updateIssueBody,
 } from "./gh.js";
 import { ensurePlanBranch, isClean } from "./git-helpers.js";
 import { makeNotifier } from "./notify.js";
 import { isPlanComplete, openPlanPr, summarizePlans } from "./plan.js";
 import {
+  type DesignOutput,
+  type DesignRunInput,
   RefineStateStore,
   createTasksFromRefine,
   renderQuestionsComment,
   renderRefineComment,
+  runDesign,
   runRefine,
 } from "./refine.js";
 import { renderReviewComment, runReview } from "./review.js";
@@ -59,6 +65,145 @@ export function createLoopState(): LoopState {
     prsOpened: 0,
     lastTickMs: 0,
   };
+}
+
+const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+
+function trustedMaintainerComments(comments: IssueComment[]): IssueComment[] {
+  return comments.filter((comment) =>
+    !!comment.author &&
+    TRUSTED_ASSOCIATIONS.has(comment.authorAssociation ?? "") &&
+    !comment.body.trimStart().startsWith("<!-- board-agent-")
+  );
+}
+
+function taskDesignDecision(comments: IssueComment[], issueNumber: number): {
+  source: IssueComment;
+  trustedComments: string[];
+  completedMarker: string;
+} | undefined {
+  const gatePrefix = `<!-- board-agent-requirements-gate:${issueNumber}`;
+  const questionPrefix = `<!-- board-agent-task-design-questions:${issueNumber}:`;
+  const completedPrefix = `<!-- board-agent-task-design:${issueNumber}:`;
+  let latestGate = -1;
+  let latestQuestion = -1;
+  let latestCompleted = -1;
+  comments.forEach((comment, index) => {
+    const body = comment.body.trimStart();
+    if (body.startsWith(gatePrefix)) latestGate = index;
+    if (body.startsWith(questionPrefix)) latestQuestion = index;
+    if (body.startsWith(completedPrefix)) latestCompleted = index;
+  });
+  const requestIndex = Math.max(latestGate, latestQuestion);
+  if (requestIndex < 0 || latestCompleted > requestIndex) return undefined;
+  const trusted = trustedMaintainerComments(comments);
+  const candidates = latestQuestion > latestGate
+    ? trustedMaintainerComments(comments.slice(latestQuestion + 1))
+    : trusted;
+  const source = candidates.at(-1);
+  if (!source) return undefined;
+  return {
+    source,
+    trustedComments: trusted.map(
+      (comment) => `${comment.createdAt} ${comment.author}: ${comment.body}`,
+    ),
+    completedMarker: `<!-- board-agent-task-design:${issueNumber}:${source.id} -->`,
+  };
+}
+
+export interface TaskDesignOps {
+  claim(card: Card): Promise<boolean>;
+  refresh(card: Card): Promise<Card | undefined>;
+  release(card: Card): Promise<void>;
+  listComments(card: Card): Promise<IssueComment[]>;
+  design(input: DesignRunInput): Promise<DesignOutput>;
+  updateBody(card: Card, body: string): Promise<void>;
+  comment(card: Card, body: string): Promise<void>;
+  setReady(card: Card): Promise<void>;
+}
+
+export type TaskDesignResult = "ready" | "questioned" | "waiting" | "skipped" | "error";
+
+/** Claim one Needs Design task, rewrite its issue contract from trusted decisions, then return it to Ready. */
+export async function processNeedsDesignTask(
+  input: {
+    card: Card;
+    cfg: Config;
+    cwd: string;
+    contextDigest: string;
+    callback: StatusCallback;
+  },
+  ops: TaskDesignOps,
+): Promise<TaskDesignResult> {
+  const { card, cfg, cwd, contextDigest, callback } = input;
+  if (
+    !card.number || !card.repoOwner || !card.repoName || card.closed ||
+    (card.type ?? "").toLowerCase() === "story" ||
+    (card.status ?? "").toLowerCase() !== cfg.columns.needs_design.toLowerCase()
+  ) return "skipped";
+
+  let claimed = false;
+  let claimedCard = card;
+  try {
+    if (!taskDesignDecision(await ops.listComments(card), card.number)) return "waiting";
+    claimed = await ops.claim(card);
+    if (!claimed) return "skipped";
+
+    const fresh = await ops.refresh(card);
+    if (
+      !fresh || fresh.closed ||
+      (fresh.type ?? "").toLowerCase() === "story" ||
+      (fresh.status ?? "").toLowerCase() !== cfg.columns.needs_design.toLowerCase()
+    ) return "skipped";
+    claimedCard = fresh;
+
+    const comments = await ops.listComments(fresh);
+    const decision = taskDesignDecision(comments, card.number);
+    if (!decision) return "waiting";
+
+    const design = await ops.design({
+      cwd,
+      title: fresh.title,
+      body: fresh.body,
+      trustedComments: decision.trustedComments,
+      contextDigest,
+      model: cfg.models.refine,
+      timeoutMs: cfg.refine.timeout_ms,
+    });
+    if (design.openQuestions.length > 0) {
+      const marker = `<!-- board-agent-task-design-questions:${card.number}:${decision.source.id} -->`;
+      await ops.comment(fresh, [
+        marker,
+        "## ❓ Needs design",
+        "",
+        ...design.openQuestions.map((question, index) => `${index + 1}. ${question}`),
+        "",
+        "Reply below with the missing decision; board-agent will retry automatically.",
+      ].join("\n"));
+      callback(`Task "${fresh.title}" remains in ${cfg.columns.needs_design}: ${design.openQuestions.length} open question(s).`, "warn");
+      return "questioned";
+    }
+
+    await ops.updateBody(fresh, design.body);
+    await ops.setReady(fresh);
+    await ops.comment(fresh, [
+      decision.completedMarker,
+      "## ✅ Ticket design updated",
+      "",
+      design.summary,
+      "",
+      `The clarified contract returned to \`${cfg.columns.ready}\` for implementation.`,
+    ].join("\n")).catch((error) => {
+      callback(`Task "${fresh.title}" is Ready, but its design audit comment failed: ${error instanceof Error ? error.message : String(error)}`, "warn");
+    });
+    callback(`Task "${fresh.title}" designed → ${cfg.columns.ready}.`);
+    return "ready";
+  } catch (error) {
+    callback(`Task design failed for "${card.title}": ${error instanceof Error ? error.message : String(error)}`, "error");
+    return "error";
+  } finally {
+    if (claimed) await ops.release(claimedCard);
+  }
 }
 
 export class BoardLoop {
@@ -145,7 +290,10 @@ export class BoardLoop {
         return;
       }
 
-      if (cfg.refine.enabled) await this.processStories(cards);
+      if (cfg.refine.enabled) {
+        await this.processTaskDesignCards(cards);
+        await this.processStories(cards);
+      }
 
       if (cfg.watchdog.enabled) {
         try {
@@ -231,7 +379,10 @@ export class BoardLoop {
     const inProgress = cfg.columns.building.toLowerCase();
     const contextDigest = await this.getContextDigest();
 
-    const story = stories[0];
+    const story = stories.find((candidate) => (candidate.status ?? "").toLowerCase() === needsDesign)
+      ?? stories.find((candidate) => (candidate.status ?? "").toLowerCase() === readyStatus)
+      ?? stories.find((candidate) => (candidate.status ?? "").toLowerCase() === inProgress);
+    if (!story) return;
     const status = (story.status ?? "").toLowerCase();
     const slug = story.plan ?? "";
     if (!slug) return;
@@ -240,10 +391,11 @@ export class BoardLoop {
       if (!story.number || !story.repoOwner || !story.repoName) return;
       const state = refineState.get(story.number);
       const comments = await listIssueComments(story.repoOwner, story.repoName, story.number).catch(() => []);
-      const fresh = state?.lastSeenCommentId
-        ? comments.filter((comment) => comment.id !== state.lastSeenCommentId)
-        : comments;
-      const humanReplies = fresh.filter((comment) => comment.author && comment.author !== botLogin);
+      const lastSeenIndex = state?.lastSeenCommentId
+        ? comments.findIndex((comment) => comment.id === state.lastSeenCommentId)
+        : -1;
+      const fresh = lastSeenIndex >= 0 ? comments.slice(lastSeenIndex + 1) : comments;
+      const humanReplies = trustedMaintainerComments(fresh);
       if (humanReplies.length === 0) return;
       callback(`Story #${story.number} has ${humanReplies.length} new human reply/replies — re-refining…`);
       await this.refineStory(
@@ -283,6 +435,47 @@ export class BoardLoop {
     }
     await this.refineStory(story, slug, contextDigest, "", refineState);
     await release(story, botLogin);
+  }
+
+  private async processTaskDesignCards(cards: Card[]): Promise<void> {
+    const { cfg, meta, botLogin, callback } = this.deps;
+    const candidates = cards.filter((card) =>
+      (card.type ?? "").toLowerCase() !== "story" &&
+      (card.status ?? "").toLowerCase() === cfg.columns.needs_design.toLowerCase() &&
+      !card.closed
+    );
+    if (candidates.length === 0) return;
+
+    const contextDigest = await this.getContextDigest();
+    for (const card of candidates) {
+      const result = await processNeedsDesignTask({
+        card,
+        cfg,
+        cwd: this.deps.cwd,
+        contextDigest,
+        callback,
+      }, {
+        claim: (candidate) => tryClaim(candidate, botLogin),
+        refresh: (candidate) => getCard(candidate.itemId, cfg.status_field, cfg.plan_field, cfg.type_field),
+        release: (candidate) => release(candidate, botLogin),
+        listComments: (candidate) => {
+          if (!candidate.number || !candidate.repoOwner || !candidate.repoName) return Promise.resolve([]);
+          return listIssueComments(candidate.repoOwner, candidate.repoName, candidate.number);
+        },
+        design: runDesign,
+        updateBody: async (candidate, body) => {
+          if (!candidate.number || !candidate.repoOwner || !candidate.repoName) throw new Error("Task has no linked GitHub issue.");
+          await updateIssueBody(candidate.repoOwner, candidate.repoName, candidate.number, body);
+        },
+        comment: async (candidate, body) => {
+          if (!candidate.number || !candidate.repoOwner || !candidate.repoName) throw new Error("Task has no linked GitHub issue.");
+          const id = await this.createCommentWithId(candidate.number, candidate.repoOwner, candidate.repoName, body);
+          if (!id) throw new Error("Failed to post the task design audit comment.");
+        },
+        setReady: (candidate) => setStatus(meta, candidate.itemId, cfg.columns.ready),
+      });
+      if (result !== "waiting" && result !== "skipped") return;
+    }
   }
 
   private async refineStory(
