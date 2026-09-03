@@ -65,10 +65,12 @@ pi install git:github.com/Hikoia/pi-board-agent@<FULL_40_CHARACTER_GIT_SHA>
 - [Pi](https://pi.dev/) `>=0.80.8`
 - Bundled [pi-dynamic-workflows](https://pi.dev/packages/@quintinshaw/pi-dynamic-workflows) `^3.10.0`
 - `gh` CLI authenticated with the `project` scope:
+
   ```bash
   gh auth login
   gh auth refresh -s project
   ```
+
 - A **GitHub Project (v2)** with these `Status` options: `Backlog`, `Ready`, `In Progress`, `Needs Design`, `Needs Human`, `Review`, `Done`. Add `Needs Human` manually to an existing Project; `init-project` intentionally does not rewrite existing option lists.
 - A `Plan` text or single-select field whose values match your feature slugs
   (e.g. `001-auth`, `002-dashboard`).
@@ -118,7 +120,7 @@ bot_identity: ""   # login for the assignee claim guard; empty = gh user
 ## How it works
 
 | Component | Role |
-|-----------|------|
+| ----------- | ------ |
 | `/board-agent run` | Starts one owner. Every tick reconciles persisted runs, then fills `max_workers - activeCount()` globally. Calling it again is a no-op unless it promotes a startup recovery-only loop. |
 | `ticket-executor.ts` | Owns final card refetch, claim, worktree/run association, recovery, and idempotent outcome transitions. |
 | `ticket-worktree.ts` | Atomically stores the v2 execution record and retains the worktree through review and human validation. |
@@ -133,8 +135,8 @@ bot_identity: ""   # login for the assignee claim guard; empty = gh user
 1. **Revision guard**: new work starts only when the effective package setting is a full Git SHA matching both the loaded module and a clean checkout. Revision drift leaves the process recovery-only until restart.
 2. **Owner + claim guards**: one local owner lock, followed by an assignee mutation and a second full card refetch.
 3. **Durable managed runs**: WorkflowManager persists the run before its agent starts. The ticket record associates that run with the retained worktree.
-4. **Fail-closed reconciliation**: only a clean, matching paused worktree resumes. Dirty, missing, malformed, failed, or ambiguous state moves that ticket to `Needs Human` without blocking siblings.
-5. **Idempotent terminal mutations**: run markers prevent duplicate comments, and the active record remains until GitHub status/comment updates succeed.
+4. **Ownership-scoped reconciliation**: a paused run resumes when its persisted args, ticket identity/status, managed path, registration, and branch all match, preserving any partial dirty diff owned by that run. Usage-limit checkpoints stay paused; unowned dirty worktrees, dirty completed results, and missing, malformed, failed, or ambiguous state fail closed to `Needs Human` without blocking siblings.
+5. **Idempotent terminal mutations**: run-lineage markers prevent duplicate comments while allowing a later run's incident to be reported, and the active record remains until GitHub status/comment updates succeed.
 
 ### Branch model
 
@@ -153,7 +155,7 @@ cleaned, board-agent opens **one PR**: `plan/001-auth` → `main`.
 ## Commands
 
 | Command | Description |
-|---------|-------------|
+| --------- | ------------- |
 | `/board-agent init` | Write `.pi/board-agent.yml` template |
 | `/board-agent lint` | Check: exact loaded revision, config, `gh` auth, project, fields, and statuses |
 | `/board-agent status` | Revision identity/runtime state plus board snapshot, active runs, and legacy/orphan/Needs Human counts |
@@ -164,7 +166,7 @@ cleaned, board-agent opens **one PR**: `plan/001-auth` → `main`.
 
 **Can I resume after a crash?**
 
-Yes. On startup or `/reload`, active ticket records recreate their WorkflowManagers. A clean paused worktree resumes from its journal; a completed persisted result is applied once. Unsafe or ambiguous state goes to `Needs Human` and keeps the worktree for inspection.
+Yes. On startup or `/reload`, active ticket records recreate their WorkflowManagers. A matching paused run resumes from its journal and preserves its existing partial diff; a usage-limit checkpoint remains paused for the scheduler. Completed results are applied only from a clean worktree. Unowned dirty, unsafe, or ambiguous state goes to `Needs Human` and keeps the worktree for inspection.
 
 **What if a builder fails?**
 
@@ -209,7 +211,7 @@ the autonomous GitHub Project board executor for Claude Code.
 ### Differences from super-board
 
 | Area | super-board | pi-board-agent |
-|---|---|---|
+| --- | --- | --- |
 | **Host agent** | Claude Code | [Pi](https://pi.dev/) |
 | **Worker model** | Dynamic workflows (`workflows/super-board-wave.js`) or `claude -p` headless | [pi-dynamic-workflows](https://github.com/QuintinShaw/pi-dynamic-workflows) builders run in board-agent's persistent ticket worktrees; reviewers use ephemeral isolation |
 | **Plan grouping** | No plan concept — cards are independent | Cards are grouped by a `plan_field` on the project (e.g. `Plan: 001-auth`). When ALL cards of a plan reach `Done`, a single cumulative PR from `plan/<slug>` → `main` is opened |
@@ -225,6 +227,7 @@ the autonomous GitHub Project board executor for Claude Code.
 ## License
 
 MIT © Alessandro Mancini. See [LICENSE](LICENSE).
+
 ## Docker (Raspberry Pi)
 
 Run the board-agent in its own always-on container (independent pi instance):

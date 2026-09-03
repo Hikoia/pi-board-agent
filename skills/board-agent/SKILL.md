@@ -14,7 +14,7 @@ Implement one ticket in the persistent worktree prepared by the orchestrator. Pu
 - The worktree remains available for human validation after this run.
 - `origin` points at the target GitHub repository.
 - The long-lived `plan/<slug>` branch already exists on `origin`.
-- A resumed mission is handed back only after the executor verifies the worktree is still registered, on the expected branch, and clean; a dirty interrupted worktree is never auto-resumed.
+- A resumed mission is handed back after the executor verifies the worktree is still registered and on the expected branch. It may contain a partial dirty diff left by that same active run.
 
 ## Minimal implementation
 
@@ -37,7 +37,7 @@ Prefer deletion and boring local code. For bugs, fix the root cause at the narro
    git remote get-url origin   # must be GitHub
    ```
 
-   Continue only from a clean task branch. If the remote task branch exists, update with `git pull --ff-only origin <task-branch>`.
+   Inspect both `git status --short` and `git diff` before changing files. If the worktree is dirty, preserve and continue the existing modifications; never reset, stash, overwrite, or discard them to make it clean. Only when the worktree is clean, update an existing remote task branch with `git pull --ff-only origin <task-branch>`.
 
 2. **Read acceptance criteria**
 
@@ -45,7 +45,7 @@ Prefer deletion and boring local code. For bugs, fix the root cause at the narro
 
 3. **Implement and verify**
 
-   Follow repository conventions, add the smallest relevant tests, and run them. Leave the worktree clean.
+   Follow repository conventions, add the smallest relevant tests, and run them. On success, leave every change committed and the worktree clean.
 
 4. **Commit**
 
@@ -65,7 +65,7 @@ Prefer deletion and boring local code. For bugs, fix the root cause at the narro
    git push -u origin <task-branch>
    ```
 
-   The task branch remains unmerged while AI review and human validation run. Keep the ticket open.
+   The task branch remains unmerged while AI review and human validation run. Keep the ticket open, and report success only after the branch is pushed and the worktree is clean.
 
 6. **Return one outcome object**
 
