@@ -57,14 +57,24 @@ TicketExecutor.reconcile(cards)
   ├─ quarantine dirty/missing/malformed/failed runs in Needs Human
   └─ quarantine legacy inflight and record-less In Progress cards individually
   ↓
-run story/review/watchdog/finalization lanes
+if activeCount() < max_workers: run the Needs Design Task gate/refinement lane
+  ↓
+run Story refinement, watchdog, Review, and finalization lanes
   ↓
 slots = max_workers - activeCount()
   ↓
 launch Ready task cards globally (no plan-level inflight guard)
 ```
 
-Builders run in the background. A tick never waits for a builder to finish; later ticks read persisted run state.
+Builders run in the background. A tick never waits for a builder to finish; later ticks read persisted run state. Task design remains a foreground workflow and uses one currently available worker slot while it runs.
+
+## Task design gate
+
+An open non-Story Task entering `Needs Design` first receives one requirements-gate marker under a temporary assignee claim. The bot then waits without claiming until an `OWNER`, `MEMBER`, or `COLLABORATOR` replies after the latest gate or task-design-question marker. A completed marker closes that request; moving the Task back to `Needs Design` starts a new gate.
+
+After claiming and before running the designer, the loop re-reads the Project item and every issue comment. Before any post-design write, it re-reads both again and requires the issue to remain open and in `Needs Design`, the body to be unchanged, no competing assignee, and the same latest trusted decision source ID. A status change prevents every write; a changed body or decision is left for the next tick. Open questions create a fresh request boundary. A resolved contract updates the body, moves the Task to `Ready`, posts its audit marker, and releases the claim.
+
+Candidates start at `tickCount % candidates.length`, so one failing Task cannot starve its siblings. Each tick invokes at most one Task designer.
 
 ## Launch ordering
 

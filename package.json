@@ -1,6 +1,7 @@
 {
   "name": "@mancioshell/pi-board-agent",
   "version": "0.1.1",
+  "private": true,
   "description": "Autonomous GitHub Project (v2) board executor for Pi — picks Ready cards, implements them in parallel git worktrees via pi-dynamic-workflows, and opens one PR per plan.",
   "license": "MIT",
   "type": "module",
