@@ -13,25 +13,36 @@ trap 'rm -rf /tmp/pi-board-agent-test-*; true' EXIT
 PASS=0
 FAIL=0
 
-pass_line() { echo "  PASS  ${1#PASS: }"; PASS=$((PASS+1)); }
-fail_line() { echo "  FAIL  ${1#FAIL: }"; FAIL=$((FAIL+1)); }
+pass_line() {
+    echo "  PASS  ${1#PASS: }"
+    PASS=$((PASS + 1))
+}
+fail_line() {
+    echo "  FAIL  ${1#FAIL: }"
+    FAIL=$((FAIL + 1))
+}
 
 run_ts() {
-  local file="$1"
-  local out
-  out="$(cd "$ROOT" && node --import tsx "$file" 2>&1)" || { echo "        [node error]"; fail_line "node crashed"; echo "$out"; return; }
-  while IFS= read -r line; do
-    case "$line" in
-      PASS:*) pass_line "$line" ;;
-      FAIL:*) fail_line "$line" ;;
-      LOOP:*|"") ;;
-      *)
-        if [[ -n "$line" ]]; then
-          echo "        $line"
-        fi
-        ;;
-    esac
-  done <<< "$out"
+    local file="$1"
+    local out
+    out="$(cd "$ROOT" && node --import tsx "$file" 2>&1)" || {
+        echo "        [node error]"
+        fail_line "node crashed"
+        echo "$out"
+        return
+    }
+    while IFS= read -r line; do
+        case "$line" in
+        PASS:*) pass_line "$line" ;;
+        FAIL:*) fail_line "$line" ;;
+        LOOP:* | "") ;;
+        *)
+            if [[ -n "$line" ]]; then
+                echo "        $line"
+            fi
+            ;;
+        esac
+    done <<<"$out"
 }
 
 echo "== pi-board-agent: offline tests =="
@@ -308,7 +319,7 @@ echo
 # ---- 5. Dispatch smoke (runWorkflow programmatic, no agents) ----
 echo "--- dispatch smoke ---"
 
-cat > "$GEN_DIR/test-dispatch-smoke.ts" <<'ENDTS'
+cat >"$GEN_DIR/test-dispatch-smoke.ts" <<'ENDTS'
 import { runWorkflow } from "@quintinshaw/pi-dynamic-workflows";
 const script = `
 export const meta = { name: 'smoke', description: 'smoke', phases: [{ title: 'x' }] };
@@ -326,7 +337,7 @@ echo
 # ---- 6. Context digest (Phase B) ----
 echo '--- context ---'
 
-cat > "$GEN_DIR/test-context.ts" <<'ENDTS'
+cat >"$GEN_DIR/test-context.ts" <<'ENDTS'
 import { renderContext, generateContext } from "../../src/context.js";
 import { _DEFAULTS, type Config } from "../../src/config.js";
 import { renderWorkflowSource, buildTasksForWave } from "../../src/workflow-prompt.js";
@@ -367,7 +378,7 @@ echo
 # ---- 8. Watchdog (Phase D) ----
 echo "--- watchdog ---"
 
-cat > "$GEN_DIR/test-watchdog.ts" <<'ENDTS'
+cat >"$GEN_DIR/test-watchdog.ts" <<'ENDTS'
 import { WatchdogStateStore } from "../../src/watchdog.js";
 import { renderFixWorkflowSource, renderReplyWorkflowSource } from "../../src/watchdog.js";
 
@@ -417,7 +428,7 @@ echo
 # ---- 9. Notify (Phase E) ----
 echo "--- notify ---"
 
-cat > "$GEN_DIR/test-notify.ts" <<'ENDTS'
+cat >"$GEN_DIR/test-notify.ts" <<'ENDTS'
 import { mdToHtml } from "../../src/notify.js";
 import { _DEFAULTS } from "../../src/config.js";
 
@@ -438,7 +449,7 @@ echo
 # ---- 10. AI review gate ----
 echo "--- AI review ---"
 
-cat > "$GEN_DIR/test-review.ts" <<'ENDTS'
+cat >"$GEN_DIR/test-review.ts" <<'ENDTS'
 import { readFileSync } from "node:fs";
 import { parseReviewOutput, renderReviewComment, renderReviewWorkflowSource } from "../../src/review.js";
 
@@ -477,6 +488,10 @@ const passBlock = loopSource.slice(passStart, loopSource.indexOf("        const 
 if (!passBlock.includes("closeIssue(") && passBlock.includes("cfg.columns.done") && passBlock.includes("close issue #")) console.log("PASS: accepted review moves to Done and waits for manual close");
 else console.log("FAIL: accepted review does not wait for manual close");
 
+const indexSource = readFileSync(new URL("../../src/index.ts", import.meta.url), "utf8");
+if (loopSource.includes("this.state.reviewingTask = task.taskKey") && loopSource.includes("this.state.reviewingTask = null") && indexSource.includes("${reviewing} [reviewing]")) console.log("PASS: active AI review appears in the persistent status widget");
+else console.log("FAIL: active AI review is missing from the persistent status widget");
+
 const ghSource = readFileSync(new URL("../../src/gh.ts", import.meta.url), "utf8");
 if (ghSource.includes("export async function closeIssue") && ghSource.includes('"issue", "close"') && ghSource.includes('"--reason", "completed"')) console.log("PASS: closeIssue marks GitHub issue completed");
 else console.log("FAIL: closeIssue marks GitHub issue completed");
@@ -492,7 +507,7 @@ echo
 # ---- 12. Persistent ticket worktree ----
 echo "--- ticket worktree ---"
 
-cat > "$GEN_DIR/test-ticket-worktree.ts" <<'ENDTS'
+cat >"$GEN_DIR/test-ticket-worktree.ts" <<'ENDTS'
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -590,7 +605,7 @@ echo
 # ---- 7. Refine phase (Phase C) ----
 echo "--- refine ---"
 
-cat > "$GEN_DIR/test-refine.ts" <<'ENDTS'
+cat >"$GEN_DIR/test-refine.ts" <<'ENDTS'
 import { parseRefineOutput, renderRefineWorkflowSource, renderRefineComment, renderQuestionsComment, type RefineOutput } from "../../src/refine.js";
 
 // 1) parseRefineOutput: happy path
@@ -655,9 +670,8 @@ echo
 # ---- summary ----
 echo "---"
 if ((FAIL > 0)); then
-  echo "pi-board-agent: ${FAIL} FAILED, ${PASS} passed"
-  exit 1
+    echo "pi-board-agent: ${FAIL} FAILED, ${PASS} passed"
+    exit 1
 else
-  echo "pi-board-agent: ALL CHECKS PASSED (${PASS}/$((PASS+FAIL)))"
+    echo "pi-board-agent: ALL CHECKS PASSED (${PASS}/$((PASS + FAIL)))"
 fi
-

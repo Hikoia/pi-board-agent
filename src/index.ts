@@ -22,7 +22,10 @@ import { getProjectMetadata, validateStatusOptions, whoami } from "./gh.js";
 import { createLoopState, BoardLoop, type LoopDeps } from "./loop.js";
 import { Inflight } from "./inflight.js";
 import { acquireOwnerLock, ownerLockHeldByOther } from "./owner-lock.js";
-import { createProductionTicketExecutor, inspectTicketExecutions } from "./ticket-executor.js";
+import {
+  createProductionTicketExecutor,
+  inspectTicketExecutions,
+} from "./ticket-executor.js";
 import { TicketWorktrees } from "./ticket-worktree.js";
 import {
   captureRuntimeIdentity,
@@ -38,10 +41,17 @@ let loop: BoardLoop | null = null;
 let loopState = createLoopState();
 const BOARD_WIDGET_ID = "board-agent-active";
 const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
-const loadedRuntimeIdentity = captureRuntimeIdentity(PACKAGE_ROOT, process.cwd());
+const loadedRuntimeIdentity = captureRuntimeIdentity(
+  PACKAGE_ROOT,
+  process.cwd(),
+);
 const REVISION_LATCH = Symbol.for("Hikoia.pi-board-agent.revision-mismatch");
-const processRevisionState = globalThis as typeof globalThis & { [REVISION_LATCH]?: { mismatch: boolean } };
-const revisionLatch = processRevisionState[REVISION_LATCH] ??= { mismatch: false };
+const processRevisionState = globalThis as typeof globalThis & {
+  [REVISION_LATCH]?: { mismatch: boolean };
+};
+const revisionLatch = (processRevisionState[REVISION_LATCH] ??= {
+  mismatch: false,
+});
 let runtimeStartedAt = new Date().toISOString();
 let lastRevisionCheck: RevisionCheck | undefined;
 
@@ -64,9 +74,15 @@ function configuredStatuses(cfg: ReturnType<typeof loadConfig>): string[] {
 function hasRecoveryState(cwd: string): boolean {
   const stateDir = resolve(cwd, CONFIG_DIR_NAME, "board-agent");
   if (!existsSync(stateDir)) return false;
-  return new TicketWorktrees(cwd).list().some((record) =>
-    record.schemaVersion === 2 && Boolean(record.activeRunId || record.launchingAt)
-  ) || new Inflight(cwd).list().length > 0;
+  return (
+    new TicketWorktrees(cwd)
+      .list()
+      .some(
+        (record) =>
+          record.schemaVersion === 2 &&
+          Boolean(record.activeRunId || record.launchingAt),
+      ) || new Inflight(cwd).list().length > 0
+  );
 }
 
 function statusPrefix(level: "info" | "warn" | "error"): string {
@@ -76,13 +92,22 @@ function statusPrefix(level: "info" | "warn" | "error"): string {
 }
 
 function currentRevision(cwd: string): RevisionCheck {
-  const check = checkRuntimeRevision(cwd, loadedRuntimeIdentity, undefined, revisionLatch.mismatch);
+  const check = checkRuntimeRevision(
+    cwd,
+    loadedRuntimeIdentity,
+    undefined,
+    revisionLatch.mismatch,
+  );
   if (!check.ok) revisionLatch.mismatch = true;
   lastRevisionCheck = check;
   return check;
 }
 
-function saveRuntime(ctx: ExtensionContext, state: RuntimeState, check = lastRevisionCheck ?? currentRevision(ctx.cwd)): void {
+function saveRuntime(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+  check = lastRevisionCheck ?? currentRevision(ctx.cwd),
+): void {
   if (ownerLockHeldByOther(ctx.cwd)) return;
   writeRuntimeStatus(ctx.cwd, {
     expectedRevision: check.expectedRevision,
@@ -97,7 +122,8 @@ function saveRuntime(ctx: ExtensionContext, state: RuntimeState, check = lastRev
 }
 
 function liveRuntimeState(check: RevisionCheck): RuntimeState {
-  if (!check.ok) return loop?.isRunning() ? "recovery-only" : "version-mismatch";
+  if (!check.ok)
+    return loop?.isRunning() ? "recovery-only" : "version-mismatch";
   if (!loop?.isRunning()) return "stopped";
   return loop.isAdmittingNewWork() ? "running" : "recovery-only";
 }
@@ -110,24 +136,45 @@ function requireCurrentRevision(ctx: ExtensionContext): RevisionCheck {
 }
 
 // Start the autonomous loop (shared by /board-agent run, auto_start, and recovery).
-async function startBoardLoop(ctx: ExtensionContext, admitNewWork = true): Promise<void> {
+async function startBoardLoop(
+  ctx: ExtensionContext,
+  admitNewWork = true,
+): Promise<void> {
   const cwd = ctx.cwd;
   const preflight = currentRevision(cwd);
   if (!preflight.ok && admitNewWork) {
-    saveRuntime(ctx, loop?.isRunning() ? "recovery-only" : "version-mismatch", preflight);
+    saveRuntime(
+      ctx,
+      loop?.isRunning() ? "recovery-only" : "version-mismatch",
+      preflight,
+    );
     throw new Error(formatRevisionFailure(preflight));
   }
-  saveRuntime(ctx, preflight.ok ? liveRuntimeState(preflight) : "recovery-only", preflight);
-  if (!preflight.ok) ctx.ui.notify(`[board-agent] ${formatRevisionFailure(preflight)} Recovery only.`, "warning");
+  saveRuntime(
+    ctx,
+    preflight.ok ? liveRuntimeState(preflight) : "recovery-only",
+    preflight,
+  );
+  if (!preflight.ok)
+    ctx.ui.notify(
+      `[board-agent] ${formatRevisionFailure(preflight)} Recovery only.`,
+      "warning",
+    );
 
   if (loop?.isRunning()) {
     if (admitNewWork && !loop.isAdmittingNewWork()) {
       loop.enableAdmissions();
       await loop.tickNow();
       await loop.tickNow();
-      ctx.ui.notify(`[board-agent] Recovery loop promoted to autonomous mode.`, "info");
+      ctx.ui.notify(
+        `[board-agent] Recovery loop promoted to autonomous mode.`,
+        "info",
+      );
     } else {
-      ctx.ui.notify(`[board-agent] Loop already running (tick=${loopState.tickCount}, active recovery preserved).`, "info");
+      ctx.ui.notify(
+        `[board-agent] Loop already running (tick=${loopState.tickCount}, active recovery preserved).`,
+        "info",
+      );
     }
     return;
   }
@@ -138,7 +185,13 @@ async function startBoardLoop(ctx: ExtensionContext, admitNewWork = true): Promi
     validateConfig(cfg);
     const { owner, repoName } = resolveOwner(cfg, cwd);
     const botLogin = cfg.bot_identity || (await whoami());
-    const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
+    const meta = await getProjectMetadata(
+      owner,
+      cfg.project.number,
+      cfg.status_field,
+      cfg.plan_field,
+      cfg.type_field,
+    );
     validateStatusOptions(meta, configuredStatuses(cfg));
     ownerLock = acquireOwnerLock(cwd, botLogin);
 
@@ -149,25 +202,53 @@ async function startBoardLoop(ctx: ExtensionContext, admitNewWork = true): Promi
         return;
       }
       const active = inspectTicketExecutions(cwd, [], cfg).active;
-      ctx.ui.setWidget(BOARD_WIDGET_ID, [
-        `Board Agent ● ${active.length === 0 ? "idle" : `${active.length}/${cfg.max_workers} active`}`,
-        ...active.map((run) => `  ${run.taskKey} [${run.status}]`),
-      ], { placement: "belowEditor" });
+      const reviewing = loopState.reviewingTask;
+      const widgetStatus = active.length
+        ? `${active.length}/${cfg.max_workers} active${reviewing ? " + reviewing" : ""}`
+        : reviewing
+          ? "reviewing"
+          : "idle";
+      ctx.ui.setWidget(
+        BOARD_WIDGET_ID,
+        [
+          `Board Agent ● ${widgetStatus}`,
+          ...active.map((run) => `  ${run.taskKey} [${run.status}]`),
+          ...(reviewing ? [`  ${reviewing} [reviewing]`] : []),
+        ],
+        { placement: "belowEditor" },
+      );
     };
 
-    const callback = (msg: string, level: "info" | "warn" | "error" = "info") => {
-      ctx.ui.notify(`[board-agent] ${statusPrefix(level)} ${msg}`, level === "warn" ? "warning" : level);
+    const callback = (
+      msg: string,
+      level: "info" | "warn" | "error" = "info",
+    ) => {
+      ctx.ui.notify(
+        `[board-agent] ${statusPrefix(level)} ${msg}`,
+        level === "warn" ? "warning" : level,
+      );
       updateWidget();
     };
     const revisionCheck = () => {
       const check = currentRevision(cwd);
-      saveRuntime(ctx, check.ok && loop?.isAdmittingNewWork() ? "running" : "recovery-only", check);
-      return { ok: check.ok, reason: check.ok ? undefined : formatRevisionFailure(check) };
+      saveRuntime(
+        ctx,
+        check.ok && loop?.isAdmittingNewWork() ? "running" : "recovery-only",
+        check,
+      );
+      return {
+        ok: check.ok,
+        reason: check.ok ? undefined : formatRevisionFailure(check),
+      };
     };
     const onTick = () => {
       updateWidget();
       const check = currentRevision(cwd);
-      saveRuntime(ctx, check.ok && loop?.isAdmittingNewWork() ? "running" : "recovery-only", check);
+      saveRuntime(
+        ctx,
+        check.ok && loop?.isAdmittingNewWork() ? "running" : "recovery-only",
+        check,
+      );
     };
 
     const executor = createProductionTicketExecutor({
@@ -177,15 +258,37 @@ async function startBoardLoop(ctx: ExtensionContext, admitNewWork = true): Promi
       botLogin,
       callback,
       modelRegistry: ctx.modelRegistry,
-      mainModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+      mainModel: ctx.model
+        ? `${ctx.model.provider}/${ctx.model.id}`
+        : undefined,
       sessionId: ctx.sessionManager.getSessionId(),
     });
-    const deps: LoopDeps = { cwd, cfg, repoOwner: owner, repoName, botLogin, meta, callback, revisionCheck, onTick };
+    const deps: LoopDeps = {
+      cwd,
+      cfg,
+      repoOwner: owner,
+      repoName,
+      botLogin,
+      meta,
+      callback,
+      revisionCheck,
+      onTick,
+    };
     loopState = createLoopState();
-    const nextLoop = new BoardLoop(deps, loopState, executor, new TicketWorktrees(cwd), ownerLock, admitNewWork);
+    const nextLoop = new BoardLoop(
+      deps,
+      loopState,
+      executor,
+      new TicketWorktrees(cwd),
+      ownerLock,
+      admitNewWork,
+    );
     loop = nextLoop;
     await nextLoop.start();
-    saveRuntime(ctx, nextLoop.isAdmittingNewWork() ? "running" : "recovery-only");
+    saveRuntime(
+      ctx,
+      nextLoop.isAdmittingNewWork() ? "running" : "recovery-only",
+    );
     ctx.ui.notify(
       `[board-agent] ${admitNewWork ? "Loop" : "Recovery loop"} started. Ticking every ${cfg.tick_seconds}s. Project: ${owner}/#${cfg.project.number}.`,
       "info",
@@ -200,7 +303,10 @@ async function startBoardLoop(ctx: ExtensionContext, admitNewWork = true): Promi
 }
 
 export default function (pi: ExtensionAPI) {
-  const subcommands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+  const subcommands = new Map<
+    string,
+    Parameters<ExtensionAPI["registerCommand"]>[1]
+  >();
   let watchdogInterval: ReturnType<typeof setInterval> | undefined;
 
   // Resume durable ticket runs on every startup/reload; auto_start also admits new work.
@@ -209,7 +315,10 @@ export default function (pi: ExtensionAPI) {
     runtimeStartedAt = new Date().toISOString();
     try {
       const previous = readRuntimeStatus(ctx.cwd);
-      if (previous?.pid === process.pid && previous.loadedRevision !== loadedRuntimeIdentity.loadedRevision) {
+      if (
+        previous?.pid === process.pid &&
+        previous.loadedRevision !== loadedRuntimeIdentity.loadedRevision
+      ) {
         revisionLatch.mismatch = true;
       }
       const revision = currentRevision(ctx.cwd);
@@ -224,7 +333,10 @@ export default function (pi: ExtensionAPI) {
         throw new Error(formatRevisionFailure(revision));
       }
     } catch (error: any) {
-      ctx.ui.notify(`[board-agent] Startup/recovery failed: ${error.message}`, "error");
+      ctx.ui.notify(
+        `[board-agent] Startup/recovery failed: ${error.message}`,
+        "error",
+      );
     }
   });
   // ----------- /board-agent init -----------
@@ -241,13 +353,17 @@ export default function (pi: ExtensionAPI) {
       const { writeFileSync, mkdirSync } = await import("node:fs");
       mkdirSync(resolve(cwd, CONFIG_DIR_NAME), { recursive: true });
       writeFileSync(dest, readConfigTemplate(), "utf-8");
-      ctx.ui.notify(`Wrote: ${dest} (edit project.number + plan_field)`, "info");
+      ctx.ui.notify(
+        `Wrote: ${dest} (edit project.number + plan_field)`,
+        "info",
+      );
     },
   });
 
   // ----------- /board-agent lint -----------
   subcommands.set("lint", {
-    description: "Check preconditions: revision, config, gh auth, project exists, plan field present",
+    description:
+      "Check preconditions: revision, config, gh auth, project exists, plan field present",
     handler: async (_args, ctx) => {
       try {
         const cwd = ctx.cwd;
@@ -261,14 +377,32 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`gh user: ${login} ✓`, "info");
 
         try {
-          const meta = await getProjectMetadata(cfg.project.owner || login, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
+          const meta = await getProjectMetadata(
+            cfg.project.owner || login,
+            cfg.project.number,
+            cfg.status_field,
+            cfg.plan_field,
+            cfg.type_field,
+          );
           validateStatusOptions(meta, configuredStatuses(cfg));
-          ctx.ui.notify(`Project #${cfg.project.number}: accessible with all configured statuses ✓`, "info");
+          ctx.ui.notify(
+            `Project #${cfg.project.number}: accessible with all configured statuses ✓`,
+            "info",
+          );
         } catch {
           const { owner } = resolveOwner(cfg, cwd);
-          const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
+          const meta = await getProjectMetadata(
+            owner,
+            cfg.project.number,
+            cfg.status_field,
+            cfg.plan_field,
+            cfg.type_field,
+          );
           validateStatusOptions(meta, configuredStatuses(cfg));
-          ctx.ui.notify(`Project #${cfg.project.number} (owner ${owner}): accessible with all configured statuses ✓`, "info");
+          ctx.ui.notify(
+            `Project #${cfg.project.number} (owner ${owner}): accessible with all configured statuses ✓`,
+            "info",
+          );
         }
         ctx.ui.notify("All checks passed.", "info");
       } catch (err: any) {
@@ -279,7 +413,8 @@ export default function (pi: ExtensionAPI) {
 
   // ----------- /board-agent init-project -----------
   subcommands.set("init-project", {
-    description: "Initialize the GitHub Project with the standard board (columns, Type, Plan, Board view)",
+    description:
+      "Initialize the GitHub Project with the standard board (columns, Type, Plan, Board view)",
     handler: async (_args, ctx) => {
       try {
         const cwd = ctx.cwd;
@@ -289,7 +424,9 @@ export default function (pi: ExtensionAPI) {
         const { owner, repoName } = resolveOwner(cfg, cwd);
         const { initProject } = await import("./init-project.js");
         const res = await initProject(owner, cfg.project.number, cfg);
-        const created = res.created.length ? `creati: ${res.created.join(", ")}` : "nessuno (già presenti)";
+        const created = res.created.length
+          ? `creati: ${res.created.join(", ")}`
+          : "nessuno (già presenti)";
         ctx.ui.notify(
           `Project #${cfg.project.number} (${owner}/${repoName}) — campi ${created}; vista "${res.view}" pronta.`,
           "info",
@@ -315,7 +452,13 @@ export default function (pi: ExtensionAPI) {
         validateConfig(cfg);
         const { owner, repoName } = resolveOwner(cfg, cwd);
         const botLogin = cfg.bot_identity || (await whoami());
-        const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
+        const meta = await getProjectMetadata(
+          owner,
+          cfg.project.number,
+          cfg.status_field,
+          cfg.plan_field,
+          cfg.type_field,
+        );
         const { Watchdog } = await import("./watchdog.js");
         const wd = new Watchdog({
           cwd,
@@ -325,7 +468,10 @@ export default function (pi: ExtensionAPI) {
           botLogin,
           meta,
           callback: (msg, level = "info") => {
-            ctx.ui.notify(`[watchdog] ${statusPrefix(level)} ${msg}`, level === "warn" ? "warning" : level);
+            ctx.ui.notify(
+              `[watchdog] ${statusPrefix(level)} ${msg}`,
+              level === "warn" ? "warning" : level,
+            );
           },
         });
         const tick = async () => {
@@ -333,11 +479,17 @@ export default function (pi: ExtensionAPI) {
             requireCurrentRevision(ctx);
             await wd.tick();
           } catch (err) {
-            ctx.ui.notify(`[watchdog] ${err instanceof Error ? err.message : String(err)}`, "error");
+            ctx.ui.notify(
+              `[watchdog] ${err instanceof Error ? err.message : String(err)}`,
+              "error",
+            );
           }
         };
         await tick();
-        watchdogInterval = setInterval(tick, cfg.watchdog.interval_seconds * 1000);
+        watchdogInterval = setInterval(
+          tick,
+          cfg.watchdog.interval_seconds * 1000,
+        );
         ctx.ui.notify(
           `Watchdog loop started (every ${cfg.watchdog.interval_seconds}s). /board-agent stop-watchdog to stop.`,
           "info",
@@ -363,7 +515,8 @@ export default function (pi: ExtensionAPI) {
 
   // ----------- /board-agent context -----------
   subcommands.set("context", {
-    description: "Generate/show the repo context digest injected into builder missions",
+    description:
+      "Generate/show the repo context digest injected into builder missions",
     handler: async (_args, ctx) => {
       try {
         const cwd = ctx.cwd;
@@ -399,10 +552,21 @@ export default function (pi: ExtensionAPI) {
         const cfg = loadConfig(cwd);
         validateConfig(cfg);
         const { owner, repoName } = resolveOwner(cfg, cwd);
-        const meta = await getProjectMetadata(owner, cfg.project.number, cfg.status_field, cfg.plan_field, cfg.type_field);
+        const meta = await getProjectMetadata(
+          owner,
+          cfg.project.number,
+          cfg.status_field,
+          cfg.plan_field,
+          cfg.type_field,
+        );
         validateStatusOptions(meta, configuredStatuses(cfg));
         const { listCards } = await import("./gh.js");
-        const cards = await listCards(meta.projectId, cfg.status_field, cfg.plan_field, cfg.type_field);
+        const cards = await listCards(
+          meta.projectId,
+          cfg.status_field,
+          cfg.plan_field,
+          cfg.type_field,
+        );
         const { summarizePlans } = await import("./plan.js");
         const plans = summarizePlans(cfg, cards);
         const execution = inspectTicketExecutions(cwd, cards, cfg);
@@ -419,7 +583,9 @@ export default function (pi: ExtensionAPI) {
           `  expected=${revision.expectedRevision ?? "missing"}`,
           `  loaded=${revision.loadedRevision ?? "unknown"}`,
           `  disk=${revision.diskRevision ?? "unknown"} dirty=${revision.dirty ? "yes" : "no"}`,
-          `  columns: ${Object.entries(colCounts).map(([k,v])=>`${k}(${v})`).join("  ")}`,
+          `  columns: ${Object.entries(colCounts)
+            .map(([k, v]) => `${k}(${v})`)
+            .join("  ")}`,
           `  plans: ${plans.size}`,
           ...Array.from(plans.values()).flatMap((s) => [
             `    ${s.rawName}: ${s.doneCards}/${s.totalCards} done  ready=${s.readyCards} building=${s.buildingCards} review=${s.reviewCards}`,
@@ -427,10 +593,15 @@ export default function (pi: ExtensionAPI) {
         ];
         lines.push(
           `  execution: active=${execution.active.length} legacy=${execution.legacy} orphan=${execution.orphans} needs-human=${execution.needsHuman}`,
-          ...execution.active.map((run) => `    ${run.taskKey}: ${run.runId} [${run.status}] ${run.worktree}`),
+          ...execution.active.map(
+            (run) =>
+              `    ${run.taskKey}: ${run.runId} [${run.status}] ${run.worktree}`,
+          ),
         );
         if (loopState.running) {
-          lines.push(`Loop: RUNNING (${loop?.isAdmittingNewWork() ? "autonomous" : "recovery-only"})  tick=${loopState.tickCount}  launches=${loopState.wavesLaunched}  prs=${loopState.prsOpened}`);
+          lines.push(
+            `Loop: RUNNING (${loop?.isAdmittingNewWork() ? "autonomous" : "recovery-only"})  tick=${loopState.tickCount}  launches=${loopState.wavesLaunched}  prs=${loopState.prsOpened}`,
+          );
         } else {
           lines.push("Loop: STOPPED");
         }
@@ -444,7 +615,8 @@ export default function (pi: ExtensionAPI) {
 
   // ----------- /board-agent run -----------
   subcommands.set("run", {
-    description: "Start the autonomous loop (picks Ready cards from the GitHub Project)",
+    description:
+      "Start the autonomous loop (picks Ready cards from the GitHub Project)",
     handler: async (_args, ctx) => {
       try {
         await startBoardLoop(ctx);
@@ -471,7 +643,10 @@ export default function (pi: ExtensionAPI) {
         await current.stop();
         ctx.ui.notify("Loop stopped.", "info");
       } catch (error: any) {
-        ctx.ui.notify(`Loop stopped with recovery warning: ${error.message}`, "warning");
+        ctx.ui.notify(
+          `Loop stopped with recovery warning: ${error.message}`,
+          "warning",
+        );
       } finally {
         saveRuntime(ctx, "stopped", currentRevision(ctx.cwd));
       }
@@ -484,7 +659,10 @@ export default function (pi: ExtensionAPI) {
       const [name = "", ...rest] = args.trim().split(/\s+/);
       const command = subcommands.get(name);
       if (!command) {
-        ctx.ui.notify(`Usage: /board-agent <${Array.from(subcommands.keys()).join("|")}>`, "warning");
+        ctx.ui.notify(
+          `Usage: /board-agent <${Array.from(subcommands.keys()).join("|")}>`,
+          "warning",
+        );
         return;
       }
       await command.handler(rest.join(" "), ctx);
@@ -501,12 +679,18 @@ export default function (pi: ExtensionAPI) {
     try {
       if (current) await current.stop();
     } catch (error: any) {
-      ctx.ui.notify(`[board-agent] Shutdown recovery failed: ${error.message}`, "error");
+      ctx.ui.notify(
+        `[board-agent] Shutdown recovery failed: ${error.message}`,
+        "error",
+      );
     } finally {
       try {
         saveRuntime(ctx, "stopped", currentRevision(ctx.cwd));
       } catch (error: any) {
-        ctx.ui.notify(`[board-agent] Runtime status update failed: ${error.message}`, "error");
+        ctx.ui.notify(
+          `[board-agent] Runtime status update failed: ${error.message}`,
+          "error",
+        );
       }
     }
   });
