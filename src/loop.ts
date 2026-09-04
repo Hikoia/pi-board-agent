@@ -75,6 +75,16 @@ export function createLoopState(): LoopState {
   };
 }
 
+export function allocateWorkerSlots(
+  maxWorkers: number,
+  activeBuilders: number,
+  reviewPending: boolean,
+): { builderSlots: number; reviewSlots: number } {
+  const available = Math.max(0, maxWorkers - activeBuilders);
+  const reviewSlots = reviewPending && available > 0 ? 1 : 0;
+  return { builderSlots: available - reviewSlots, reviewSlots };
+}
+
 const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 
 function trustedMaintainerComments(comments: IssueComment[]): IssueComment[] {
@@ -390,7 +400,6 @@ export class BoardLoop {
         }
       }
 
-      if (cfg.review.enabled) await this.processReviewCards(cards);
       const finalizationFailures = await this.processClosedDoneCards(cards);
 
       const plans = summarizePlans(cfg, cards);
@@ -433,23 +442,52 @@ export class BoardLoop {
       }
 
       if (!this.admitNewWork) return;
-      let slots = Math.max(0, cfg.max_workers - this.executor.activeCount());
-      if (slots <= 0) return;
-      const ready = cards.filter(
+      const reviewCandidates = cards.filter(
+        (card) =>
+          (card.status ?? "").toLowerCase() ===
+            cfg.columns.review.toLowerCase() &&
+          card.plan &&
+          (card.type ?? "").toLowerCase() !== "story",
+      );
+      const readyCandidates = cards.filter(
         (card) =>
           (card.type ?? "").toLowerCase() !== "story" &&
           (card.status ?? "").toLowerCase() ===
             cfg.columns.ready.toLowerCase() &&
-          !!card.plan &&
+          Boolean(card.plan) &&
           (!cfg.safety.skip_closed_issues || !card.closed),
       );
+      const attemptedItemIds = new Set<string>();
+      const launchReady = async (limit: number): Promise<void> => {
+        let launched = 0;
+        for (const card of readyCandidates) {
+          if (!this.admitNewWork || launched >= limit) break;
+          if (attemptedItemIds.has(card.itemId)) continue;
+          attemptedItemIds.add(card.itemId);
+          if (!card.plan) continue;
+          const result = await this.executor.launch(card, planSlug(card.plan));
+          if (result.status !== "launched") continue;
+          launched++;
+          this.state.wavesLaunched++;
+        }
+      };
 
-      for (const card of ready) {
-        if (!this.admitNewWork || slots <= 0) break;
-        const result = await this.executor.launch(card, planSlug(card.plan!));
-        if (result.status !== "launched") continue;
-        slots--;
-        this.state.wavesLaunched++;
+      const initialSlots = allocateWorkerSlots(
+        cfg.max_workers,
+        this.executor.activeCount(),
+        cfg.review.enabled && reviewCandidates.length > 0,
+      );
+      await launchReady(initialSlots.builderSlots);
+
+      if (initialSlots.reviewSlots > 0 && this.admitNewWork) {
+        await this.processReviewCards(reviewCandidates);
+        if (!this.admitNewWork) return;
+        const refillSlots = allocateWorkerSlots(
+          cfg.max_workers,
+          this.executor.activeCount(),
+          false,
+        );
+        await launchReady(refillSlots.builderSlots);
       }
     } finally {
       this.state.tickCount++;
@@ -787,17 +825,8 @@ export class BoardLoop {
     ).length;
   }
 
-  private async processReviewCards(cards: Card[]): Promise<void> {
+  private async processReviewCards(reviewCards: Card[]): Promise<void> {
     const { cfg, meta, callback } = this.deps;
-    const reviewCards = cards
-      .filter(
-        (card) =>
-          (card.status ?? "").toLowerCase() ===
-            cfg.columns.review.toLowerCase() &&
-          card.plan &&
-          (card.type ?? "").toLowerCase() !== "story",
-      )
-      .slice(0, cfg.max_workers);
 
     for (const card of reviewCards) {
       const rawPlan = card.plan;
@@ -831,7 +860,7 @@ export class BoardLoop {
           callback(
             `AI review passed for "${card.title}" → ${cfg.columns.done}. Validate ${worktree?.path ?? task.taskBranch}, then close issue #${card.number} to merge.`,
           );
-          continue;
+          return;
         }
 
         if (!card.number || !card.repoOwner || !card.repoName)
@@ -857,6 +886,7 @@ export class BoardLoop {
       } finally {
         await release(card, this.deps.botLogin);
       }
+      return;
     }
   }
 

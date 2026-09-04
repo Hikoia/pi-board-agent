@@ -32,7 +32,7 @@ Board Agent is deployed from one global Pi package checkout. Project-local packa
 
    `pi list` and `HEAD` must show `RELEASE_SHA`, and status must be empty. Confirm each project still has no Board Agent entry in `.pi/settings.json`.
 7. Start exactly one Pi session in each project. `auto_start: true` starts the loop; do not start a second owner process for the same project.
-8. Allow startup reconciliation to adopt/resume clean persistent runs and quarantine legacy or uncertain state. Dirty worktrees must remain on disk and move to `Needs Human`; an item must never have two active runs.
+8. Allow startup reconciliation to adopt or resume persistent runs. A structurally valid dirty worktree remains owned by its ticket and may be handed to the next builder without a previous active run ID; quarantine unregistered, mismatched, legacy, or uncertain state. An item must never have two active runs.
 9. Verify the fleet:
 
    ```bash

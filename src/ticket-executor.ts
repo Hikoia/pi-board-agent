@@ -911,7 +911,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
         `worktree preparation failed: ${error.message}`,
       );
     }
-    const check = this.deps.worktrees.check(record, true);
+    // The persistent worktree belongs to the ticket, not to a previous run ID.
+    const check = this.deps.worktrees.check(record, false);
     if (!check.ok) {
       await this.moveToNeedsHuman(
         record,

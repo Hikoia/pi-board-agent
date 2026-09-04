@@ -14,7 +14,7 @@ Implement one ticket in the persistent worktree prepared by the orchestrator. Pu
 - The worktree remains available for human validation after this run.
 - `origin` points at the target GitHub repository.
 - The long-lived `plan/<slug>` branch already exists on `origin`.
-- A resumed mission is handed back after the executor verifies the worktree is still registered and on the expected branch. It may contain a partial dirty diff left by that same active run.
+- A new or resumed mission is handed the ticket's registered worktree on its expected branch. It may contain a partial dirty diff left by a previous interrupted builder for the same ticket; preserve and continue it.
 
 ## Minimal implementation
 

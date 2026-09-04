@@ -9,12 +9,13 @@ project:
   # GitHub user or org that owns the Project (v2).
   # Leave empty -> auto-detected from `git remote get-url origin`.
   owner: ""
-  # REQUIRED. Project number — the N in https://github.com/users/<owner>/projects/<N>
+  # REQUIRED. Project number — the N in
+  # https://github.com/users/<owner>/projects/<N>
   number: 0
 
 # ── Board columns (Status field) ────────────────────────────────────────────
-# Names must match the option labels of the project's single-select `Status` field
-# exactly (case-insensitive).
+# Names must match the option labels of the project's single-select `Status`
+# field exactly (case-insensitive).
 columns:
   ready: "Ready"
   building: "In Progress"
@@ -33,7 +34,8 @@ type_field: "Kind"
 plan_field: "Plan"
 
 # ── Concurrency ─────────────────────────────────────────────────────────────
-# Global cap across running, paused, and resuming ticket builders. Capped at 16.
+# Global cap shared by active ticket builders and the current reviewer.
+# Capped at 16.
 max_workers: 2
 
 # Polling interval (seconds) of the autonomous loop. 60-120 is recommended
@@ -42,9 +44,10 @@ tick_seconds: 90
 
 # ── Branch / PR strategy ────────────────────────────────────────────────────
 branches:
-  base: "main"                  # PR target
-  plan_prefix: "plan/"          # branch prefix for the long-lived plan branch
-  task_prefix: "task/"          # branch prefix for short-lived per-task branches
+  base: "main" # PR target
+  plan_prefix: "plan/" # branch prefix for the long-lived plan branch
+  # Branch prefix for short-lived per-task branches.
+  task_prefix: "task/"
 
 # How a manually accepted task is merged after its GitHub issue is closed:
 #   "squash" -> one commit per task on plan/<slug> (recommended, clean PR)
@@ -70,7 +73,7 @@ pr:
 builder_tier: "medium"
 
 # Optional: hard timeout per builder agent (milliseconds). Omit for no cap.
-builder_timeout_ms: 1800000  # 30 min
+builder_timeout_ms: 1800000 # 30 min
 
 # Retries for a recoverable failure (timeout, empty output, connection drop).
 builder_retries: 1
@@ -90,8 +93,8 @@ models:
 # Regenerated automatically when the git HEAD changes.
 context:
   enabled: true
-  max_chars: 20000      # ~5K tokens
-  exclude: []           # extra paths/globs to exclude from the digest
+  max_chars: 20000 # ~5K tokens
+  exclude: [] # extra paths/globs to exclude from the digest
 
 # ── Refine phase (stories → tasks) ─────────────────────────────────────────
 # Story cards (Type=Story) in Ready are refined with one cheap-model pass;
@@ -99,24 +102,25 @@ context:
 # human answers on the linked issue, otherwise sub-issue tasks are created.
 refine:
   enabled: true
-  timeout_ms: 240000    # per-refine agent timeout
-  max_tasks: 12         # safety cap on tasks created per story
+  timeout_ms: 240000 # per-refine agent timeout
+  max_tasks: 12 # safety cap on tasks created per story
 
 # ── AI review gate ──────────────────────────────────────────────────────────
 # Review cards are independently checked against their acceptance criteria.
-# PASS → Done; FAIL → a findings comment is posted and the card returns to Ready.
+# PASS → Done; FAIL → a findings comment is posted and the card returns to
+# Ready.
 review:
   enabled: false
-  timeout_ms: 600000    # per-review agent timeout (10 min)
+  timeout_ms: 600000 # per-review agent timeout (10 min)
 
 # ── Watchdog (PR CI + mentions) ───────────────────────────────────────
 # Keeps bot-managed PRs healthy: auto-fix failing CI (max rounds, cooldown),
 # then ask the human; replies to @bot mentions on its PRs.
 watchdog:
   enabled: true
-  interval_seconds: 300      # standalone /board-agent watchdog interval
-  fix_rounds_max: 5          # max auto-fix rounds per PR before needs-human
-  fix_cooldown_minutes: 5    # pause between fix attempts (CI needs time)
+  interval_seconds: 300 # standalone /board-agent watchdog interval
+  fix_rounds_max: 5 # max auto-fix rounds per PR before needs-human
+  fix_cooldown_minutes: 5 # pause between fix attempts (CI needs time)
   respond_to_mentions: true
   pr_label: "board-agent"
   needs_human_label: "needs-human"
@@ -128,8 +132,15 @@ telegram:
   enabled: true
   bot_token_env: "TELEGRAM_BOT_TOKEN"
   chat_id_env: "TELEGRAM_CHAT_ID"
-  # events: pr_opened, ci_fixed, needs_human, task_failed, refine_questions, refine_done
-  on: ["pr_opened", "ci_fixed", "needs_human", "task_failed", "refine_questions", "refine_done"]
+  # Events: pr_opened, ci_fixed, needs_human, task_failed,
+  # refine_questions, refine_done
+  "on":
+    - "pr_opened"
+    - "ci_fixed"
+    - "needs_human"
+    - "task_failed"
+    - "refine_questions"
+    - "refine_done"
 
 # ── Auto start (container) ──────────────────────────────────────────────────
 # Start the loop automatically when the pi session starts (Docker/headless).

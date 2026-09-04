@@ -203,11 +203,10 @@ async function startBoardLoop(
       }
       const active = inspectTicketExecutions(cwd, [], cfg).active;
       const reviewing = loopState.reviewingTask;
-      const widgetStatus = active.length
-        ? `${active.length}/${cfg.max_workers} active${reviewing ? " + reviewing" : ""}`
-        : reviewing
-          ? "reviewing"
-          : "idle";
+      const totalActive = active.length + (reviewing ? 1 : 0);
+      const widgetStatus = totalActive
+        ? `${totalActive}/${cfg.max_workers} active`
+        : "idle";
       ctx.ui.setWidget(
         BOARD_WIDGET_ID,
         [

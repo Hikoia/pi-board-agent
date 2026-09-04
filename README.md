@@ -60,6 +60,40 @@ pi install git:github.com/Hikoia/pi-board-agent@<FULL_40_CHARACTER_GIT_SHA>
 /board-agent stop
 ```
 
+### Quick update
+
+The package is pinned to a full commit SHA, so `pi update --extensions` only
+reconciles the existing pin; it does not advance to a newer commit.
+
+1. In Pi, pause active builders with `/board-agent stop`.
+2. From a shell, fetch the latest pushed `main` SHA and install it:
+
+   **Bash / Git Bash**
+
+   ```bash
+   LATEST_SHA=$(gh api repos/Hikoia/pi-board-agent/commits/main --jq .sha)
+   pi install "git:github.com/Hikoia/pi-board-agent@$LATEST_SHA"
+   ```
+
+   **PowerShell**
+
+   ```powershell
+   $LatestSha = gh api repos/Hikoia/pi-board-agent/commits/main --jq .sha
+   pi install "git:github.com/Hikoia/pi-board-agent@$LatestSha"
+   ```
+
+   Both commands print or store the exact 40-character SHA before changing the
+   package pin. Review that commit before restarting Pi.
+
+3. Restart Pi and run `/board-agent lint`. If `auto_start` is disabled, run
+   `/board-agent run`.
+
+From a clean clone whose release commit has already been pushed, step 2 can be:
+
+```bash
+pi install "git:github.com/Hikoia/pi-board-agent@$(git rev-parse HEAD)"
+```
+
 ## Prerequisites
 
 - [Pi](https://pi.dev/) `>=0.80.8`
@@ -94,7 +128,7 @@ columns:
 status_field: "Status"
 plan_field: "Plan"
 
-max_workers: 2     # global cap across running/paused/resuming builders
+max_workers: 2     # shared cap: active builders + current reviewer
 tick_seconds: 90   # 60-120 recommended (safe for GraphQL rate limit)
 branches:
   base: "main"
@@ -121,7 +155,7 @@ bot_identity: ""   # login for the assignee claim guard; empty = gh user
 
 | Component | Role |
 | ----------- | ------ |
-| `/board-agent run` | Starts one owner. Every tick reconciles persisted runs, then fills `max_workers - activeCount()` globally. Calling it again is a no-op unless it promotes a startup recovery-only loop. |
+| `/board-agent run` | Starts one owner. Each tick reconciles and finalizes persisted work, reserves one shared slot for a pending reviewer, starts background builders in the remainder, then refills after review. Calling it again is a no-op unless it promotes a startup recovery-only loop. |
 | `ticket-executor.ts` | Owns final card refetch, claim, worktree/run association, recovery, and idempotent outcome transitions. |
 | `ticket-worktree.ts` | Atomically stores the v2 execution record and retains the worktree through review and human validation. |
 | pi-dynamic-workflows `WorkflowManager` | Persists run status, args, journal, result, and lease; one manager/agent per ticket worktree. |
@@ -135,7 +169,7 @@ bot_identity: ""   # login for the assignee claim guard; empty = gh user
 1. **Revision guard**: new work starts only when the effective package setting is a full Git SHA matching both the loaded module and a clean checkout. Revision drift leaves the process recovery-only until restart.
 2. **Owner + claim guards**: one local owner lock, followed by an assignee mutation and a second full card refetch.
 3. **Durable managed runs**: WorkflowManager persists the run before its agent starts. The ticket record associates that run with the retained worktree.
-4. **Ownership-scoped reconciliation**: a paused run resumes when its persisted args, ticket identity/status, managed path, registration, and branch all match, preserving any partial dirty diff owned by that run. Usage-limit checkpoints stay paused; unowned dirty worktrees, dirty completed results, and missing, malformed, failed, or ambiguous state fail closed to `Needs Human` without blocking siblings.
+4. **Ticket-scoped worktree ownership**: a paused run resumes when its persisted args and ticket identity match. A fresh builder may also continue a dirty diff when the ticket record, managed path, registration, plan, and task branch match, regardless of the previous run ID. Usage-limit checkpoints stay paused; dirty completed results and unregistered, mismatched, missing, malformed, failed, or ambiguous state fail closed to `Needs Human` without blocking siblings.
 5. **Idempotent terminal mutations**: run-lineage markers prevent duplicate comments while allowing a later run's incident to be reported, and the active record remains until GitHub status/comment updates succeed.
 
 ### Branch model
@@ -166,7 +200,7 @@ cleaned, board-agent opens **one PR**: `plan/001-auth` → `main`.
 
 **Can I resume after a crash?**
 
-Yes. On startup or `/reload`, active ticket records recreate their WorkflowManagers. A matching paused run resumes from its journal and preserves its existing partial diff; a usage-limit checkpoint remains paused for the scheduler. Completed results are applied only from a clean worktree. Unowned dirty, unsafe, or ambiguous state goes to `Needs Human` and keeps the worktree for inspection.
+Yes. On startup or `/reload`, active ticket records recreate their WorkflowManagers. A matching paused run resumes from its journal, while a fresh run may continue a partial diff in a structurally valid ticket worktree even without a previous active run ID. A usage-limit checkpoint remains paused for the scheduler. Completed results are applied only from a clean worktree; unmanaged, mismatched, or ambiguous state goes to `Needs Human` and keeps the worktree for inspection.
 
 **What if a builder fails?**
 
@@ -174,7 +208,7 @@ Recoverable connection/empty-output failures use `builder_retries` inside the sa
 
 **How do I resume a `Needs Human` ticket?**
 
-Read the structured blocker comment, reply with the requested decision or manual fix, and leave the retained task worktree on its expected branch with a clean status. Then manually move the Project card to `Ready`. The fresh builder run reads trusted maintainer replies after the latest blocker comment and continues from the retained task branch.
+Read the structured blocker comment, reply with the requested decision or manual fix, and leave the retained task worktree on its expected branch. It may remain dirty. Then manually move the Project card to `Ready`; the fresh builder reads trusted maintainer replies, preserves the existing diff, and continues from the retained task branch.
 
 **What happens in `Needs Design`?**
 

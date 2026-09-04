@@ -8,7 +8,7 @@
 src/index.ts
 ├── lifecycle hooks, commands, project metadata validation
 ├── owner-lock.ts             one local repo owner (`fs.open(..., "wx")`)
-└── loop.ts                   reconcile first, then fill global worker slots
+└── loop.ts                   reconcile/finalize, then share worker slots
     ├── ticket-executor.ts    claim → worktree → managed run → recovery/outcome
     │   ├── ticket-worktree.ts  v2 ticket execution record + retained worktree
     │   ├── inflight.ts         legacy lock detection/archive only
@@ -57,14 +57,25 @@ TicketExecutor.reconcile(cards)
   ├─ quarantine dirty/missing/malformed/failed runs in Needs Human
   └─ quarantine legacy inflight and record-less In Progress cards individually
   ↓
-run story/review/watchdog/finalization lanes
+run story/watchdog/finalization lanes and plan PR checks
   ↓
-slots = max_workers - activeCount()
+build Review and Ready candidate lists
   ↓
-launch Ready task cards globally (no plan-level inflight guard)
+available = max(0, max_workers - active builders)
+  ├─ reserve one slot when Review work is pending
+  └─ give every other available slot to builders
+  ↓
+launch Ready task builders in the background
+  ↓
+await at most one claimed Review card
+  ↓
+recount active builders and immediately refill Ready slots
 ```
 
-Builders run in the background. A tick never waits for a builder to finish; later ticks read persisted run state.
+`max_workers` is shared by active builders and the current reviewer. Builders
+run in the background, so the reviewer overlaps their work. The tick awaits the
+single reviewer lane but never waits for a builder; later ticks reconcile
+persisted builder state.
 
 ## Launch ordering
 
@@ -80,7 +91,7 @@ If the process dies between steps 5 and 6, persisted args (`itemId`, `issueNumbe
 ## Recovery policy
 
 | Persisted state | Action |
-|---|---|
+| --- | --- |
 | running with a live lease | Keep In Progress |
 | paused, expected branch, clean worktree | Resume (usage-limit pauses wait for the built-in scheduler) |
 | completed with one valid success result | Comment once, move to Review, release assignee, clear active association |
@@ -96,7 +107,7 @@ Outcome comments use `<!-- board-agent-run:<runId>:<outcome> -->`, so a retry af
 
 `owner.lock` contains pid, hostname, bot identity, and a random token. A live local owner or any different-host owner fails closed; a dead same-host pid can be reclaimed.
 
-`BoardLoop.stop()` is asynchronous: it stops admissions and new ticks, waits for the current short tick, pauses managed runs and waits for their leases to settle, then releases the owner lock. `session_shutdown` awaits it. On startup or reload, an existing active/launching record (or legacy inflight file) starts a recovery-only loop even when `auto_start` is false; it reconciles existing tickets but does not admit Ready work. `/board-agent run` promotes that loop to autonomous mode.
+`BoardLoop.stop()` is asynchronous: it stops admissions and new ticks, waits for the current tick (including its reviewer), pauses managed runs and waits for their leases to settle, then releases the owner lock. `session_shutdown` awaits it. On startup or reload, an existing active/launching record (or legacy inflight file) starts a recovery-only loop even when `auto_start` is false; it reconciles existing tickets but does not admit Ready work. `/board-agent run` promotes that loop to autonomous mode.
 
 ## Branch and human gate
 

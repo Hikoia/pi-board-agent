@@ -315,14 +315,15 @@ const builderScript = runFor(card79.itemId).script;
 if (
   builderScript.includes("git status --short") &&
   builderScript.includes("git diff") &&
+  builderScript.includes("the persistent worktree for this ticket") &&
   builderScript.includes("Only pull") &&
   builderScript.includes("Never reset, stash, overwrite, or discard") &&
   builderScript.includes("clean, committed, and pushed")
 )
   console.log(
-    "PASS: resumed builder preserves and completes an owned partial diff",
+    "PASS: builder preserves and completes a ticket-owned partial diff",
   );
-else console.log("FAIL: resumed builder dirty-worktree contract");
+else console.log("FAIL: ticket-owned dirty-worktree contract");
 const startsBeforeDuplicate = [...managerStates.values()].reduce(
   (sum, state) => sum + state.starts,
   0,
@@ -468,19 +469,28 @@ if (
   );
 else console.log("FAIL: dirty usage-limit checkpoint recovery");
 
-const unknownDirty = board.add("PVTI_853", 853);
-const unknownDirtyTask = buildTasksForWave(cfg, "demo", [unknownDirty])[0];
-const unknownDirtyRecord = worktrees.ensure(unknownDirtyTask, "demo");
-writeFileSync(join(unknownDirtyRecord.path, "unknown.txt"), "unowned\n");
-const unknownDirtyLaunch = await executor.launch(unknownDirty, "demo");
+const ticketOwnedDirty = board.add("PVTI_853", 853);
+const ticketOwnedDirtyTask = buildTasksForWave(cfg, "demo", [
+  ticketOwnedDirty,
+])[0];
+const ticketOwnedDirtyRecord = worktrees.ensure(ticketOwnedDirtyTask, "demo");
+writeFileSync(
+  join(ticketOwnedDirtyRecord.path, "checkpoint.txt"),
+  "ticket-owned\n",
+);
+const ticketOwnedDirtyLaunch = await executor.launch(ticketOwnedDirty, "demo");
 if (
-  unknownDirtyLaunch.status === "needs-human" &&
-  board.cards.get(unknownDirty.itemId)?.status === cfg.columns.needs_human &&
-  !recordFor(unknownDirty.itemId).activeRunId &&
-  existsSync(join(unknownDirtyRecord.path, "unknown.txt"))
+  ticketOwnedDirtyLaunch.status === "launched" &&
+  ticketOwnedDirtyLaunch.worktree === ticketOwnedDirtyRecord.path &&
+  board.cards.get(ticketOwnedDirty.itemId)?.status === cfg.columns.building &&
+  recordFor(ticketOwnedDirty.itemId).activeRunId &&
+  existsSync(join(ticketOwnedDirtyRecord.path, "checkpoint.txt")) &&
+  !board.comments.get(ticketOwnedDirty.itemId)?.length
 )
-  console.log("PASS: dirty worktree without an active run still fails closed");
-else console.log("FAIL: unknown dirty worktree launch gate");
+  console.log(
+    "PASS: ticket-owned dirty worktree launches without a prior run id",
+  );
+else console.log("FAIL: ticket-owned dirty worktree launch");
 
 const completedDirty = board.add("PVTI_854", 854);
 await executor.launch(completedDirty, "demo");

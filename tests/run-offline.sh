@@ -14,35 +14,35 @@ PASS=0
 FAIL=0
 
 pass_line() {
-    echo "  PASS  ${1#PASS: }"
-    PASS=$((PASS + 1))
+  echo "  PASS  ${1#PASS: }"
+  PASS=$((PASS + 1))
 }
 fail_line() {
-    echo "  FAIL  ${1#FAIL: }"
-    FAIL=$((FAIL + 1))
+  echo "  FAIL  ${1#FAIL: }"
+  FAIL=$((FAIL + 1))
 }
 
 run_ts() {
-    local file="$1"
-    local out
-    out="$(cd "$ROOT" && node --import tsx "$file" 2>&1)" || {
-        echo "        [node error]"
-        fail_line "node crashed"
-        echo "$out"
-        return
-    }
-    while IFS= read -r line; do
-        case "$line" in
-        PASS:*) pass_line "$line" ;;
-        FAIL:*) fail_line "$line" ;;
-        LOOP:* | "") ;;
-        *)
-            if [[ -n "$line" ]]; then
-                echo "        $line"
-            fi
-            ;;
-        esac
-    done <<<"$out"
+  local file="$1"
+  local out
+  out="$(cd "$ROOT" && node --import tsx "$file" 2>&1)" || {
+    echo "        [node error]"
+    fail_line "node crashed"
+    echo "$out"
+    return
+  }
+  while IFS= read -r line; do
+    case "$line" in
+    PASS:*) pass_line "$line" ;;
+    FAIL:*) fail_line "$line" ;;
+    LOOP:* | "") ;;
+    *)
+      if [[ -n "$line" ]]; then
+        echo "        $line"
+      fi
+      ;;
+    esac
+  done <<<"$out"
 }
 
 echo "== pi-board-agent: offline tests =="
@@ -212,7 +212,7 @@ echo
 echo "--- loop tick (dry-run) ---"
 
 cat >"$GEN_DIR/test-loop.ts" <<'ENDTS'
-import { createLoopState, BoardLoop, type LoopDeps } from "../../src/loop.js";
+import { allocateWorkerSlots, createLoopState, BoardLoop, type LoopDeps } from "../../src/loop.js";
 import type { TicketExecutor } from "../../src/ticket-executor.js";
 import { loadConfig } from "../../src/config.js";
 import { writeFileSync, mkdirSync } from "node:fs";
@@ -224,6 +224,18 @@ const dotpi = resolve(cwd, ".pi");
 mkdirSync(dotpi, { recursive: true });
 writeFileSync(resolve(dotpi, "board-agent.yml"), `project:\n  owner: "test"\n  number: 1\nmax_workers: 1\ntick_seconds: 9999\nrefine:\n  enabled: false\nwatchdog:\n  enabled: false\nreview:\n  enabled: false\n`);
 const cfg = loadConfig(cwd);
+const slotMatrix = [
+  [2, 0, true, 1, 1],
+  [2, 1, true, 0, 1],
+  [2, 2, true, 0, 0],
+  [2, 0, false, 2, 0],
+  [2, 3, true, 0, 0],
+] as const;
+if (slotMatrix.every(([max, active, review, builders, reviewers]) => {
+  const slots = allocateWorkerSlots(max, active, review);
+  return slots.builderSlots === builders && slots.reviewSlots === reviewers;
+})) console.log("PASS: builder and reviewer share the worker slot matrix");
+else console.log("FAIL: shared worker slot allocation matrix");
 execSync("git init && git config user.email t@t && git config user.name t && git remote add origin https://github.com/test/repo.git && git checkout -b main && git commit --allow-empty -m init", { cwd, stdio: "ignore" });
 const state = createLoopState();
 let shutdowns = 0;
@@ -488,9 +500,22 @@ const passBlock = loopSource.slice(passStart, loopSource.indexOf("        const 
 if (!passBlock.includes("closeIssue(") && passBlock.includes("cfg.columns.done") && passBlock.includes("close issue #")) console.log("PASS: accepted review moves to Done and waits for manual close");
 else console.log("FAIL: accepted review does not wait for manual close");
 
+const reviewStart = loopSource.indexOf("private async processReviewCards");
+const reviewBlock = loopSource.slice(reviewStart, loopSource.indexOf("private async processClosedDoneCards", reviewStart));
+if (!reviewBlock.includes(".slice(0, cfg.max_workers)") && reviewBlock.includes("      return;\n    }")) console.log("PASS: review processing is limited to one claimed card per tick");
+else console.log("FAIL: review processing still uses a max_workers batch");
+const initialLaunch = loopSource.indexOf("await launchReady(initialSlots.builderSlots)");
+const reviewAwait = loopSource.indexOf("await this.processReviewCards(reviewCandidates)");
+if (initialLaunch >= 0 && initialLaunch < reviewAwait && !loopSource.includes("void this.processReviewCards(")) console.log("PASS: background builders start before the awaited reviewer");
+else console.log("FAIL: reviewer is detached or starts before builders");
+const refillStart = loopSource.indexOf("const refillSlots", reviewAwait);
+const refillBlock = loopSource.slice(refillStart, loopSource.indexOf("await launchReady(refillSlots.builderSlots)", refillStart));
+if (refillStart > reviewAwait && refillBlock.includes("this.executor.activeCount()")) console.log("PASS: reviewer completion recounts builders before refill");
+else console.log("FAIL: reviewer completion does not recount builders");
+
 const indexSource = readFileSync(new URL("../../src/index.ts", import.meta.url), "utf8");
-if (loopSource.includes("this.state.reviewingTask = task.taskKey") && loopSource.includes("this.state.reviewingTask = null") && indexSource.includes("${reviewing} [reviewing]")) console.log("PASS: active AI review appears in the persistent status widget");
-else console.log("FAIL: active AI review is missing from the persistent status widget");
+if (loopSource.includes("this.state.reviewingTask = task.taskKey") && loopSource.includes("this.state.reviewingTask = null") && indexSource.includes("active.length + (reviewing ? 1 : 0)") && indexSource.includes("${totalActive}/${cfg.max_workers} active") && indexSource.includes("${reviewing} [reviewing]")) console.log("PASS: active AI review counts in the persistent status widget");
+else console.log("FAIL: active AI review is missing from the persistent status widget total");
 
 const ghSource = readFileSync(new URL("../../src/gh.ts", import.meta.url), "utf8");
 if (ghSource.includes("export async function closeIssue") && ghSource.includes('"issue", "close"') && ghSource.includes('"--reason", "completed"')) console.log("PASS: closeIssue marks GitHub issue completed");
@@ -670,8 +695,8 @@ echo
 # ---- summary ----
 echo "---"
 if ((FAIL > 0)); then
-    echo "pi-board-agent: ${FAIL} FAILED, ${PASS} passed"
-    exit 1
+  echo "pi-board-agent: ${FAIL} FAILED, ${PASS} passed"
+  exit 1
 else
-    echo "pi-board-agent: ALL CHECKS PASSED (${PASS}/$((PASS + FAIL)))"
+  echo "pi-board-agent: ALL CHECKS PASSED (${PASS}/$((PASS + FAIL)))"
 fi
