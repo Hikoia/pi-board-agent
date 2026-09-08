@@ -109,14 +109,17 @@ interface TaskDesignRequest {
 function taskDesignRequest(
   comments: IssueComment[],
   issueNumber: number,
+  botLogin: string,
 ): TaskDesignRequest {
   const gatePrefix = `<!-- board-agent-requirements-gate:${issueNumber}`;
   const questionPrefix = `<!-- board-agent-task-design-questions:${issueNumber}:`;
   const completedPrefix = `<!-- board-agent-task-design:${issueNumber}:`;
+  const bot = botLogin.toLowerCase();
   let latestGate = -1;
   let latestQuestion = -1;
   let latestCompleted = -1;
   comments.forEach((comment, index) => {
+    if (comment.author?.toLowerCase() !== bot) return;
     const body = comment.body.trimStart();
     if (body.startsWith(gatePrefix) && !/^\d/.test(body.slice(gatePrefix.length))) latestGate = index;
     if (body.startsWith(questionPrefix)) latestQuestion = index;
@@ -190,6 +193,7 @@ export async function processNeedsDesignTask(
     const initialRequest = taskDesignRequest(
       await ops.listComments(card),
       card.number,
+      botLogin,
     );
     const needsGate = !initialRequest.active;
     if (!needsGate && !initialRequest.decision) return "waiting";
@@ -204,7 +208,11 @@ export async function processNeedsDesignTask(
     )
       return "skipped";
 
-    const request = taskDesignRequest(await ops.listComments(fresh), card.number);
+    const request = taskDesignRequest(
+      await ops.listComments(fresh),
+      card.number,
+      botLogin,
+    );
     if (needsGate) {
       if (request.active) return "waiting";
       await ops.comment(fresh, [
@@ -232,8 +240,21 @@ export async function processNeedsDesignTask(
 
     const latest = await ops.refresh(fresh);
     if (!isNeedsDesignTask(latest, cfg) || !ownsTaskDesignClaim(latest, botLogin)) return "skipped";
-    const latestDecision = taskDesignRequest(await ops.listComments(latest), card.number).decision;
-    if (latest.body !== fresh.body || latestDecision?.source.id !== decision.source.id) return "skipped";
+    const latestDecision = taskDesignRequest(
+      await ops.listComments(latest),
+      card.number,
+      botLogin,
+    ).decision;
+    if (
+      latest.body !== fresh.body ||
+      !latestDecision ||
+      latestDecision.source.id !== decision.source.id ||
+      latestDecision.trustedComments.length !== decision.trustedComments.length ||
+      latestDecision.trustedComments.some(
+        (comment, index) => comment !== decision.trustedComments[index],
+      )
+    )
+      return "skipped";
 
     if (design.openQuestions.length > 0) {
       await ops.comment(
@@ -256,19 +277,21 @@ export async function processNeedsDesignTask(
       return "questioned";
     }
 
-    await ops.updateBody(latest, design.body);
-    await ops.setReady(latest);
+    // This authentic marker is the durable decision-consumption boundary.
+    // GitHub writes are not transactional: later recovery requires a fresh gate.
     await ops.comment(
       latest,
       [
         decision.completedMarker,
-        "## ✅ Ticket design updated",
+        "## ✅ Ticket design decision recorded",
         "",
         design.summary,
         "",
-        `The clarified contract returned to \`${cfg.columns.ready}\` for implementation.`,
+        `This decision is consumed. The Task can enter \`${cfg.columns.ready}\` only after its issue contract is updated.`,
       ].join("\n"),
     );
+    await ops.updateBody(latest, design.body);
+    await ops.setReady(latest);
     callback(`Task "${latest.title}" designed → ${cfg.columns.ready}.`);
     return "ready";
   } catch (error) {

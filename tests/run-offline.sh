@@ -494,7 +494,7 @@ const comment = renderReviewComment(fail!);
 if (comment.includes("AI review") && comment.includes("src/a.ts") && comment.includes("Ready")) console.log("PASS: review failure comment");
 else console.log("FAIL: review failure comment");
 
-const loopSource = readFileSync(new URL("../../src/loop.ts", import.meta.url), "utf8");
+const loopSource = readFileSync(new URL("../../src/loop.ts", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const passStart = loopSource.indexOf('if (review.verdict === "pass")');
 const passBlock = loopSource.slice(passStart, loopSource.indexOf("        const commentId", passStart));
 if (!passBlock.includes("closeIssue(") && passBlock.includes("cfg.columns.done") && passBlock.includes("close issue #")) console.log("PASS: accepted review moves to Done and waits for manual close");
