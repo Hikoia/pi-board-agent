@@ -57,7 +57,9 @@ TicketExecutor.reconcile(cards)
   ├─ quarantine dirty/missing/malformed/failed runs in Needs Human
   └─ quarantine legacy inflight and record-less In Progress cards individually
   ↓
-run story/watchdog/finalization lanes and plan PR checks
+if activeCount() < max_workers: run the Needs Design Task gate/refinement lane
+  ↓
+run Story refinement, watchdog, finalization lanes, and plan PR checks
   ↓
 build Review and Ready candidate lists
   ↓
@@ -72,10 +74,21 @@ await at most one claimed Review card
 recount active builders and immediately refill Ready slots
 ```
 
-`max_workers` is shared by active builders and the current reviewer. Builders
-run in the background, so the reviewer overlaps their work. The tick awaits the
-single reviewer lane but never waits for a builder; later ticks reconcile
-persisted builder state.
+`max_workers` is shared by task design, active builders, and the current reviewer.
+Task design remains a foreground workflow and starts only when a worker slot is
+available. Builders run in the background, so the reviewer overlaps their work.
+The tick awaits the single reviewer lane but never waits for a builder; later
+ticks reconcile persisted builder state.
+
+## Task design gate
+
+An open non-Story Task entering `Needs Design` first receives one requirements-gate marker under a temporary assignee claim. Only well-formed marker comments authored by the configured bot login (matched case-insensitively) affect this state machine. The bot then waits without claiming until an `OWNER`, `MEMBER`, or `COLLABORATOR` replies after the latest authentic gate or task-design-question marker. An authentic completed marker closes that request; moving the Task back to `Needs Design` starts a new gate.
+
+After claiming and before running the designer, the loop re-reads the Project item and every issue comment. Before any post-design write, it re-reads both again and requires the issue to remain open and in `Needs Design`, the title and body to be unchanged, no competing assignee, and the complete trusted-comment input snapshot (timestamps, authors, and bodies) to remain unchanged. A status change prevents every write; a changed body or decision is left for the next tick. Open questions create a fresh request boundary.
+
+For a resolved contract, the bot writes the authentic audit marker first, updates the issue body second, and exposes `Ready` last. The marker is the durable decision-consumption boundary, not a transactional or exactly-once guarantee. A failure before that marker is visible may retry the decision. Once it is visible, the same decision is not replayed: if the card remains in or returns to `Needs Design`, the next tick opens a fresh gate so a maintainer can inspect the current body and explicitly authorize recovery. An ambiguous `Ready` response is safe because the body and marker were already written.
+
+Candidates start at `tickCount % candidates.length`, so one failing Task cannot starve its siblings. Each tick invokes at most one Task designer.
 
 ## Launch ordering
 
