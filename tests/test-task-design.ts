@@ -265,6 +265,34 @@ check(
   "task-design markers authenticate the bot login case-insensitively",
 );
 
+const malformedGate = harness({ comments: [
+  comment("malformed-gate", "<!-- board-agent-requirements-gate:79BROKEN -->", "NONE", 10, "board-bot"),
+  decision(),
+] });
+const malformedGateResult = await run(malformedGate, malformedGate.initialCard);
+check(
+  malformedGateResult === "questioned" && malformedGate.stats.designRuns === 0 &&
+  malformedGate.stats.bodyWrites === 0 && malformedGate.posted[0]?.body === expectedGate,
+  "an authenticated malformed gate marker is ignored",
+);
+
+for (const [label, marker] of [
+  ["questions", "<!-- board-agent-task-design-questions:79:"],
+  ["completion", "<!-- board-agent-task-design:79:"],
+] as const) {
+  const malformed = harness({ comments: [
+    gate(),
+    decision(),
+    comment(`malformed-${label}`, marker, "NONE", 30, "board-bot"),
+  ] });
+  const result = await run(malformed, malformed.initialCard);
+  check(
+    result === "ready" && malformed.stats.designRuns === 1 &&
+    malformed.stats.bodyWrites === 1 && malformed.stats.readyWrites === 1,
+    `an authenticated malformed ${label} marker is ignored`,
+  );
+}
+
 const questions = harness({
   comments: [gate(), decision()],
   designResult: { body: "unchanged", summary: "Need a decision", openQuestions: ["Which provider remains?", "Delete migration code?"] },
@@ -383,6 +411,7 @@ for (const [label, mutate] of [
 }
 
 const staleMutations: Array<[string, (card: Card, comments: IssueComment[]) => void]> = [
+  ["title edit", (card) => { card.title = "Maintainer changed the title while design ran."; }],
   ["body edit", (card) => { card.body = "Maintainer edited the body while design ran."; }],
   ["new trusted decision", (_card, comments) => comments.push(decision("newer-decision", "COLLABORATOR", 600))],
   ["issue closure", (card) => { card.closed = true; }],

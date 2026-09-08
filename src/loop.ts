@@ -111,9 +111,15 @@ function taskDesignRequest(
   issueNumber: number,
   botLogin: string,
 ): TaskDesignRequest {
-  const gatePrefix = `<!-- board-agent-requirements-gate:${issueNumber}`;
-  const questionPrefix = `<!-- board-agent-task-design-questions:${issueNumber}:`;
-  const completedPrefix = `<!-- board-agent-task-design:${issueNumber}:`;
+  const gateMarker = new RegExp(
+    `^<!-- board-agent-requirements-gate:${issueNumber} -->(?:\\r?\\n|$)`,
+  );
+  const questionMarker = new RegExp(
+    `^<!-- board-agent-task-design-questions:${issueNumber}:[^\\s>]+ -->(?:\\r?\\n|$)`,
+  );
+  const completedMarker = new RegExp(
+    `^<!-- board-agent-task-design:${issueNumber}:[^\\s>]+ -->(?:\\r?\\n|$)`,
+  );
   const bot = botLogin.toLowerCase();
   let latestGate = -1;
   let latestQuestion = -1;
@@ -121,9 +127,9 @@ function taskDesignRequest(
   comments.forEach((comment, index) => {
     if (comment.author?.toLowerCase() !== bot) return;
     const body = comment.body.trimStart();
-    if (body.startsWith(gatePrefix) && !/^\d/.test(body.slice(gatePrefix.length))) latestGate = index;
-    if (body.startsWith(questionPrefix)) latestQuestion = index;
-    if (body.startsWith(completedPrefix)) latestCompleted = index;
+    if (gateMarker.test(body)) latestGate = index;
+    if (questionMarker.test(body)) latestQuestion = index;
+    if (completedMarker.test(body)) latestCompleted = index;
   });
 
   const requestIndex = Math.max(latestGate, latestQuestion);
@@ -246,6 +252,7 @@ export async function processNeedsDesignTask(
       botLogin,
     ).decision;
     if (
+      latest.title !== fresh.title ||
       latest.body !== fresh.body ||
       !latestDecision ||
       latestDecision.source.id !== decision.source.id ||
