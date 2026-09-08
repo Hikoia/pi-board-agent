@@ -1,13 +1,14 @@
 # pi-board-agent
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![npm](https://img.shields.io/npm/v/@mancioshell/pi-board-agent?color=cb3837&logo=npm)](https://www.npmjs.com/package/@mancioshell/pi-board-agent)
 [![for Pi](https://img.shields.io/badge/for-Pi-7c3aed)](https://pi.dev/)
 
 > An autonomous GitHub Project (v2) board executor for [Pi](https://pi.dev/).
 > Drag a card into the `Ready` column, walk away, come back to a PR.
 
 Built on **pi-dynamic-workflows 3.10** for journaled, resumable builders in persistent per-ticket worktrees, with an owner lock, startup reconciliation, assignee-based claiming, AI review, human validation, and plan-level PR batching.
+
+> **Git-only fork:** install this repository from a pinned Git commit. This fork is not published to npm; `@mancioshell/pi-board-agent` is the upstream package.
 
 ## Watch it run
 
@@ -210,9 +211,11 @@ Recoverable connection/empty-output failures use `builder_retries` inside the sa
 
 Read the structured blocker comment, reply with the requested decision or manual fix, and leave the retained task worktree on its expected branch. It may remain dirty. Then manually move the Project card to `Ready`; the fresh builder reads trusted maintainer replies, preserves the existing diff, and continues from the retained task branch.
 
-**What happens in `Needs Design`?**
+**How do the design and review lanes differ?**
 
-Stories re-run refinement after a trusted maintainer reply. Tasks sent there by the requirements gate are claimed by the designer, which rewrites the issue contract from repository owner/member/collaborator comments and returns the card to `Ready`. If a real decision is still missing, it posts the questions and waits for another trusted reply.
+- **`Needs Design` Story:** re-runs Story refinement after a fresh repository owner, member, or collaborator reply.
+- **`Needs Design` Task:** posts a decision gate, waits for a fresh trusted reply after the latest gate or question, temporarily claims the issue, rewrites the contract, and returns it to `Ready`. Open questions create a new reply boundary.
+- **`Review` Task:** independently reviews the task branch against the accepted contract; it does not refine that contract.
 
 **What about merge conflicts?**
 

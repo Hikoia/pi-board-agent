@@ -60,8 +60,9 @@ export interface LoopDeps {
   revisionCheck?: () =>
     | { ok: boolean; reason?: string }
     | Promise<{ ok: boolean; reason?: string }>;
-  /** Offline adapter; production uses gh.ts. */
+  /** Offline adapters; production uses gh.ts and runDesign. */
   listCards?: () => Promise<Card[]>;
+  taskDesignOps?: TaskDesignOps;
 }
 
 export function createLoopState(): LoopState {
@@ -96,16 +97,19 @@ function trustedMaintainerComments(comments: IssueComment[]): IssueComment[] {
   );
 }
 
-function taskDesignDecision(
+interface TaskDesignRequest {
+  active: boolean;
+  decision?: {
+    source: IssueComment;
+    trustedComments: string[];
+    completedMarker: string;
+  };
+}
+
+function taskDesignRequest(
   comments: IssueComment[],
   issueNumber: number,
-):
-  | {
-      source: IssueComment;
-      trustedComments: string[];
-      completedMarker: string;
-    }
-  | undefined {
+): TaskDesignRequest {
   const gatePrefix = `<!-- board-agent-requirements-gate:${issueNumber}`;
   const questionPrefix = `<!-- board-agent-task-design-questions:${issueNumber}:`;
   const completedPrefix = `<!-- board-agent-task-design:${issueNumber}:`;
@@ -114,26 +118,38 @@ function taskDesignDecision(
   let latestCompleted = -1;
   comments.forEach((comment, index) => {
     const body = comment.body.trimStart();
-    if (body.startsWith(gatePrefix)) latestGate = index;
+    if (body.startsWith(gatePrefix) && !/^\d/.test(body.slice(gatePrefix.length))) latestGate = index;
     if (body.startsWith(questionPrefix)) latestQuestion = index;
     if (body.startsWith(completedPrefix)) latestCompleted = index;
   });
+
   const requestIndex = Math.max(latestGate, latestQuestion);
-  if (requestIndex < 0 || latestCompleted > requestIndex) return undefined;
-  const trusted = trustedMaintainerComments(comments);
-  const candidates =
-    latestQuestion > latestGate
-      ? trustedMaintainerComments(comments.slice(latestQuestion + 1))
-      : trusted;
-  const source = candidates.at(-1);
-  if (!source) return undefined;
+  if (requestIndex < 0 || requestIndex < latestCompleted)
+    return { active: false };
+
+  const trusted = trustedMaintainerComments(comments.slice(requestIndex + 1));
+  const source = trusted.at(-1);
   return {
-    source,
-    trustedComments: trusted.map(
-      (comment) => `${comment.createdAt} ${comment.author}: ${comment.body}`,
-    ),
-    completedMarker: `<!-- board-agent-task-design:${issueNumber}:${source.id} -->`,
+    active: true,
+    decision: source ? {
+      source,
+      trustedComments: trusted.map(
+        (comment) => `${comment.createdAt} ${comment.author}: ${comment.body}`,
+      ),
+      completedMarker: `<!-- board-agent-task-design:${issueNumber}:${source.id} -->`,
+    } : undefined,
   };
+}
+
+function isNeedsDesignTask(card: Card | undefined, cfg: Config): card is Card & { number: number; repoOwner: string; repoName: string } {
+  return !!card?.number && !!card.repoOwner && !!card.repoName && !card.closed &&
+    (card.type ?? "").toLowerCase() !== "story" &&
+    (card.status ?? "").toLowerCase() === cfg.columns.needs_design.toLowerCase();
+}
+
+function ownsTaskDesignClaim(card: Card, botLogin: string): boolean {
+  const bot = botLogin.toLowerCase();
+  return card.assignees.length === 1 && card.assignees[0].toLowerCase() === bot;
 }
 
 export interface TaskDesignOps {
@@ -154,51 +170,56 @@ export type TaskDesignResult =
   | "skipped"
   | "error";
 
-/** Claim one Needs Design task, rewrite its issue contract from trusted decisions, then return it to Ready. */
+/** Gate or refine one Needs Design task under the existing assignee mutex. */
 export async function processNeedsDesignTask(
   input: {
     card: Card;
     cfg: Config;
     cwd: string;
     contextDigest: string;
+    botLogin: string;
     callback: StatusCallback;
   },
   ops: TaskDesignOps,
 ): Promise<TaskDesignResult> {
-  const { card, cfg, cwd, contextDigest, callback } = input;
-  if (
-    !card.number ||
-    !card.repoOwner ||
-    !card.repoName ||
-    card.closed ||
-    (card.type ?? "").toLowerCase() === "story" ||
-    (card.status ?? "").toLowerCase() !== cfg.columns.needs_design.toLowerCase()
-  )
-    return "skipped";
+  const { card, cfg, cwd, contextDigest, botLogin, callback } = input;
+  if (!isNeedsDesignTask(card, cfg)) return "skipped";
 
   let claimed = false;
-  let claimedCard = card;
   try {
-    if (!taskDesignDecision(await ops.listComments(card), card.number))
-      return "waiting";
+    const initialRequest = taskDesignRequest(
+      await ops.listComments(card),
+      card.number,
+    );
+    const needsGate = !initialRequest.active;
+    if (!needsGate && !initialRequest.decision) return "waiting";
+
     claimed = await ops.claim(card);
     if (!claimed) return "skipped";
 
     const fresh = await ops.refresh(card);
     if (
-      !fresh ||
-      fresh.closed ||
-      (fresh.type ?? "").toLowerCase() === "story" ||
-      (fresh.status ?? "").toLowerCase() !==
-        cfg.columns.needs_design.toLowerCase()
+      !isNeedsDesignTask(fresh, cfg) ||
+      !ownsTaskDesignClaim(fresh, botLogin)
     )
       return "skipped";
-    claimedCard = fresh;
 
-    const comments = await ops.listComments(fresh);
-    const decision = taskDesignDecision(comments, card.number);
-    if (!decision) return "waiting";
+    const request = taskDesignRequest(await ops.listComments(fresh), card.number);
+    if (needsGate) {
+      if (request.active) return "waiting";
+      await ops.comment(fresh, [
+        `<!-- board-agent-requirements-gate:${card.number} -->`,
+        "## ❓ Design decision required",
+        "",
+        "Reply with the approved scope, constraints, and acceptance criteria.",
+        "Board Agent will wait for a repository owner, member, or collaborator.",
+      ].join("\n"));
+      callback(`Task "${fresh.title}" is waiting for a fresh maintainer design decision.`, "warn");
+      return "questioned";
+    }
 
+    const decision = request.decision;
+    if (!request.active || !decision) return "waiting";
     const design = await ops.design({
       cwd,
       title: fresh.title,
@@ -208,12 +229,17 @@ export async function processNeedsDesignTask(
       model: cfg.models.refine,
       timeoutMs: cfg.refine.timeout_ms,
     });
+
+    const latest = await ops.refresh(fresh);
+    if (!isNeedsDesignTask(latest, cfg) || !ownsTaskDesignClaim(latest, botLogin)) return "skipped";
+    const latestDecision = taskDesignRequest(await ops.listComments(latest), card.number).decision;
+    if (latest.body !== fresh.body || latestDecision?.source.id !== decision.source.id) return "skipped";
+
     if (design.openQuestions.length > 0) {
-      const marker = `<!-- board-agent-task-design-questions:${card.number}:${decision.source.id} -->`;
       await ops.comment(
-        fresh,
+        latest,
         [
-          marker,
+          `<!-- board-agent-task-design-questions:${card.number}:${decision.source.id} -->`,
           "## ❓ Needs design",
           "",
           ...design.openQuestions.map(
@@ -224,33 +250,26 @@ export async function processNeedsDesignTask(
         ].join("\n"),
       );
       callback(
-        `Task "${fresh.title}" remains in ${cfg.columns.needs_design}: ${design.openQuestions.length} open question(s).`,
+        `Task "${latest.title}" remains in ${cfg.columns.needs_design}: ${design.openQuestions.length} open question(s).`,
         "warn",
       );
       return "questioned";
     }
 
-    await ops.updateBody(fresh, design.body);
-    await ops.setReady(fresh);
-    await ops
-      .comment(
-        fresh,
-        [
-          decision.completedMarker,
-          "## ✅ Ticket design updated",
-          "",
-          design.summary,
-          "",
-          `The clarified contract returned to \`${cfg.columns.ready}\` for implementation.`,
-        ].join("\n"),
-      )
-      .catch((error) => {
-        callback(
-          `Task "${fresh.title}" is Ready, but its design audit comment failed: ${error instanceof Error ? error.message : String(error)}`,
-          "warn",
-        );
-      });
-    callback(`Task "${fresh.title}" designed → ${cfg.columns.ready}.`);
+    await ops.updateBody(latest, design.body);
+    await ops.setReady(latest);
+    await ops.comment(
+      latest,
+      [
+        decision.completedMarker,
+        "## ✅ Ticket design updated",
+        "",
+        design.summary,
+        "",
+        `The clarified contract returned to \`${cfg.columns.ready}\` for implementation.`,
+      ].join("\n"),
+    );
+    callback(`Task "${latest.title}" designed → ${cfg.columns.ready}.`);
     return "ready";
   } catch (error) {
     callback(
@@ -259,7 +278,7 @@ export async function processNeedsDesignTask(
     );
     return "error";
   } finally {
-    if (claimed) await ops.release(claimedCard);
+    if (claimed) await ops.release(card);
   }
 }
 
@@ -612,6 +631,8 @@ export class BoardLoop {
 
   private async processTaskDesignCards(cards: Card[]): Promise<void> {
     const { cfg, meta, botLogin, callback } = this.deps;
+    if (this.executor.activeCount() >= cfg.max_workers) return;
+
     const candidates = cards.filter(
       (card) =>
         (card.type ?? "").toLowerCase() !== "story" &&
@@ -621,75 +642,78 @@ export class BoardLoop {
     );
     if (candidates.length === 0) return;
 
+    const start = this.state.tickCount % candidates.length;
+    const ordered = [...candidates.slice(start), ...candidates.slice(0, start)];
     const contextDigest = await this.getContextDigest();
-    for (const card of candidates) {
+    const baseOps = this.deps.taskDesignOps ?? {
+      claim: (candidate: Card) => tryClaim(candidate, botLogin),
+      refresh: (candidate: Card) =>
+        getCard(
+          candidate.itemId,
+          cfg.status_field,
+          cfg.plan_field,
+          cfg.type_field,
+        ),
+      release: (candidate: Card) => release(candidate, botLogin),
+      listComments: (candidate: Card) => {
+        if (
+          !candidate.number ||
+          !candidate.repoOwner ||
+          !candidate.repoName
+        )
+          return Promise.resolve([]);
+        return listIssueComments(
+          candidate.repoOwner,
+          candidate.repoName,
+          candidate.number,
+        );
+      },
+      design: runDesign,
+      updateBody: async (candidate: Card, body: string) => {
+        if (!candidate.number || !candidate.repoOwner || !candidate.repoName)
+          throw new Error("Task has no linked GitHub issue.");
+        await updateIssueBody(
+          candidate.repoOwner,
+          candidate.repoName,
+          candidate.number,
+          body,
+        );
+      },
+      comment: async (candidate: Card, body: string) => {
+        if (!candidate.number || !candidate.repoOwner || !candidate.repoName)
+          throw new Error("Task has no linked GitHub issue.");
+        const id = await this.createCommentWithId(
+          candidate.number,
+          candidate.repoOwner,
+          candidate.repoName,
+          body,
+        );
+        if (!id) throw new Error("Failed to post the task design comment.");
+      },
+      setReady: (candidate: Card) =>
+        setStatus(meta, candidate.itemId, cfg.columns.ready),
+    } satisfies TaskDesignOps;
+
+    for (const card of ordered) {
+      let ranDesign = false;
       const result = await processNeedsDesignTask(
         {
           card,
           cfg,
           cwd: this.deps.cwd,
           contextDigest,
+          botLogin,
           callback,
         },
         {
-          claim: (candidate) => tryClaim(candidate, botLogin),
-          refresh: (candidate) =>
-            getCard(
-              candidate.itemId,
-              cfg.status_field,
-              cfg.plan_field,
-              cfg.type_field,
-            ),
-          release: (candidate) => release(candidate, botLogin),
-          listComments: (candidate) => {
-            if (
-              !candidate.number ||
-              !candidate.repoOwner ||
-              !candidate.repoName
-            )
-              return Promise.resolve([]);
-            return listIssueComments(
-              candidate.repoOwner,
-              candidate.repoName,
-              candidate.number,
-            );
+          ...baseOps,
+          design: async (designInput) => {
+            ranDesign = true;
+            return baseOps.design(designInput);
           },
-          design: runDesign,
-          updateBody: async (candidate, body) => {
-            if (
-              !candidate.number ||
-              !candidate.repoOwner ||
-              !candidate.repoName
-            )
-              throw new Error("Task has no linked GitHub issue.");
-            await updateIssueBody(
-              candidate.repoOwner,
-              candidate.repoName,
-              candidate.number,
-              body,
-            );
-          },
-          comment: async (candidate, body) => {
-            if (
-              !candidate.number ||
-              !candidate.repoOwner ||
-              !candidate.repoName
-            )
-              throw new Error("Task has no linked GitHub issue.");
-            const id = await this.createCommentWithId(
-              candidate.number,
-              candidate.repoOwner,
-              candidate.repoName,
-              body,
-            );
-            if (!id)
-              throw new Error("Failed to post the task design audit comment.");
-          },
-          setReady: (candidate) =>
-            setStatus(meta, candidate.itemId, cfg.columns.ready),
         },
       );
-      if (result !== "waiting" && result !== "skipped") return;
+      if (ranDesign || (result !== "waiting" && result !== "skipped")) return;
     }
   }
 

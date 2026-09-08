@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Made the Hikoia fork Git-only with npm's private-package guard and removed its release/publish workflow.
+- Hardened Needs Design Task refinement with fresh trusted-decision gates, temporary claims, post-design revalidation, worker-budget admission, and rotating candidates.
+- Issue comment reads now paginate the complete GraphQL history and fail on missing or repeated cursors.
 - Replaced process-local workflow promises and inflight locks with one durable WorkflowManager run per retained ticket worktree.
 - Added startup reconciliation, launch-window adoption, owner locking, global worker accounting, idempotent outcomes, and the `Needs Human` recovery lane.
 - Graceful stop now pauses and settles managed runs; legacy inflight files are quarantine-only.

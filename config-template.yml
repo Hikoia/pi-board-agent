@@ -96,10 +96,10 @@ context:
   max_chars: 20000 # ~5K tokens
   exclude: [] # extra paths/globs to exclude from the digest
 
-# ── Refine phase (stories → tasks) ─────────────────────────────────────────
-# Story cards (Type=Story) in Ready are refined with one cheap-model pass;
-# if open questions remain the story goes to Needs Design and waits for
-# human answers on the linked issue, otherwise sub-issue tasks are created.
+# ── Refine phase (Stories and Task contracts) ───────────────────────────────
+# `enabled` controls both Story refinement and Needs Design Task contract
+# refinement. Stories produce sub-issues; Tasks wait for a fresh trusted
+# design decision before their existing issue contract is rewritten.
 refine:
   enabled: true
   timeout_ms: 240000 # per-refine agent timeout

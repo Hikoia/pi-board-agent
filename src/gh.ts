@@ -694,30 +694,50 @@ export interface IssueComment {
   authorAssociation?: string;
 }
 
-/** List comments of an issue (ascending). */
+/** List every comment of an issue (ascending). */
 export async function listIssueComments(
   repoOwner: string,
   repoName: string,
   number: number,
 ): Promise<IssueComment[]> {
-  const query = `
-    query($owner: String!, $name: String!, $number: Int!) {
-      repository(owner: $owner, name: $name) {
-        issue(number: $number) {
-          comments(first: 50) {
-            nodes { id body createdAt authorAssociation author { login } }
+  const comments: IssueComment[] = [];
+  const seenCursors = new Set<string>();
+  let after: string | null = null;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const query = `
+      query($owner: String!, $name: String!, $number: Int!, $after: String) {
+        repository(owner: $owner, name: $name) {
+          issue(number: $number) {
+            comments(first: 100, after: $after) {
+              pageInfo { hasNextPage endCursor }
+              nodes { id body createdAt authorAssociation author { login } }
+            }
           }
         }
-      }
-    }`;
-  const data = await graphql<any>(query, { owner: repoOwner, name: repoName, number });
-  const comments: IssueComment[] = (data?.repository?.issue?.comments?.nodes ?? []).map((n: any) => ({
-    id: n.id,
-    body: n.body,
-    createdAt: n.createdAt,
-    author: n.author?.login,
-    authorAssociation: n.authorAssociation,
-  }));
+      }`;
+    const data: any = await graphql<any>(query, { owner: repoOwner, name: repoName, number, after });
+    const connection: any = data?.repository?.issue?.comments;
+    for (const node of connection?.nodes ?? []) {
+      comments.push({
+        id: node.id,
+        body: node.body,
+        createdAt: node.createdAt,
+        author: node.author?.login,
+        authorAssociation: node.authorAssociation,
+      });
+    }
+    if (!connection?.pageInfo?.hasNextPage) break;
+
+    const next: unknown = connection.pageInfo.endCursor;
+    if (typeof next !== "string" || !next || next === after || seenCursors.has(next)) {
+      throw new Error(`GitHub comment pagination for ${repoOwner}/${repoName}#${number} returned a missing or repeated cursor.`);
+    }
+    seenCursors.add(next);
+    after = next;
+  }
+
   return comments.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 

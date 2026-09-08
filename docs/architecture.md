@@ -57,7 +57,9 @@ TicketExecutor.reconcile(cards)
   ├─ quarantine dirty/missing/malformed/failed runs in Needs Human
   └─ quarantine legacy inflight and record-less In Progress cards individually
   ↓
-run story/watchdog/finalization lanes and plan PR checks
+if activeCount() < max_workers: run the Needs Design Task gate/refinement lane
+  ↓
+run Story refinement, watchdog, finalization lanes, and plan PR checks
   ↓
 build Review and Ready candidate lists
   ↓
@@ -72,10 +74,19 @@ await at most one claimed Review card
 recount active builders and immediately refill Ready slots
 ```
 
-`max_workers` is shared by active builders and the current reviewer. Builders
-run in the background, so the reviewer overlaps their work. The tick awaits the
-single reviewer lane but never waits for a builder; later ticks reconcile
-persisted builder state.
+`max_workers` is shared by task design, active builders, and the current reviewer.
+Task design remains a foreground workflow and starts only when a worker slot is
+available. Builders run in the background, so the reviewer overlaps their work.
+The tick awaits the single reviewer lane but never waits for a builder; later
+ticks reconcile persisted builder state.
+
+## Task design gate
+
+An open non-Story Task entering `Needs Design` first receives one requirements-gate marker under a temporary assignee claim. The bot then waits without claiming until an `OWNER`, `MEMBER`, or `COLLABORATOR` replies after the latest gate or task-design-question marker. A completed marker closes that request; moving the Task back to `Needs Design` starts a new gate.
+
+After claiming and before running the designer, the loop re-reads the Project item and every issue comment. Before any post-design write, it re-reads both again and requires the issue to remain open and in `Needs Design`, the body to be unchanged, no competing assignee, and the same latest trusted decision source ID. A status change prevents every write; a changed body or decision is left for the next tick. Open questions create a fresh request boundary. A resolved contract updates the body, moves the Task to `Ready`, posts its audit marker, and releases the claim.
+
+Candidates start at `tickCount % candidates.length`, so one failing Task cannot starve its siblings. Each tick invokes at most one Task designer.
 
 ## Launch ordering
 
