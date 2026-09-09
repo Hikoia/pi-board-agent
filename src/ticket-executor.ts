@@ -126,6 +126,29 @@ function marker(runId: string, outcome: string): string {
   return `<!-- board-agent-run:${runId}:${outcome} -->`;
 }
 
+function completedAgentTimeoutReason(
+  run: PersistedRunState,
+): string | undefined {
+  const agents: unknown = run.agents;
+  if (!Array.isArray(agents)) return undefined;
+
+  for (const value of agents) {
+    if (!value || typeof value !== "object") continue;
+    const agent = value as Record<string, unknown>;
+    if (agent.status !== "error" || agent.errorCode !== "AGENT_TIMEOUT")
+      continue;
+
+    const timeoutMs: unknown = run.agentTimeoutMs;
+    return typeof timeoutMs === "number" &&
+      Number.isFinite(timeoutMs) &&
+      Number.isInteger(timeoutMs) &&
+      timeoutMs > 0
+      ? `Builder agent timed out after ${timeoutMs} ms.`
+      : "Builder agent timed out.";
+  }
+  return undefined;
+}
+
 function renderNeedsHumanComment(
   reason: string,
   details?: WaveOutcome,
@@ -140,7 +163,7 @@ function renderNeedsHumanComment(
     "Automation cannot safely continue until the blocker above is resolved.";
   const workaround =
     details?.workaround?.trim() ||
-    "Inspect the task branch/worktree if present, preserve useful changes, and leave the expected task branch clean.";
+    "Inspect the task branch/worktree if present, preserve useful changes, and address the reported blocker before retrying.";
   const humanAction =
     details?.humanAction?.trim() ||
     "Reply with the missing decision or describe the manual fix.";
@@ -496,6 +519,16 @@ export class ManagedTicketExecutor implements TicketExecutor {
       return;
     }
 
+    const completedOutcomes =
+      run.status === "completed" ? normalizeWaveResults(run.result) : [];
+    const completedOutcome =
+      completedOutcomes.length === 1
+        ? {
+            ...completedOutcomes[0],
+            taskKey: record.taskKey,
+            itemId: record.itemId,
+          }
+        : undefined;
     const structural = this.deps.worktrees.check(record, false);
     const planMatches = !!card.plan && planSlug(card.plan) === record.plan;
     if (
@@ -503,13 +536,20 @@ export class ManagedTicketExecutor implements TicketExecutor {
       !planMatches ||
       (record.issueNumber > 0 && card.number !== record.issueNumber)
     ) {
+      const failure =
+        completedOutcome?.status === "failure" ? completedOutcome : undefined;
+      const mismatchReason =
+        structural.reason ?? "ticket Plan or issue identity changed";
       await manager.stopAndWait(run.runId);
       await this.moveToNeedsHuman(
         record,
         card,
-        structural.reason ?? "ticket Plan or issue identity changed",
+        failure
+          ? `${failure.error ?? "builder reported failure"} Additional safety issue: ${mismatchReason}`
+          : mismatchReason,
         run.runId,
-        "mismatch",
+        failure ? "failure" : "mismatch",
+        failure,
       );
       summary.needsHuman++;
       return;
@@ -579,23 +619,13 @@ export class ManagedTicketExecutor implements TicketExecutor {
     }
 
     if (run.status === "completed") {
-      const outcomes = normalizeWaveResults(run.result);
-      const outcome =
-        outcomes.length === 1
-          ? { ...outcomes[0], taskKey: record.taskKey, itemId: record.itemId }
-          : undefined;
-      const check = this.deps.worktrees.check(record, true);
-      if (
-        !outcome ||
-        !check.ok ||
-        (outcome.status === "success" && outcome.branch !== record.taskBranch)
-      ) {
+      const outcome = completedOutcome;
+      if (!outcome) {
         await this.moveToNeedsHuman(
           record,
           card,
-          !check.ok
-            ? (check.reason ?? "completed worktree is unsafe")
-            : "persisted builder result is malformed",
+          completedAgentTimeoutReason(run) ??
+            "persisted builder result is malformed",
           run.runId,
           "malformed",
         );
@@ -610,6 +640,20 @@ export class ManagedTicketExecutor implements TicketExecutor {
           run.runId,
           "failure",
           outcome,
+        );
+        summary.needsHuman++;
+        return;
+      }
+      const check = this.deps.worktrees.check(record, true);
+      if (!check.ok || outcome.branch !== record.taskBranch) {
+        await this.moveToNeedsHuman(
+          record,
+          card,
+          check.ok
+            ? "persisted builder result is malformed"
+            : (check.reason ?? "completed worktree is unsafe"),
+          run.runId,
+          "malformed",
         );
         summary.needsHuman++;
         return;

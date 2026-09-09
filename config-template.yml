@@ -70,7 +70,7 @@ pr:
 builder_tier: "medium"
 
 # Optional: hard timeout per builder agent (milliseconds). Omit for no cap.
-builder_timeout_ms: 1800000 # 30 min
+builder_timeout_ms: 21600000 # 6 hours per attempt
 
 # Retries for a recoverable failure (timeout, empty output, connection drop).
 builder_retries: 1

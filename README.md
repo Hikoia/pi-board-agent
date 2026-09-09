@@ -22,7 +22,7 @@ Built on **pi-dynamic-workflows 3.10** for journaled, resumable builders in pers
 │         │ T007  │          │        │        │                │
 ├──────────────────────────────────────────────┼────────────────┤
 │  T001 → build task/T001 → Review → Done → human closes issue │
-│       → merge directly into main → clean ticket worktree      │
+│       → merge into main → delete worktree + local/remote branch│
 │  T002/T003 follow the same human-gated lifecycle              │
 │                                                              │
 │  Each closed Done task is integrated immediately              │
@@ -34,7 +34,8 @@ Built on **pi-dynamic-workflows 3.10** for journaled, resumable builders in pers
 Review PASS moves a card to `Done` without merging or closing its issue. The
 persistent ticket worktree stays available for manual validation. When the
 human closes the issue, board-agent merges its task branch directly into
-`main` (or `branches.base`) and removes the worktree.
+`main` (or `branches.base`), then removes the worktree and deletes the task
+branch locally and from `origin`.
 
 ## Quickstart
 
@@ -141,7 +142,7 @@ pr:                               # retained for config compatibility; unused
   labels: ["board-agent"]
 
 builder_tier: "medium"          # pi-dynamic-workflows tier
-builder_timeout_ms: 1800000     # 30 min, omit for no cap
+builder_timeout_ms: 21600000    # 6 hours per attempt, omit for no cap
 builder_retries: 1
 
 safety:
@@ -183,7 +184,8 @@ main                  ← baseline and direct merge target
 
 AI review moves each task to Done but leaves it unmerged. Closing the linked
 issue is the human approval signal; board-agent then merges that task directly
-into `branches.base` and removes its worktree.
+into `branches.base`, removes its worktree, and deletes its local and remote
+branch.
 
 ## Commands
 

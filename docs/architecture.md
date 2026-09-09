@@ -136,8 +136,9 @@ main
 ```
 
 Closing a Done issue is the approval signal to merge its task branch directly
-into `branches.base` and remove its worktree. A refined Story reaches Done after
-every task is closed and finalized.
+into `branches.base`, remove its worktree, and delete the task branch locally
+and from `origin`. A refined Story reaches Done after every task is closed and
+finalized.
 
 ## Safety boundaries
 

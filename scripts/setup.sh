@@ -164,7 +164,7 @@ pr:
   labels: ["board-agent"]
 
 builder_tier: "medium"
-builder_timeout_ms: 1800000
+builder_timeout_ms: 21600000 # 6 hours per attempt
 builder_retries: 1
 
 safety:

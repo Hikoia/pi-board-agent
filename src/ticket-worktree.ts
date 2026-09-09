@@ -16,6 +16,7 @@ import type { BuilderTask } from "./workflow-prompt.js";
 
 interface GitResult {
   ok: boolean;
+  status: number | null;
   stdout: string;
   stderr: string;
 }
@@ -62,6 +63,7 @@ function git(args: string[], cwd: string): GitResult {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
   return {
     ok: result.status === 0,
+    status: result.status,
     stdout: result.stdout ?? "",
     stderr: result.stderr || result.error?.message || "",
   };
@@ -219,10 +221,8 @@ export class TicketWorktrees {
   }
 
   isMerged(itemId: string, targetBranch: string, taskBranch?: string): boolean {
-    git(
-      ["fetch", "origin", targetBranch, ...(taskBranch ? [taskBranch] : [])],
-      this.repoRoot,
-    );
+    git(["fetch", "origin", targetBranch], this.repoRoot);
+    if (taskBranch) git(["fetch", "origin", taskBranch], this.repoRoot);
     const remoteTarget = `origin/${targetBranch}`;
     const marked =
       git(
@@ -526,10 +526,38 @@ export class TicketWorktrees {
     }
 
     mustGit(["push", "origin", `HEAD:${targetBranch}`], record.path);
-    this.remove(record);
+    this.removeMerged(record, targetBranch);
+  }
+
+  /** Remove a finalized worktree and delete its local and remote task branch. */
+  removeMerged(record: TicketWorktreeRecord, targetBranch: string): void {
+    if (record.taskBranch === targetBranch)
+      throw new Error(`Refusing to delete target branch: ${targetBranch}`);
+
+    this.removePath(record);
+    if (branchExists(record.taskBranch, this.repoRoot))
+      mustGit(["branch", "-D", record.taskBranch], this.repoRoot);
+
+    const remote = git(
+      ["ls-remote", "--exit-code", "--heads", "origin", record.taskBranch],
+      this.repoRoot,
+    );
+    if (remote.ok)
+      mustGit(["push", "origin", "--delete", record.taskBranch], this.repoRoot);
+    else if (remote.status !== 2)
+      throw new Error(
+        `git ls-remote origin ${record.taskBranch} failed: ${remote.stderr.trim()}`,
+      );
+
+    this.clear(record.itemId);
   }
 
   remove(record: TicketWorktreeRecord): void {
+    this.removePath(record);
+    this.clear(record.itemId);
+  }
+
+  private removePath(record: TicketWorktreeRecord): void {
     const result = git(
       ["worktree", "remove", "--force", "--force", record.path],
       this.repoRoot,
@@ -550,6 +578,5 @@ export class TicketWorktrees {
     if (existsSync(record.path))
       throw new Error(`Ticket worktree still exists: ${record.path}`);
     git(["worktree", "prune"], this.repoRoot);
-    this.clear(record.itemId);
   }
 }

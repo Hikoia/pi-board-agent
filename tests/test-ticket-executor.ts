@@ -1,4 +1,7 @@
-import type { PersistedRunState } from "@quintinshaw/pi-dynamic-workflows";
+import {
+  WorkflowErrorCode,
+  type PersistedRunState,
+} from "@quintinshaw/pi-dynamic-workflows";
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
@@ -53,6 +56,8 @@ const cfg: Config = {
   ..._DEFAULTS,
   project: { owner: "test", number: 1 },
   max_workers: 2,
+  builder_timeout_ms: 21600000,
+  builder_retries: 1,
   context: { ..._DEFAULTS.context, enabled: false },
   refine: { ..._DEFAULTS.refine, enabled: false },
   review: { ..._DEFAULTS.review, enabled: false },
@@ -135,6 +140,12 @@ interface ManagerState {
   resumes: number;
   pauses: number;
   stops: number;
+  lastStartOptions?: {
+    maxAgents: number;
+    concurrency: number;
+    agentRetries: number;
+    agentTimeoutMs?: number;
+  };
 }
 
 const managerStates = new Map<string, ManagerState>();
@@ -176,12 +187,19 @@ class FakeManager implements TicketWorkflowManager {
   start(
     script: string,
     args: { itemId: string; issueNumber: number; taskKey: string },
+    options: {
+      maxAgents: number;
+      concurrency: number;
+      agentRetries: number;
+      agentTimeoutMs?: number;
+    },
   ): string {
     const runId = `run-${++runSequence}`;
     const run = makeRun(runId, args);
     run.script = script;
     this.state.runs.set(runId, run);
     this.state.starts++;
+    this.state.lastStartOptions = options;
     return runId;
   }
   list(): PersistedRunState[] {
@@ -312,6 +330,20 @@ if (launched79.status === "launched")
   console.log("PASS: same-plan Ready ticket launches despite legacy sibling");
 else console.log("FAIL: legacy sibling blocked Ready ticket");
 const builderScript = runFor(card79.itemId).script;
+const builderStartOptions = stateFor(
+  recordFor(card79.itemId).path,
+).lastStartOptions;
+if (
+  builderStartOptions?.agentTimeoutMs === 21600000 &&
+  builderStartOptions.agentRetries === 1 &&
+  builderScript.includes('"builder_timeout_ms":21600000') &&
+  builderScript.includes('"builder_retries":1') &&
+  builderScript.includes("timeoutMs: PAYLOAD.cfg.builder_timeout_ms")
+)
+  console.log(
+    "PASS: six-hour timeout and one retry reach executor and generated agent",
+  );
+else console.log("FAIL: builder timeout launch propagation");
 if (
   builderScript.includes("git status --short") &&
   builderScript.includes("git diff") &&
@@ -503,16 +535,143 @@ complete(completedDirty.itemId, [
     summary: "done",
   },
 ]);
-const completedDirtyPath = recordFor(completedDirty.itemId).path;
+const completedDirtyRecord = recordFor(completedDirty.itemId);
+const completedDirtyPath = completedDirtyRecord.path;
 writeFileSync(join(completedDirtyPath, "completed-dirty.txt"), "unsafe\n");
 await executor.reconcile(board.all());
+const completedDirtyComment = (
+  board.comments.get(completedDirty.itemId) ?? []
+).join("\n");
 if (
   board.cards.get(completedDirty.itemId)?.status === cfg.columns.needs_human &&
   !recordFor(completedDirty.itemId).activeRunId &&
+  completedDirtyComment.includes(
+    `board-agent-run:${completedDirtyRecord.activeRunId}:malformed`,
+  ) &&
+  completedDirtyComment.includes("dirty worktree") &&
   existsSync(join(completedDirtyPath, "completed-dirty.txt"))
 )
   console.log("PASS: dirty completed-success worktree still fails closed");
 else console.log("FAIL: dirty completed-success worktree gate");
+
+const timedOut = board.add("PVTI_38", 38);
+await executor.launch(timedOut, "demo");
+const timedOutRun = runFor(timedOut.itemId);
+const timedOutRunId = timedOutRun.runId;
+timedOutRun.status = "completed";
+timedOutRun.result = [null];
+timedOutRun.agentTimeoutMs = 7200000;
+timedOutRun.agents = [
+  {
+    id: 1,
+    label: "build T038",
+    prompt: "builder prompt",
+    status: "error",
+    errorCode: WorkflowErrorCode.AGENT_TIMEOUT,
+    error: "RAW provider timeout details must stay private",
+  },
+];
+const timedOutPath = recordFor(timedOut.itemId).path;
+writeFileSync(join(timedOutPath, "README.md"), "base\npartial timeout work\n");
+writeFileSync(join(timedOutPath, "timeout-untracked.txt"), "keep me\n");
+const timedOutSummary = await executor.reconcile(board.all());
+const timedOutComment = (board.comments.get(timedOut.itemId) ?? []).join("\n");
+const timedOutCommentCount = board.comments.get(timedOut.itemId)?.length ?? 0;
+await executor.reconcile(board.all());
+const timedOutRecord = recordFor(timedOut.itemId);
+if (
+  timedOutSummary.needsHuman === 1 &&
+  board.cards.get(timedOut.itemId)?.status === cfg.columns.needs_human &&
+  !timedOutRecord.activeRunId &&
+  timedOutRecord.lastRunId === timedOutRunId &&
+  timedOutComment.includes(`board-agent-run:${timedOutRunId}:malformed`) &&
+  timedOutComment.includes("Builder agent timed out after 7200000 ms.") &&
+  timedOutComment.includes("preserve useful changes") &&
+  timedOutComment.includes("address the reported blocker before retrying") &&
+  !timedOutComment.includes("RAW provider timeout details") &&
+  !timedOutComment.includes("dirty worktree") &&
+  !timedOutComment.includes("leave the expected task branch clean") &&
+  readFileSync(join(timedOutPath, "README.md"), "utf8") ===
+    "base\npartial timeout work\n" &&
+  readFileSync(join(timedOutPath, "timeout-untracked.txt"), "utf8") ===
+    "keep me\n" &&
+  (board.comments.get(timedOut.itemId)?.length ?? 0) === timedOutCommentCount
+) {
+  console.log(
+    "PASS: completed null timeout outranks dirtiness and preserves partial work",
+  );
+} else console.log("FAIL: completed null timeout reconciliation");
+
+const validTimeoutAgent = {
+  status: "error",
+  errorCode: "AGENT_TIMEOUT",
+  error: "RAW malformed metadata details",
+};
+const malformedAgentCases: Array<{
+  number: number;
+  agents: unknown;
+  timeoutMs?: unknown;
+}> = [
+  { number: 381, agents: {} },
+  { number: 382, agents: [null] },
+  { number: 383, agents: [{ ...validTimeoutAgent, status: "done" }] },
+  { number: 384, agents: [{ ...validTimeoutAgent, errorCode: "OTHER" }] },
+  { number: 385, agents: [validTimeoutAgent], timeoutMs: 0 },
+  { number: 386, agents: [validTimeoutAgent], timeoutMs: 1.5 },
+  {
+    number: 387,
+    agents: [validTimeoutAgent],
+    timeoutMs: Number.POSITIVE_INFINITY,
+  },
+];
+const malformedAgentRuns: Array<{
+  itemId: string;
+  runId: string;
+  timeout: boolean;
+}> = [];
+for (const testCase of malformedAgentCases) {
+  const card = board.add(`PVTI_${testCase.number}`, testCase.number);
+  await executor.launch(card, "demo");
+  const run = runFor(card.itemId);
+  run.status = "completed";
+  run.result = [null];
+  const metadata = run as unknown as {
+    agents: unknown;
+    agentTimeoutMs?: unknown;
+  };
+  metadata.agents = testCase.agents;
+  if ("timeoutMs" in testCase) metadata.agentTimeoutMs = testCase.timeoutMs;
+  malformedAgentRuns.push({
+    itemId: card.itemId,
+    runId: run.runId,
+    timeout: "timeoutMs" in testCase,
+  });
+}
+const malformedAgentSummary = await executor.reconcile(board.all());
+const malformedAgentGuardsPassed = malformedAgentRuns.every(
+  ({ itemId, runId, timeout }) => {
+    const comment = (board.comments.get(itemId) ?? []).join("\n");
+    const expectedProblem = timeout
+      ? "Builder agent timed out."
+      : "persisted builder result is malformed";
+    return (
+      board.cards.get(itemId)?.status === cfg.columns.needs_human &&
+      comment.includes(`board-agent-run:${runId}:malformed`) &&
+      comment.includes(`**Problem**\n${expectedProblem}\n`) &&
+      !comment.includes("RAW") &&
+      !comment.includes("timed out after")
+    );
+  },
+);
+if (
+  malformedAgentSummary.needsHuman === malformedAgentCases.length &&
+  malformedAgentSummary.errors === 0 &&
+  malformedAgentGuardsPassed
+) {
+  console.log(
+    "PASS: malformed timeout metadata falls back safely and invalid durations are omitted",
+  );
+} else console.log("FAIL: malformed timeout metadata guards");
 
 const trustedIdentity = board.add("PVTI_37", 37);
 await executor.launch(trustedIdentity, "demo");
@@ -618,6 +777,9 @@ complete(explained.itemId, [
     humanAction: "Reply with the approved target.",
   },
 ]);
+const explainedPath = recordFor(explained.itemId).path;
+writeFileSync(join(explainedPath, "README.md"), "base\nstructured partial\n");
+writeFileSync(join(explainedPath, "structured-untracked.txt"), "keep me\n");
 await executor.reconcile(board.all());
 const blockerComment = (board.comments.get(explained.itemId) ?? []).join("\n");
 if (
@@ -628,10 +790,62 @@ if (
   blockerComment.includes("Choosing a target would be unsafe.") &&
   blockerComment.includes("Select staging or production.") &&
   blockerComment.includes("Reply with the approved target.") &&
-  blockerComment.includes("manually move this Project card to `Ready`")
+  blockerComment.includes("manually move this Project card to `Ready`") &&
+  !blockerComment.includes("dirty worktree") &&
+  readFileSync(join(explainedPath, "README.md"), "utf8") ===
+    "base\nstructured partial\n" &&
+  readFileSync(join(explainedPath, "structured-untracked.txt"), "utf8") ===
+    "keep me\n"
 )
-  console.log("PASS: builder failure leaves actionable human guidance");
-else console.log("FAIL: builder failure human guidance");
+  console.log(
+    "PASS: dirty builder failure preserves work and actionable details",
+  );
+else console.log("FAIL: dirty builder failure human guidance");
+
+const wrongBranchFailure = board.add("PVTI_896", 896);
+await executor.launch(wrongBranchFailure, "demo");
+complete(wrongBranchFailure.itemId, [
+  {
+    taskKey: "T896",
+    itemId: wrongBranchFailure.itemId,
+    status: "failure",
+    error: "Build prerequisites are missing.",
+    attempted: "Checked the generated artifacts.",
+    limitations: "Continuing would produce an invalid build.",
+    workaround: "Keep the partial patch for inspection.",
+    humanAction: "Restore the expected branch and provide the prerequisite.",
+  },
+]);
+const wrongBranchFailureRecord = recordFor(wrongBranchFailure.itemId);
+git(wrongBranchFailureRecord.path, "checkout", "-b", "wrong/probe");
+writeFileSync(
+  join(wrongBranchFailureRecord.path, "wrong-branch-partial.txt"),
+  "keep me\n",
+);
+await executor.reconcile(board.all());
+const wrongBranchFailureComment = (
+  board.comments.get(wrongBranchFailure.itemId) ?? []
+).join("\n");
+if (
+  board.cards.get(wrongBranchFailure.itemId)?.status ===
+    cfg.columns.needs_human &&
+  !recordFor(wrongBranchFailure.itemId).activeRunId &&
+  [
+    "Build prerequisites are missing.",
+    "Checked the generated artifacts.",
+    "Continuing would produce an invalid build.",
+    "Keep the partial patch for inspection.",
+    "Restore the expected branch and provide the prerequisite.",
+    "expected branch task/t896, found wrong/probe",
+  ].every((text) => wrongBranchFailureComment.includes(text)) &&
+  existsSync(
+    join(wrongBranchFailureRecord.path, "wrong-branch-partial.txt"),
+  )
+)
+  console.log(
+    "PASS: wrong-branch builder failure preserves safety reason and actionable details",
+  );
+else console.log("FAIL: wrong-branch builder failure details");
 
 const manuallyMoved = board.add("PVTI_895", 895);
 await executor.launch(manuallyMoved, "demo");

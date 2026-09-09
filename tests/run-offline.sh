@@ -606,8 +606,12 @@ let visibleOnPlan = true;
 try { git(repo, "show", "origin/plan/demo:feature.txt"); } catch { visibleOnPlan = false; }
 if (!visibleOnPlan) console.log("PASS: direct finalization bypasses the plan branch");
 else console.log("FAIL: direct finalization still merged into the plan branch");
-if (!existsSync(worktree.path) && !store.has(task.itemId) && store.isMerged(task.itemId, "main", task.taskBranch)) console.log("PASS: finalized ticket worktree and state are cleaned");
-else console.log("FAIL: finalized ticket worktree or state remains");
+let localTaskExists = true;
+let remoteTaskExists = true;
+try { git(repo, "rev-parse", "--verify", "refs/heads/task/t001"); } catch { localTaskExists = false; }
+try { git(repo, "ls-remote", "--exit-code", "--heads", "origin", "task/t001"); } catch { remoteTaskExists = false; }
+if (!existsSync(worktree.path) && !store.has(task.itemId) && !localTaskExists && !remoteTaskExists && store.isMerged(task.itemId, "main", task.taskBranch)) console.log("PASS: finalized ticket worktree, state, and branches are cleaned");
+else console.log("FAIL: finalized ticket worktree, state, or branches remain");
 const cleanTask = { ...task, itemId: "PVTI_clean", taskKey: "T002", taskBranch: "task/t002", planBranch: "main" };
 const cleanWorktree = store.ensure(cleanTask, "demo");
 if (!store.hasTaskDelta(cleanWorktree)) console.log("PASS: delta checks use the updated remote base");

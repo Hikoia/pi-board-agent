@@ -950,15 +950,12 @@ export class BoardLoop {
     for (const card of closed) {
       const slug = planSlug(card.plan!);
       const task = buildTasksForWave(cfg, slug, [card])[0];
-      if (
-        this.ticketWorktrees.isMerged(
-          card.itemId,
-          cfg.branches.base,
-          task.taskBranch,
-        ) &&
-        !this.ticketWorktrees.has(card.itemId)
-      )
-        continue;
+      const alreadyMerged = this.ticketWorktrees.isMerged(
+        card.itemId,
+        cfg.branches.base,
+        task.taskBranch,
+      );
+      if (alreadyMerged && !this.ticketWorktrees.has(card.itemId)) continue;
       if (!card.number || !card.repoOwner || !card.repoName) {
         callback(
           `Cannot finalize draft card "${card.title}"; a closed GitHub issue is required.`,
@@ -972,19 +969,31 @@ export class BoardLoop {
         claimed = await tryClaim(card, this.deps.botLogin);
         if (!claimed) continue;
         ensurePlanBranch(task.planBranch, cfg.branches.base, this.deps.cwd);
-        const worktree = this.ticketWorktrees.ensure(task, slug);
+        const worktree = alreadyMerged
+          ? this.ticketWorktrees.read(card.itemId)
+          : this.ticketWorktrees.ensure(task, slug);
+        if (!worktree)
+          throw new Error(`Ticket execution record is corrupt: ${card.itemId}`);
+
+        if (alreadyMerged) {
+          callback(
+            `Issue #${card.number} is already merged. Finishing cleanup for ${task.taskBranch}…`,
+          );
+          this.ticketWorktrees.removeMerged(worktree, cfg.branches.base);
+        } else {
+          callback(
+            `Issue #${card.number} is closed. Merging ${task.taskBranch} → ${cfg.branches.base}…`,
+          );
+          this.ticketWorktrees.mergeAndRemove(
+            worktree,
+            cfg.task_merge_strategy,
+            card.number,
+            card.title,
+            cfg.branches.base,
+          );
+        }
         callback(
-          `Issue #${card.number} is closed. Merging ${task.taskBranch} → ${cfg.branches.base}…`,
-        );
-        this.ticketWorktrees.mergeAndRemove(
-          worktree,
-          cfg.task_merge_strategy,
-          card.number,
-          card.title,
-          cfg.branches.base,
-        );
-        callback(
-          `Merged "${card.title}" into ${cfg.branches.base} and removed ${worktree.path}`,
+          `Finalized "${card.title}" in ${cfg.branches.base}; removed ${worktree.path} and deleted ${task.taskBranch} locally and from origin`,
         );
       } catch (error: any) {
         callback(
