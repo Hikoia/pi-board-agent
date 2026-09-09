@@ -898,7 +898,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
       await this.deps.board.release(card);
       return {
         status: "skipped",
-        reason: `plan branch preparation failed: ${error.message}`,
+        reason: `baseline branch preparation failed: ${error.message}`,
       };
     }
 
@@ -954,7 +954,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         cfg: this.deps.cfg,
         planSlug: expectedPlan,
         baseBranch: this.deps.cfg.branches.base,
-        tasks: [task],
+        tasks: [{ ...task, planBranch: record.planBranch }],
         skillName: "board-agent",
         context,
       });

@@ -7,7 +7,6 @@ import {
   type ProjectMetadata,
   createComment,
   getCard,
-  isPrMerged,
   listCards,
   listIssueComments,
   release,
@@ -17,7 +16,6 @@ import {
 } from "./gh.js";
 import { ensurePlanBranch, isClean } from "./git-helpers.js";
 import { makeNotifier } from "./notify.js";
-import { isPlanComplete, openPlanPr, summarizePlans } from "./plan.js";
 import {
   type DesignOutput,
   type DesignRunInput,
@@ -43,7 +41,6 @@ export interface LoopState {
   running: boolean;
   tickCount: number;
   wavesLaunched: number;
-  prsOpened: number;
   lastTickMs: number;
   reviewingTask: string | null;
 }
@@ -70,7 +67,6 @@ export function createLoopState(): LoopState {
     running: false,
     tickCount: 0,
     wavesLaunched: 0,
-    prsOpened: 0,
     lastTickMs: 0,
     reviewingTask: null,
   };
@@ -140,20 +136,31 @@ function taskDesignRequest(
   const source = trusted.at(-1);
   return {
     active: true,
-    decision: source ? {
-      source,
-      trustedComments: trusted.map(
-        (comment) => `${comment.createdAt} ${comment.author}: ${comment.body}`,
-      ),
-      completedMarker: `<!-- board-agent-task-design:${issueNumber}:${source.id} -->`,
-    } : undefined,
+    decision: source
+      ? {
+          source,
+          trustedComments: trusted.map(
+            (comment) =>
+              `${comment.createdAt} ${comment.author}: ${comment.body}`,
+          ),
+          completedMarker: `<!-- board-agent-task-design:${issueNumber}:${source.id} -->`,
+        }
+      : undefined,
   };
 }
 
-function isNeedsDesignTask(card: Card | undefined, cfg: Config): card is Card & { number: number; repoOwner: string; repoName: string } {
-  return !!card?.number && !!card.repoOwner && !!card.repoName && !card.closed &&
+function isNeedsDesignTask(
+  card: Card | undefined,
+  cfg: Config,
+): card is Card & { number: number; repoOwner: string; repoName: string } {
+  return (
+    !!card?.number &&
+    !!card.repoOwner &&
+    !!card.repoName &&
+    !card.closed &&
     (card.type ?? "").toLowerCase() !== "story" &&
-    (card.status ?? "").toLowerCase() === cfg.columns.needs_design.toLowerCase();
+    (card.status ?? "").toLowerCase() === cfg.columns.needs_design.toLowerCase()
+  );
 }
 
 function ownsTaskDesignClaim(card: Card, botLogin: string): boolean {
@@ -208,10 +215,7 @@ export async function processNeedsDesignTask(
     if (!claimed) return "skipped";
 
     const fresh = await ops.refresh(card);
-    if (
-      !isNeedsDesignTask(fresh, cfg) ||
-      !ownsTaskDesignClaim(fresh, botLogin)
-    )
+    if (!isNeedsDesignTask(fresh, cfg) || !ownsTaskDesignClaim(fresh, botLogin))
       return "skipped";
 
     const request = taskDesignRequest(
@@ -221,14 +225,20 @@ export async function processNeedsDesignTask(
     );
     if (needsGate) {
       if (request.active) return "waiting";
-      await ops.comment(fresh, [
-        `<!-- board-agent-requirements-gate:${card.number} -->`,
-        "## ❓ Design decision required",
-        "",
-        "Reply with the approved scope, constraints, and acceptance criteria.",
-        "Board Agent will wait for a repository owner, member, or collaborator.",
-      ].join("\n"));
-      callback(`Task "${fresh.title}" is waiting for a fresh maintainer design decision.`, "warn");
+      await ops.comment(
+        fresh,
+        [
+          `<!-- board-agent-requirements-gate:${card.number} -->`,
+          "## ❓ Design decision required",
+          "",
+          "Reply with the approved scope, constraints, and acceptance criteria.",
+          "Board Agent will wait for a repository owner, member, or collaborator.",
+        ].join("\n"),
+      );
+      callback(
+        `Task "${fresh.title}" is waiting for a fresh maintainer design decision.`,
+        "warn",
+      );
       return "questioned";
     }
 
@@ -245,7 +255,11 @@ export async function processNeedsDesignTask(
     });
 
     const latest = await ops.refresh(fresh);
-    if (!isNeedsDesignTask(latest, cfg) || !ownsTaskDesignClaim(latest, botLogin)) return "skipped";
+    if (
+      !isNeedsDesignTask(latest, cfg) ||
+      !ownsTaskDesignClaim(latest, botLogin)
+    )
+      return "skipped";
     const latestDecision = taskDesignRequest(
       await ops.listComments(latest),
       card.number,
@@ -256,7 +270,8 @@ export async function processNeedsDesignTask(
       latest.body !== fresh.body ||
       !latestDecision ||
       latestDecision.source.id !== decision.source.id ||
-      latestDecision.trustedComments.length !== decision.trustedComments.length ||
+      latestDecision.trustedComments.length !==
+        decision.trustedComments.length ||
       latestDecision.trustedComments.some(
         (comment, index) => comment !== decision.trustedComments[index],
       )
@@ -449,46 +464,7 @@ export class BoardLoop {
         }
       }
 
-      const finalizationFailures = await this.processClosedDoneCards(cards);
-
-      const plans = summarizePlans(cfg, cards);
-      for (const [, summary] of plans) {
-        const tasksFinalized = summary.cards
-          .filter((card) => (card.type ?? "").toLowerCase() !== "story")
-          .every(
-            (card) => card.closed && !this.ticketWorktrees.has(card.itemId),
-          );
-        if (
-          !isPlanComplete(summary) ||
-          !tasksFinalized ||
-          finalizationFailures.has(summary.slug)
-        )
-          continue;
-
-        ensurePlanBranch(
-          `${cfg.branches.plan_prefix}${summary.slug}`,
-          cfg.branches.base,
-          this.deps.cwd,
-        );
-        const result = await openPlanPr({
-          cwd: this.deps.cwd,
-          cfg,
-          repoOwner,
-          repoName,
-          summary,
-        });
-        if (result.status !== "opened" && result.status !== "exists") continue;
-        this.state.prsOpened++;
-        callback(`Plan PR ${result.status}: ${result.url ?? summary.slug}`);
-        if (result.status === "opened") {
-          await makeNotifier(cfg)(
-            "pr_opened",
-            `PR aperta: ${summary.rawName}`,
-            `#${result.number} — ${result.url}`,
-            [result.url ?? ""],
-          );
-        }
-      }
+      await this.processClosedDoneCards(cards);
 
       if (!this.admitNewWork) return;
       const reviewCandidates = cards.filter(
@@ -550,10 +526,10 @@ export class BoardLoop {
    *  - Ready stories  → refine (1 cheap pass) → sub-issue tasks on the board,
    *    or Needs Design if open questions remain
    *  - Needs Design   → re-refine when the human replies on the issue thread
-   *  - In Progress    → Done when the plan PR is merged
+   *  - In Progress    → Done when every task is merged into branches.base
    */
   private async processStories(cards: Card[]): Promise<void> {
-    const { cfg, meta, repoOwner, repoName, botLogin, callback } = this.deps;
+    const { cfg, meta, botLogin, callback } = this.deps;
     const stories = cards.filter(
       (c) => (c.type ?? "").toLowerCase() === "story",
     );
@@ -612,19 +588,36 @@ export class BoardLoop {
 
     if (status === inProgress) {
       const state = refineState.get(story.number ?? 0);
-      if (
-        state?.refined &&
-        (await isPrMerged(
-          repoOwner,
-          repoName,
-          `${cfg.branches.plan_prefix}${planSlug(slug)}`,
-        ))
-      ) {
+      const sluggedPlan = planSlug(slug);
+      const planTasks = cards.filter(
+        (candidate) =>
+          (candidate.type ?? "").toLowerCase() !== "story" &&
+          Boolean(candidate.plan) &&
+          planSlug(candidate.plan!) === sluggedPlan,
+      );
+      const tasksFinalized =
+        planTasks.length > 0 &&
+        planTasks.every((candidate) => {
+          if (
+            !candidate.closed ||
+            (candidate.status ?? "").toLowerCase() !==
+              cfg.columns.done.toLowerCase() ||
+            this.ticketWorktrees.has(candidate.itemId)
+          )
+            return false;
+          const task = buildTasksForWave(cfg, sluggedPlan, [candidate])[0];
+          return this.ticketWorktrees.isMerged(
+            candidate.itemId,
+            cfg.branches.base,
+            task.taskBranch,
+          );
+        });
+      if (state?.refined && tasksFinalized) {
         await setStatus(meta, story.itemId, cfg.columns.done).catch(
           () => undefined,
         );
         callback(
-          `Story "${story.title}" → ${cfg.columns.done} (plan PR merged)`,
+          `Story "${story.title}" → ${cfg.columns.done} (all tasks merged into ${cfg.branches.base})`,
         );
       }
       return;
@@ -675,54 +668,52 @@ export class BoardLoop {
     const start = this.state.tickCount % candidates.length;
     const ordered = [...candidates.slice(start), ...candidates.slice(0, start)];
     const contextDigest = await this.getContextDigest();
-    const baseOps = this.deps.taskDesignOps ?? {
-      claim: (candidate: Card) => tryClaim(candidate, botLogin),
-      refresh: (candidate: Card) =>
-        getCard(
-          candidate.itemId,
-          cfg.status_field,
-          cfg.plan_field,
-          cfg.type_field,
-        ),
-      release: (candidate: Card) => release(candidate, botLogin),
-      listComments: (candidate: Card) => {
-        if (
-          !candidate.number ||
-          !candidate.repoOwner ||
-          !candidate.repoName
-        )
-          return Promise.resolve([]);
-        return listIssueComments(
-          candidate.repoOwner,
-          candidate.repoName,
-          candidate.number,
-        );
-      },
-      design: runDesign,
-      updateBody: async (candidate: Card, body: string) => {
-        if (!candidate.number || !candidate.repoOwner || !candidate.repoName)
-          throw new Error("Task has no linked GitHub issue.");
-        await updateIssueBody(
-          candidate.repoOwner,
-          candidate.repoName,
-          candidate.number,
-          body,
-        );
-      },
-      comment: async (candidate: Card, body: string) => {
-        if (!candidate.number || !candidate.repoOwner || !candidate.repoName)
-          throw new Error("Task has no linked GitHub issue.");
-        const id = await this.createCommentWithId(
-          candidate.number,
-          candidate.repoOwner,
-          candidate.repoName,
-          body,
-        );
-        if (!id) throw new Error("Failed to post the task design comment.");
-      },
-      setReady: (candidate: Card) =>
-        setStatus(meta, candidate.itemId, cfg.columns.ready),
-    } satisfies TaskDesignOps;
+    const baseOps =
+      this.deps.taskDesignOps ??
+      ({
+        claim: (candidate: Card) => tryClaim(candidate, botLogin),
+        refresh: (candidate: Card) =>
+          getCard(
+            candidate.itemId,
+            cfg.status_field,
+            cfg.plan_field,
+            cfg.type_field,
+          ),
+        release: (candidate: Card) => release(candidate, botLogin),
+        listComments: (candidate: Card) => {
+          if (!candidate.number || !candidate.repoOwner || !candidate.repoName)
+            return Promise.resolve([]);
+          return listIssueComments(
+            candidate.repoOwner,
+            candidate.repoName,
+            candidate.number,
+          );
+        },
+        design: runDesign,
+        updateBody: async (candidate: Card, body: string) => {
+          if (!candidate.number || !candidate.repoOwner || !candidate.repoName)
+            throw new Error("Task has no linked GitHub issue.");
+          await updateIssueBody(
+            candidate.repoOwner,
+            candidate.repoName,
+            candidate.number,
+            body,
+          );
+        },
+        comment: async (candidate: Card, body: string) => {
+          if (!candidate.number || !candidate.repoOwner || !candidate.repoName)
+            throw new Error("Task has no linked GitHub issue.");
+          const id = await this.createCommentWithId(
+            candidate.number,
+            candidate.repoOwner,
+            candidate.repoName,
+            body,
+          );
+          if (!id) throw new Error("Failed to post the task design comment.");
+        },
+        setReady: (candidate: Card) =>
+          setStatus(meta, candidate.itemId, cfg.columns.ready),
+      } satisfies TaskDesignOps);
 
     for (const card of ordered) {
       let ranDesign = false;
@@ -896,7 +887,9 @@ export class BoardLoop {
           body: card.body,
           issueNumber: card.number,
           baseBranch: cfg.branches.base,
-          planBranch: task.planBranch,
+          planBranch:
+            this.ticketWorktrees.read(card.itemId)?.planBranch ??
+            task.planBranch,
           taskBranch: task.taskBranch,
           model: cfg.models.review,
           timeoutMs: cfg.review.timeout_ms,
@@ -944,9 +937,8 @@ export class BoardLoop {
     }
   }
 
-  private async processClosedDoneCards(cards: Card[]): Promise<Set<string>> {
+  private async processClosedDoneCards(cards: Card[]): Promise<void> {
     const { cfg, callback } = this.deps;
-    const failedPlans = new Set<string>();
     const closed = cards.filter(
       (card) =>
         card.closed &&
@@ -961,14 +953,13 @@ export class BoardLoop {
       if (
         this.ticketWorktrees.isMerged(
           card.itemId,
-          task.planBranch,
+          cfg.branches.base,
           task.taskBranch,
         ) &&
         !this.ticketWorktrees.has(card.itemId)
       )
         continue;
       if (!card.number || !card.repoOwner || !card.repoName) {
-        failedPlans.add(slug);
         callback(
           `Cannot finalize draft card "${card.title}"; a closed GitHub issue is required.`,
           "warn",
@@ -979,24 +970,23 @@ export class BoardLoop {
       let claimed = false;
       try {
         claimed = await tryClaim(card, this.deps.botLogin);
-        if (!claimed) {
-          failedPlans.add(slug);
-          continue;
-        }
+        if (!claimed) continue;
         ensurePlanBranch(task.planBranch, cfg.branches.base, this.deps.cwd);
         const worktree = this.ticketWorktrees.ensure(task, slug);
         callback(
-          `Issue #${card.number} is closed. Merging ${task.taskBranch} → ${task.planBranch}…`,
+          `Issue #${card.number} is closed. Merging ${task.taskBranch} → ${cfg.branches.base}…`,
         );
         this.ticketWorktrees.mergeAndRemove(
           worktree,
           cfg.task_merge_strategy,
           card.number,
           card.title,
+          cfg.branches.base,
         );
-        callback(`Merged "${card.title}" and removed ${worktree.path}`);
+        callback(
+          `Merged "${card.title}" into ${cfg.branches.base} and removed ${worktree.path}`,
+        );
       } catch (error: any) {
-        failedPlans.add(slug);
         callback(
           `Finalization failed for "${card.title}": ${error.message}`,
           "warn",
@@ -1005,6 +995,5 @@ export class BoardLoop {
         if (claimed) await release(card, this.deps.botLogin);
       }
     }
-    return failedPlans;
   }
 }

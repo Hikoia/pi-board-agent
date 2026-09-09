@@ -599,7 +599,7 @@ export default function (pi: ExtensionAPI) {
         );
         if (loopState.running) {
           lines.push(
-            `Loop: RUNNING (${loop?.isAdmittingNewWork() ? "autonomous" : "recovery-only"})  tick=${loopState.tickCount}  launches=${loopState.wavesLaunched}  prs=${loopState.prsOpened}`,
+            `Loop: RUNNING (${loop?.isAdmittingNewWork() ? "autonomous" : "recovery-only"})  tick=${loopState.tickCount}  launches=${loopState.wavesLaunched}`,
           );
         } else {
           lines.push("Loop: STOPPED");

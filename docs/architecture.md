@@ -14,7 +14,7 @@ src/index.ts
     │   ├── inflight.ts         legacy lock detection/archive only
     │   └── pi-dynamic-workflows WorkflowManager + UsageLimitScheduler
     ├── refine.ts / review.ts / watchdog.ts
-    └── plan.ts               final task merge and cumulative plan PR
+    └── plan.ts               plan progress summaries
 ```
 
 `dispatch.ts` only normalizes persisted builder results. It no longer starts workflows or stores in-memory promises.
@@ -41,7 +41,11 @@ interface TicketExecutionRecord {
 }
 ```
 
-The record associates a card, retained worktree, and managed run. WorkflowManager's persisted run is the execution truth for status, journal, result, and lease. Legacy v1 worktree records remain readable and are upgraded when reused.
+The record associates a card, retained worktree, and managed run. New records use
+`branches.base` as `planBranch`; older plan-based records keep their original
+baseline so retained worktrees can resume safely. WorkflowManager's persisted
+run is the execution truth for status, journal, result, and lease. Legacy v1
+worktree records remain readable and are upgraded when reused.
 
 WorkflowManager stores runs outside the repository under Pi's workflow project storage. One manager is created lazily per ticket worktree with `concurrency=1` and `maxAgents=1`. Its usage-limit scheduler remains enabled.
 
@@ -59,7 +63,7 @@ TicketExecutor.reconcile(cards)
   ↓
 if activeCount() < max_workers: run the Needs Design Task gate/refinement lane
   ↓
-run Story refinement, watchdog, finalization lanes, and plan PR checks
+run Story refinement, watchdog, and direct-to-base finalization lanes
   ↓
 build Review and Ready candidate lists
   ↓
@@ -126,13 +130,14 @@ Outcome comments use `<!-- board-agent-run:<runId>:<outcome> -->`, so a retry af
 
 ```text
 main
- └─ plan/001-auth
-     ├─ task/t001 + retained worktree → Review → Done → human closes issue
-     ├─ task/t002 + retained worktree → Review → Done → human closes issue
-     └─ task/t003 + retained worktree → Review → Done → human closes issue
+ ├─ task/t001 + retained worktree → Review → Done → human closes issue ─┐
+ ├─ task/t002 + retained worktree → Review → Done → human closes issue ├─→ main
+ └─ task/t003 + retained worktree → Review → Done → human closes issue ─┘
 ```
 
-Closing a Done issue is the approval signal to merge its task branch into the plan branch and remove its worktree. The cumulative plan PR opens only after every task is closed and finalized.
+Closing a Done issue is the approval signal to merge its task branch directly
+into `branches.base` and remove its worktree. A refined Story reaches Done after
+every task is closed and finalized.
 
 ## Safety boundaries
 

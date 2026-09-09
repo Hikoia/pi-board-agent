@@ -6,13 +6,13 @@
 > An autonomous GitHub Project (v2) board executor for [Pi](https://pi.dev/).
 > Drag a card into the `Ready` column, walk away, come back to a PR.
 
-Built on **pi-dynamic-workflows 3.10** for journaled, resumable builders in persistent per-ticket worktrees, with an owner lock, startup reconciliation, assignee-based claiming, AI review, human validation, and plan-level PR batching.
+Built on **pi-dynamic-workflows 3.10** for journaled, resumable builders in persistent per-ticket worktrees, with an owner lock, startup reconciliation, assignee-based claiming, AI review, human validation, and direct task merges into the base branch.
 
 > **Git-only fork:** install this repository from a pinned Git commit. This fork is not published to npm; `@mancioshell/pi-board-agent` is the upstream package.
 
 ## Watch it run
 
-```
+```text
 ┌─ Board ─────────────────────────────────────────────────────┐
 │ Columns                                      │                │
 ├──────────────────────────────────────────────┼────────────────┤
@@ -22,10 +22,10 @@ Built on **pi-dynamic-workflows 3.10** for journaled, resumable builders in pers
 │         │ T007  │          │        │        │                │
 ├──────────────────────────────────────────────┼────────────────┤
 │  T001 → build task/T001 → Review → Done → human closes issue │
-│       → merge into plan/001-feature → clean ticket worktree   │
+│       → merge directly into main → clean ticket worktree      │
 │  T002/T003 follow the same human-gated lifecycle              │
 │                                                              │
-│  All tasks closed + merged → plan/001-feature PR → main       │
+│  Each closed Done task is integrated immediately              │
 │  Reviewers: @reviewer1 @reviewer2                            │
 │  Labels: board-agent                                         │
 └──────────────────────────────────────────────────────────────┘
@@ -33,9 +33,8 @@ Built on **pi-dynamic-workflows 3.10** for journaled, resumable builders in pers
 
 Review PASS moves a card to `Done` without merging or closing its issue. The
 persistent ticket worktree stays available for manual validation. When the
-human closes the issue, board-agent merges its task branch into `plan/<slug>`
-and removes the worktree. The plan PR opens only after every task is Done,
-manually closed, merged, and cleaned.
+human closes the issue, board-agent merges its task branch directly into
+`main` (or `branches.base`) and removes the worktree.
 
 ## Quickstart
 
@@ -133,11 +132,11 @@ max_workers: 2     # shared cap: active builders + current reviewer
 tick_seconds: 90   # 60-120 recommended (safe for GraphQL rate limit)
 branches:
   base: "main"
-  plan_prefix: "plan/"
+  plan_prefix: "plan/"   # retained for legacy worktrees
   task_prefix: "task/"
-task_merge_strategy: "squash"   # or "merge"
+task_merge_strategy: "squash"   # direct into branches.base; or "merge"
 
-pr:
+pr:                               # retained for config compatibility; unused
   reviewers: ["alice", "bob"]   # GitHub logins or "org/team-slug"
   labels: ["board-agent"]
 
@@ -175,17 +174,16 @@ bot_identity: ""   # login for the assignee claim guard; empty = gh user
 
 ### Branch model
 
-```
-main
- └─ plan/001-auth   ← long-lived plan branch
-     ├─ task/t001   ← persistent worktree until issue #1 is closed
-     ├─ task/t002   ← persistent worktree until issue #2 is closed
-     └─ task/t003   ← persistent worktree until issue #3 is closed
+```text
+main                  ← baseline and direct merge target
+ ├─ task/t001         ← persistent worktree until issue #1 is closed
+ ├─ task/t002         ← persistent worktree until issue #2 is closed
+ └─ task/t003         ← persistent worktree until issue #3 is closed
 ```
 
 AI review moves each task to Done but leaves it unmerged. Closing the linked
-issue is the human approval signal. Once all tasks are closed, merged, and
-cleaned, board-agent opens **one PR**: `plan/001-auth` → `main`.
+issue is the human approval signal; board-agent then merges that task directly
+into `branches.base` and removes its worktree.
 
 ## Commands
 
@@ -220,8 +218,8 @@ Read the structured blocker comment, reply with the requested decision or manual
 **What about merge conflicts?**
 
 Builders never merge. If finalization conflicts after the human closes the
-issue, board-agent leaves the ticket worktree and state intact, skips the plan
-PR, and retries on a later tick after a human resolves the conflict.
+issue, board-agent leaves the ticket worktree and state intact and retries on a
+later tick after a human resolves the conflict.
 
 **Do I need to keep pi running the whole time?**
 
@@ -251,9 +249,9 @@ the autonomous GitHub Project board executor for Claude Code.
 | --- | --- | --- |
 | **Host agent** | Claude Code | [Pi](https://pi.dev/) |
 | **Worker model** | Dynamic workflows (`workflows/super-board-wave.js`) or `claude -p` headless | [pi-dynamic-workflows](https://github.com/QuintinShaw/pi-dynamic-workflows) builders run in board-agent's persistent ticket worktrees; reviewers use ephemeral isolation |
-| **Plan grouping** | No plan concept — cards are independent | Cards are grouped by a `plan_field` on the project (e.g. `Plan: 001-auth`). When ALL cards of a plan reach `Done`, a single cumulative PR from `plan/<slug>` → `main` is opened |
-| **PR model** | One PR per card (opened by builder) | **One PR per plan** — builders push task branches; manual issue closure triggers task→plan merge; the orchestrator opens the cumulative plan PR |
-| **Review gate** | `super-review` skill runs automated review, with optional `human_approves_merge` | AI PASS moves the card to Done without closing or merging. The human validates the persistent worktree and closes the issue to approve merge |
+| **Plan grouping** | No plan concept — cards are independent | Cards retain a `plan_field` for task and Story grouping |
+| **Merge model** | One PR per card (opened by builder) | Builders push task branches; manual issue closure merges each accepted task directly into `branches.base` |
+| **Review gate** | `super-review` skill runs automated review, with optional `human_approves_merge` | AI PASS moves the card to Done without closing or merging. The human validates the persistent worktree and closes the issue to approve the direct merge |
 | **QA lane** | `super-qa` skill runs Playwright path specs on the worker's branch | Not built (v0.1). The `Review` column is the sole post-build gate. A future version will add a `super-qa` equivalent via pi-dynamic-workflows |
 | **Mutex / claim** | Assignee claim on GitHub issue + `.claude/super-board/inflight/` lockfile | Owner lock + assignee claim/refetch + WorkflowManager run lease; legacy inflight files are quarantine-only |
 | **Worktree** | Manual `git worktree` management in `super-board-wave.js` | One persistent worktree per ticket, retained through review and human validation, then removed after manual-close merge |

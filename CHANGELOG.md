@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Closed Done tickets now merge directly into `branches.base` and remove their retained worktrees; cumulative plan PR creation is skipped.
 - Made the Hikoia fork Git-only with npm's private-package guard and removed its release/publish workflow.
 - Hardened Needs Design Task refinement with fresh trusted-decision gates, temporary claims, post-design revalidation, worker-budget admission, and rotating candidates.
 - Issue comment reads now paginate the complete GraphQL history and fail on missing or repeated cursors.
