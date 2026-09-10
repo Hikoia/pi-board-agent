@@ -29,12 +29,11 @@ type_field: "Kind"
 
 # ── Plan grouping ───────────────────────────────────────────────────────────
 # Cards are grouped into "plans" by the value of `plan_field` on the project.
-# Suggested setup: add a single-select field "Plan" on the project with one
-# option per spec-kit feature slug (matches the directory name under specs/).
+# Add one stable slug per Story/task group (for example, release-0.2.0).
 plan_field: "Plan"
 
 # ── Concurrency ─────────────────────────────────────────────────────────────
-# Global cap shared by active ticket builders and the current reviewer.
+# Global cap shared by active ticket builders and foreground refinement/review.
 # Capped at 16.
 max_workers: 2
 
@@ -45,8 +44,7 @@ tick_seconds: 90
 # ── Branch strategy ─────────────────────────────────────────────────────────
 branches:
   base: "main" # direct merge target after a Done issue is closed
-  plan_prefix: "plan/" # retained for legacy plan-based worktrees
-  # Branch prefix for short-lived per-task branches.
+  # Branch prefix for short-lived per-Issue task branches (`task/issue-42`).
   task_prefix: "task/"
 
 # How a manually accepted task is merged into branches.base after its
@@ -55,20 +53,7 @@ branches:
 #   "merge"  -> preserve full commit history of each task branch
 task_merge_strategy: "squash"
 
-# ── Legacy PR settings (retained for config compatibility) ──────────────────
-pr:
-  # These values are unused in direct-merge mode, but remain valid so existing
-  # configuration files do not need a migration.
-  reviewers: []
-  body_template: ".github/PULL_REQUEST_TEMPLATE.md"
-  labels:
-    - "board-agent"
-
-# ── Builder model routing ───────────────────────────────────────────────────
-# Maps to pi-dynamic-workflows tiers configured via `/workflows-models`.
-# Each builder agent runs in a worktree under this tier.
-builder_tier: "medium"
-
+# ── Builder execution ───────────────────────────────────────────────────────
 # Optional: hard timeout per builder agent (milliseconds). Omit for no cap.
 builder_timeout_ms: 21600000 # 6 hours per attempt
 
@@ -76,8 +61,8 @@ builder_timeout_ms: 21600000 # 6 hours per attempt
 builder_retries: 1
 
 # ── LLM models (parametrizzabili) ───────────────────────────────────────────
-# Explicit model id used for each role. When set, it takes precedence over
-# the tier. Use "provider/modelId" or a bare modelId resolvable by pi.
+# Explicit model id used for each role. Use "provider/modelId" or a bare
+# modelId resolvable by Pi.
 models:
   builder: "deepseek-v4-flash-0731"
   refine: "deepseek-v4-flash-0731"
@@ -105,7 +90,9 @@ refine:
 # ── AI review gate ──────────────────────────────────────────────────────────
 # Review cards are independently checked against their acceptance criteria.
 # PASS → Done; FAIL → a findings comment is posted and the card returns to
-# Ready.
+# Ready. When disabled, validate the retained worktree manually, move the Task
+# to Done, then close its Issue to approve the matching local/remote task SHA.
+# Any prior AI-reviewed SHA must still match, even after disabling this gate.
 review:
   enabled: false
   timeout_ms: 600000 # per-review agent timeout (10 min)
@@ -114,11 +101,11 @@ review:
 # Keeps bot-managed PRs healthy: auto-fix failing CI (max rounds, cooldown),
 # then ask the human; replies to @bot mentions on its PRs.
 watchdog:
-  enabled: true
-  interval_seconds: 300 # standalone /board-agent watchdog interval
+  enabled: true # scheduled only by the main BoardLoop
   fix_rounds_max: 5 # max auto-fix rounds per PR before needs-human
   fix_cooldown_minutes: 5 # pause between fix attempts (CI needs time)
-  respond_to_mentions: true
+  # Trusted OWNER/MEMBER/COLLABORATOR mentions only; disabled by default.
+  respond_to_mentions: false
   pr_label: "board-agent"
   needs_human_label: "needs-human"
 
@@ -129,24 +116,22 @@ telegram:
   enabled: true
   bot_token_env: "TELEGRAM_BOT_TOKEN"
   chat_id_env: "TELEGRAM_CHAT_ID"
-  # Events: pr_opened, ci_fixed, needs_human, task_failed,
-  # refine_questions, refine_done
+  # Events: ci_fixed, needs_human, refine_questions, refine_done
   "on":
-    - "pr_opened"
     - "ci_fixed"
     - "needs_human"
-    - "task_failed"
     - "refine_questions"
     - "refine_done"
 
-# ── Auto start (container) ──────────────────────────────────────────────────
-# Start the loop automatically when the pi session starts (Docker/headless).
+# ── Auto start ──────────────────────────────────────────────────────────────
+# Start the loop automatically when a normal Pi session starts.
 auto_start: false
 
 # ── Safety rails ────────────────────────────────────────────────────────────
 safety:
-  # Refuse to launch new work if the main working tree is dirty. Existing
-  # managed runs are still reconciled so one ticket cannot block the board.
+  # Refuse to launch new work if the main working tree is dirty. Only untracked
+  # runtime paths are excluded; tracked source/config changes always block.
+  # Existing managed runs are still reconciled; one ticket cannot block the board.
   require_clean_worktree: true
   # Skip cards whose linked issue is already closed.
   skip_closed_issues: true

@@ -1,49 +1,24 @@
-/**
- * Thin git wrappers for plan-branch lifecycle and main-worktree safety checks.
- * Persistent per-ticket worktrees live in ticket-worktree.ts.
- */
-import { spawnSync } from "node:child_process";
+/** Main-worktree safety checks. */
+import { runProcessSync } from "./process-runner.js";
 
-function git(args: string[], cwd: string): { ok: boolean; stdout: string; stderr: string } {
-  const res = spawnSync("git", args, { cwd, encoding: "utf-8" });
-  return { ok: res.status === 0, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
-}
-
+/** Ignore only untracked Board Agent runtime, never index/tracked changes. */
 export function isClean(cwd: string): boolean {
-  const res = git(["status", "--porcelain"], cwd);
-  return res.ok && res.stdout.trim().length === 0;
-}
-
-export function currentBranch(cwd: string): string {
-  return git(["rev-parse", "--abbrev-ref", "HEAD"], cwd).stdout.trim();
-}
-
-export function localBranchExists(branch: string, cwd: string): boolean {
-  return git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], cwd).ok;
-}
-
-export function remoteBranchExists(branch: string, cwd: string): boolean {
-  const r = git(["ls-remote", "--exit-code", "--heads", "origin", branch], cwd);
-  return r.ok;
-}
-
-export function commitsAhead(branch: string, base: string, cwd: string): number {
-  const r = git(["rev-list", "--count", `${base}..${branch}`], cwd);
-  if (!r.ok) return 0;
-  return Number(r.stdout.trim() || "0");
-}
-
-/** Ensure a `plan/<slug>` branch exists locally + on origin, based on `base`. */
-export function ensurePlanBranch(planBranch: string, baseBranch: string, cwd: string): void {
-  // Fetch latest base.
-  let r = git(["fetch", "origin", baseBranch], cwd);
-  if (!r.ok) throw new Error(`git fetch origin ${baseBranch} failed: ${r.stderr}`);
-  if (!localBranchExists(planBranch, cwd)) {
-    r = git(["branch", planBranch, `origin/${baseBranch}`], cwd);
-    if (!r.ok) throw new Error(`git branch ${planBranch} failed: ${r.stderr}`);
-  }
-  if (!remoteBranchExists(planBranch, cwd)) {
-    r = git(["push", "-u", "origin", planBranch], cwd);
-    if (!r.ok) throw new Error(`git push -u origin ${planBranch} failed: ${r.stderr}`);
-  }
+  const result = runProcessSync(
+    "git",
+    ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    { cwd },
+  );
+  if (!result.ok) return false;
+  // Porcelain -z is repository-root relative and does not quote odd filenames.
+  // A tracked rename's first entry already fails, so its second path cannot be
+  // mistaken for runtime noise. Do not exclude these directories via pathspec:
+  // that also hides tracked source and staged additions within them.
+  return result.stdout
+    .split("\0")
+    .every(
+      (entry) =>
+        !entry ||
+        entry.startsWith("?? .pi/board-agent/") ||
+        entry.startsWith("?? .pi/worktrees/"),
+    );
 }

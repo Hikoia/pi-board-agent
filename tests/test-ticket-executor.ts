@@ -2,8 +2,10 @@ import {
   WorkflowErrorCode,
   type PersistedRunState,
 } from "@quintinshaw/pi-dynamic-workflows";
+import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -14,7 +16,6 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import { _DEFAULTS, type Config } from "../src/config.js";
 import type { Card } from "../src/gh.js";
-import { Inflight } from "../src/inflight.js";
 import { BoardLoop, createLoopState, type LoopDeps } from "../src/loop.js";
 import { acquireOwnerLock } from "../src/owner-lock.js";
 import {
@@ -30,6 +31,10 @@ import {
 } from "../src/ticket-worktree.js";
 import { buildTasksForWave } from "../src/workflow-prompt.js";
 
+const fail = (message: string) => {
+  process.exitCode = 1;
+  console.log(message);
+};
 const root = process.env.TMP_DIR!;
 const origin = join(root, "origin.git");
 const repo = join(root, "repo");
@@ -49,8 +54,6 @@ git(repo, "add", ".");
 git(repo, "commit", "-m", "init");
 git(repo, "remote", "add", "origin", origin);
 git(repo, "push", "-u", "origin", "main");
-git(repo, "branch", "plan/demo", "main");
-git(repo, "push", "-u", "origin", "plan/demo");
 
 const cfg: Config = {
   ..._DEFAULTS,
@@ -82,6 +85,7 @@ class FakeBoard implements TicketBoardAdapter {
   ): Card {
     const card: Card = {
       itemId,
+      contentType: "Issue",
       number,
       title: `T${String(number).padStart(3, "0")} ticket`,
       body: "Acceptance criteria",
@@ -228,19 +232,18 @@ class FakeManager implements TicketWorkflowManager {
 
 const board = new FakeBoard();
 const worktrees = new TicketWorktrees(repo);
-const legacy = new Inflight(repo);
 const notices: string[] = [];
 const makeExecutor = (recover = false) =>
   new ManagedTicketExecutor({
     cwd: repo,
     cfg,
     botLogin: "bot",
+    repoOwner: "test",
+    repoName: "repo",
     board,
     callback: (message) => notices.push(message),
     worktrees: new TicketWorktrees(repo),
-    legacyInflight: new Inflight(repo),
     createManager: (path) => new FakeManager(stateFor(path), recover),
-    ensurePlan: () => undefined,
   });
 const recordFor = (itemId: string) =>
   worktrees.read(itemId) as TicketExecutionRecord;
@@ -254,837 +257,1249 @@ const complete = (itemId: string, result: unknown) => {
   run.result = result;
 };
 
-const corrupt76 = board.add("PVTI_76", 76, cfg.columns.building);
-const card77 = board.add("PVTI_77", 77, cfg.columns.building);
-const orphan78 = board.add("PVTI_78", 78, cfg.columns.building);
-const card79 = board.add("PVTI_79", 79);
-writeFileSync(
-  join(repo, ".pi", "board-agent", "ticket-worktrees", "pvti_76.json"),
-  "{ corrupt",
-);
-legacy.write({
-  itemId: card77.itemId,
-  issueNumber: 77,
-  cardTitle: card77.title,
-  plan: "demo",
-  taskBranch: "task/t077",
-  planBranch: "plan/demo",
-  startedAt: Date.now(),
-});
-let executor = makeExecutor();
-const legacySummary = await executor.reconcile(board.all());
-if (
-  board.cards.get(card77.itemId)?.status === cfg.columns.needs_human &&
-  legacySummary.legacy === 1 &&
-  !legacy.has(card77.itemId)
-) {
-  console.log("PASS: legacy inflight ticket is quarantined and archived");
-} else console.log("FAIL: legacy inflight recovery");
-if (
-  board.cards.get(orphan78.itemId)?.status === cfg.columns.needs_human &&
-  legacySummary.orphans === 2
-) {
-  console.log(
-    "PASS: In Progress ticket without an execution record is quarantined individually",
-  );
-} else console.log("FAIL: orphan ticket quarantine");
-if (board.cards.get(corrupt76.itemId)?.status === cfg.columns.needs_human) {
-  console.log("PASS: corrupt execution JSON cannot hide an In Progress orphan");
-} else console.log("FAIL: corrupt execution record quarantine");
-await board.setStatus(corrupt76.itemId, cfg.columns.ready);
-const corruptRelaunch = await executor.launch(corrupt76, "demo");
-if (
-  corruptRelaunch.status === "needs-human" &&
-  readFileSync(
+// The default run retains every recovery check; this opt-in focuses the new
+// end-to-end finalization regressions during local iteration.
+if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
+  const corrupt76 = board.add("PVTI_76", 76, cfg.columns.building);
+  const orphan78 = board.add("PVTI_78", 78, cfg.columns.building);
+  const card79 = board.add("PVTI_79", 79);
+  writeFileSync(
     join(repo, ".pi", "board-agent", "ticket-worktrees", "pvti_76.json"),
-    "utf8",
-  ) === "{ corrupt"
-) {
-  console.log("PASS: corrupt execution JSON is never overwritten by a new run");
-} else console.log("FAIL: corrupt execution record was overwritten");
-const corruptLegacy = board.add(
-  "PVTI_corrupt_legacy",
-  771,
-  cfg.columns.building,
-);
-const corruptLegacyPath = join(
-  repo,
-  ".pi",
-  "board-agent",
-  "inflight",
-  `${corruptLegacy.itemId}.json`,
-);
-writeFileSync(corruptLegacyPath, "{ corrupt");
-const corruptLegacySummary = await executor.reconcile(board.all());
-if (
-  board.cards.get(corruptLegacy.itemId)?.status === cfg.columns.needs_human &&
-  corruptLegacySummary.legacy === 1 &&
-  !existsSync(corruptLegacyPath)
-) {
-  console.log(
-    "PASS: corrupt legacy inflight JSON is quarantined by filename identity",
+    "{ corrupt",
   );
-} else console.log("FAIL: corrupt legacy inflight record was ignored");
-const launched79 = await executor.launch(card79, "demo");
-if (launched79.status === "launched")
-  console.log("PASS: same-plan Ready ticket launches despite legacy sibling");
-else console.log("FAIL: legacy sibling blocked Ready ticket");
-const builderScript = runFor(card79.itemId).script;
-const builderStartOptions = stateFor(
-  recordFor(card79.itemId).path,
-).lastStartOptions;
-if (
-  builderStartOptions?.agentTimeoutMs === 21600000 &&
-  builderStartOptions.agentRetries === 1 &&
-  builderScript.includes('"builder_timeout_ms":21600000') &&
-  builderScript.includes('"builder_retries":1') &&
-  builderScript.includes("timeoutMs: PAYLOAD.cfg.builder_timeout_ms")
-)
-  console.log(
-    "PASS: six-hour timeout and one retry reach executor and generated agent",
-  );
-else console.log("FAIL: builder timeout launch propagation");
-if (
-  builderScript.includes("git status --short") &&
-  builderScript.includes("git diff") &&
-  builderScript.includes("the persistent worktree for this ticket") &&
-  builderScript.includes("Only pull") &&
-  builderScript.includes("Never reset, stash, overwrite, or discard") &&
-  builderScript.includes("clean, committed, and pushed")
-)
-  console.log(
-    "PASS: builder preserves and completes a ticket-owned partial diff",
-  );
-else console.log("FAIL: ticket-owned dirty-worktree contract");
-const startsBeforeDuplicate = [...managerStates.values()].reduce(
-  (sum, state) => sum + state.starts,
-  0,
-);
-await executor.launch(card79, "demo");
-const startsAfterDuplicate = [...managerStates.values()].reduce(
-  (sum, state) => sum + state.starts,
-  0,
-);
-if (startsAfterDuplicate === startsBeforeDuplicate)
-  console.log("PASS: active ticket is not dispatched twice");
-else console.log("FAIL: active ticket dispatched twice");
-const branchCollision = board.add("PVTI_790", 790);
-board.cards.get(branchCollision.itemId)!.title = "T079 duplicate branch";
-if ((await executor.launch(branchCollision, "demo")).status === "needs-human") {
-  console.log("PASS: two tickets cannot share one task branch/worktree");
-} else console.log("FAIL: duplicate task branch ownership");
-const card80 = board.add("PVTI_80", 80);
-if (
-  (await executor.launch(card80, "demo")).status === "launched" &&
-  executor.activeCount() === 2
-) {
-  console.log("PASS: two tickets from one plan can run concurrently");
-} else console.log("FAIL: same-plan concurrency");
-
-const stale81 = board.add("PVTI_81", 81);
-board.cards.get(stale81.itemId)!.status = cfg.columns.backlog;
-const stale82 = board.add("PVTI_82", 82);
-board.cards.get(stale82.itemId)!.plan = "changed";
-const stale83 = board.add("PVTI_83", 83);
-board.cards.get(stale83.itemId)!.closed = true;
-const staleResults = await Promise.all([
-  executor.launch(stale81, "demo"),
-  executor.launch(stale82, "demo"),
-  executor.launch(stale83, "demo"),
-]);
-if (staleResults.every((result) => result.status === "skipped"))
-  console.log(
-    "PASS: final refetch rejects status, Plan, and issue-state changes",
-  );
-else console.log("FAIL: final refetch validation");
-const raced = board.add("PVTI_84", 84);
-board.claimRaces.add(raced.itemId);
-if (
-  (await executor.launch(raced, "demo")).status === "skipped" &&
-  board.cards.get(raced.itemId)!.assignees.includes("rival")
-) {
-  console.log(
-    "PASS: post-claim refetch detects competing assignee and releases bot",
-  );
-} else console.log("FAIL: post-claim race validation");
-
-await executor.shutdown();
-if (
-  [card79.itemId, card80.itemId].every(
-    (itemId) => runFor(itemId).status === "paused",
-  )
-) {
-  console.log("PASS: shutdown pauses active managers and preserves records");
-} else console.log("FAIL: shutdown persistence");
-complete(card79.itemId, [
-  {
-    taskKey: "T079",
-    itemId: card79.itemId,
-    status: "success",
-    branch: "task/t079",
-    summary: "done",
-  },
-]);
-executor = makeExecutor(true);
-const restartSummary = await executor.reconcile(board.all());
-if (
-  board.cards.get(card79.itemId)?.status === cfg.columns.review &&
-  board.cards.get(card79.itemId)?.assignees.length === 0 &&
-  !recordFor(card79.itemId).activeRunId &&
-  restartSummary.resumed === 1 &&
-  runFor(card80.itemId).status === "running"
-)
-  console.log(
-    "PASS: restart consumes completed result and resumes clean paused sibling",
-  );
-else console.log("FAIL: startup completed/resume recovery");
-const successCommentCount = board.comments.get(card79.itemId)?.length ?? 0;
-await executor.reconcile(board.all());
-if ((board.comments.get(card79.itemId)?.length ?? 0) === successCommentCount)
-  console.log("PASS: terminal reconciliation is idempotent");
-else console.log("FAIL: duplicate terminal comment");
-
-const dirty = board.add("PVTI_85", 85);
-const cleanSibling = board.add("PVTI_851", 851);
-await executor.launch(dirty, "demo");
-await executor.launch(cleanSibling, "demo");
-runFor(dirty.itemId).status = "paused";
-const dirtyRecord = recordFor(dirty.itemId);
-const dirtyPath = dirtyRecord.path;
-const dirtyCommentCount = board.comments.get(dirty.itemId)?.length ?? 0;
-writeFileSync(join(dirtyPath, "README.md"), "base\npartial\n");
-writeFileSync(join(dirtyPath, "dirty.txt"), "untracked partial\n");
-await executor.shutdown();
-executor = makeExecutor(true);
-const dirtySummary = await executor.reconcile(board.all());
-if (
-  board.cards.get(dirty.itemId)?.status === cfg.columns.building &&
-  recordFor(dirty.itemId).activeRunId === dirtyRecord.activeRunId &&
-  runFor(dirty.itemId).status === "running" &&
-  runFor(cleanSibling.itemId).status === "running" &&
-  dirtySummary.resumed >= 2 &&
-  readFileSync(join(dirtyPath, "README.md"), "utf8") === "base\npartial\n" &&
-  readFileSync(join(dirtyPath, "dirty.txt"), "utf8") ===
-    "untracked partial\n" &&
-  (board.comments.get(dirty.itemId)?.length ?? 0) === dirtyCommentCount
-) {
-  console.log(
-    "PASS: owned dirty paused worktree resumes with tracked and untracked changes preserved",
-  );
-} else console.log("FAIL: owned dirty paused worktree recovery");
-
-const usageLimited = board.add("PVTI_852", 852);
-await executor.launch(usageLimited, "demo");
-const usageRun = runFor(usageLimited.itemId);
-usageRun.status = "paused";
-usageRun.pauseReason = "usage_limit";
-const usageRecord = recordFor(usageLimited.itemId);
-const usageState = stateFor(usageRecord.path);
-const usageResumes = usageState.resumes;
-const usageStops = usageState.stops;
-writeFileSync(join(usageRecord.path, "usage-limit.txt"), "checkpoint\n");
-const usageSummary = await executor.reconcile(board.all());
-if (
-  board.cards.get(usageLimited.itemId)?.status === cfg.columns.building &&
-  recordFor(usageLimited.itemId).activeRunId === usageRun.runId &&
-  usageRun.status === "paused" &&
-  usageState.resumes === usageResumes &&
-  usageState.stops === usageStops &&
-  usageSummary.active.some(
-    (active) => active.runId === usageRun.runId && active.status === "paused",
-  ) &&
-  existsSync(join(usageRecord.path, "usage-limit.txt")) &&
-  !board.comments.get(usageLimited.itemId)?.length
-)
-  console.log(
-    "PASS: dirty usage-limit checkpoint stays paused for the scheduler",
-  );
-else console.log("FAIL: dirty usage-limit checkpoint recovery");
-
-const ticketOwnedDirty = board.add("PVTI_853", 853);
-const ticketOwnedDirtyTask = buildTasksForWave(cfg, "demo", [
-  ticketOwnedDirty,
-])[0];
-const ticketOwnedDirtyRecord = worktrees.ensure(ticketOwnedDirtyTask, "demo");
-writeFileSync(
-  join(ticketOwnedDirtyRecord.path, "checkpoint.txt"),
-  "ticket-owned\n",
-);
-const ticketOwnedDirtyLaunch = await executor.launch(ticketOwnedDirty, "demo");
-if (
-  ticketOwnedDirtyLaunch.status === "launched" &&
-  ticketOwnedDirtyLaunch.worktree === ticketOwnedDirtyRecord.path &&
-  board.cards.get(ticketOwnedDirty.itemId)?.status === cfg.columns.building &&
-  recordFor(ticketOwnedDirty.itemId).activeRunId &&
-  existsSync(join(ticketOwnedDirtyRecord.path, "checkpoint.txt")) &&
-  !board.comments.get(ticketOwnedDirty.itemId)?.length
-)
-  console.log(
-    "PASS: ticket-owned dirty worktree launches without a prior run id",
-  );
-else console.log("FAIL: ticket-owned dirty worktree launch");
-
-const completedDirty = board.add("PVTI_854", 854);
-await executor.launch(completedDirty, "demo");
-complete(completedDirty.itemId, [
-  {
-    taskKey: "T854",
-    itemId: completedDirty.itemId,
-    status: "success",
-    branch: "task/t854",
-    summary: "done",
-  },
-]);
-const completedDirtyRecord = recordFor(completedDirty.itemId);
-const completedDirtyPath = completedDirtyRecord.path;
-writeFileSync(join(completedDirtyPath, "completed-dirty.txt"), "unsafe\n");
-await executor.reconcile(board.all());
-const completedDirtyComment = (
-  board.comments.get(completedDirty.itemId) ?? []
-).join("\n");
-if (
-  board.cards.get(completedDirty.itemId)?.status === cfg.columns.needs_human &&
-  !recordFor(completedDirty.itemId).activeRunId &&
-  completedDirtyComment.includes(
-    `board-agent-run:${completedDirtyRecord.activeRunId}:malformed`,
-  ) &&
-  completedDirtyComment.includes("dirty worktree") &&
-  existsSync(join(completedDirtyPath, "completed-dirty.txt"))
-)
-  console.log("PASS: dirty completed-success worktree still fails closed");
-else console.log("FAIL: dirty completed-success worktree gate");
-
-const timedOut = board.add("PVTI_38", 38);
-await executor.launch(timedOut, "demo");
-const timedOutRun = runFor(timedOut.itemId);
-const timedOutRunId = timedOutRun.runId;
-timedOutRun.status = "completed";
-timedOutRun.result = [null];
-timedOutRun.agentTimeoutMs = 7200000;
-timedOutRun.agents = [
-  {
-    id: 1,
-    label: "build T038",
-    prompt: "builder prompt",
-    status: "error",
-    errorCode: WorkflowErrorCode.AGENT_TIMEOUT,
-    error: "RAW provider timeout details must stay private",
-  },
-];
-const timedOutPath = recordFor(timedOut.itemId).path;
-writeFileSync(join(timedOutPath, "README.md"), "base\npartial timeout work\n");
-writeFileSync(join(timedOutPath, "timeout-untracked.txt"), "keep me\n");
-const timedOutSummary = await executor.reconcile(board.all());
-const timedOutComment = (board.comments.get(timedOut.itemId) ?? []).join("\n");
-const timedOutCommentCount = board.comments.get(timedOut.itemId)?.length ?? 0;
-await executor.reconcile(board.all());
-const timedOutRecord = recordFor(timedOut.itemId);
-if (
-  timedOutSummary.needsHuman === 1 &&
-  board.cards.get(timedOut.itemId)?.status === cfg.columns.needs_human &&
-  !timedOutRecord.activeRunId &&
-  timedOutRecord.lastRunId === timedOutRunId &&
-  timedOutComment.includes(`board-agent-run:${timedOutRunId}:malformed`) &&
-  timedOutComment.includes("Builder agent timed out after 7200000 ms.") &&
-  timedOutComment.includes("preserve useful changes") &&
-  timedOutComment.includes("address the reported blocker before retrying") &&
-  !timedOutComment.includes("RAW provider timeout details") &&
-  !timedOutComment.includes("dirty worktree") &&
-  !timedOutComment.includes("leave the expected task branch clean") &&
-  readFileSync(join(timedOutPath, "README.md"), "utf8") ===
-    "base\npartial timeout work\n" &&
-  readFileSync(join(timedOutPath, "timeout-untracked.txt"), "utf8") ===
-    "keep me\n" &&
-  (board.comments.get(timedOut.itemId)?.length ?? 0) === timedOutCommentCount
-) {
-  console.log(
-    "PASS: completed null timeout outranks dirtiness and preserves partial work",
-  );
-} else console.log("FAIL: completed null timeout reconciliation");
-
-const validTimeoutAgent = {
-  status: "error",
-  errorCode: "AGENT_TIMEOUT",
-  error: "RAW malformed metadata details",
-};
-const malformedAgentCases: Array<{
-  number: number;
-  agents: unknown;
-  timeoutMs?: unknown;
-}> = [
-  { number: 381, agents: {} },
-  { number: 382, agents: [null] },
-  { number: 383, agents: [{ ...validTimeoutAgent, status: "done" }] },
-  { number: 384, agents: [{ ...validTimeoutAgent, errorCode: "OTHER" }] },
-  { number: 385, agents: [validTimeoutAgent], timeoutMs: 0 },
-  { number: 386, agents: [validTimeoutAgent], timeoutMs: 1.5 },
-  {
-    number: 387,
-    agents: [validTimeoutAgent],
-    timeoutMs: Number.POSITIVE_INFINITY,
-  },
-];
-const malformedAgentRuns: Array<{
-  itemId: string;
-  runId: string;
-  timeout: boolean;
-}> = [];
-for (const testCase of malformedAgentCases) {
-  const card = board.add(`PVTI_${testCase.number}`, testCase.number);
-  await executor.launch(card, "demo");
-  const run = runFor(card.itemId);
-  run.status = "completed";
-  run.result = [null];
-  const metadata = run as unknown as {
-    agents: unknown;
-    agentTimeoutMs?: unknown;
-  };
-  metadata.agents = testCase.agents;
-  if ("timeoutMs" in testCase) metadata.agentTimeoutMs = testCase.timeoutMs;
-  malformedAgentRuns.push({
-    itemId: card.itemId,
-    runId: run.runId,
-    timeout: "timeoutMs" in testCase,
-  });
-}
-const malformedAgentSummary = await executor.reconcile(board.all());
-const malformedAgentGuardsPassed = malformedAgentRuns.every(
-  ({ itemId, runId, timeout }) => {
-    const comment = (board.comments.get(itemId) ?? []).join("\n");
-    const expectedProblem = timeout
-      ? "Builder agent timed out."
-      : "persisted builder result is malformed";
-    return (
-      board.cards.get(itemId)?.status === cfg.columns.needs_human &&
-      comment.includes(`board-agent-run:${runId}:malformed`) &&
-      comment.includes(`**Problem**\n${expectedProblem}\n`) &&
-      !comment.includes("RAW") &&
-      !comment.includes("timed out after")
+  let executor = makeExecutor();
+  const orphanSummary = await executor.reconcile(board.all());
+  if (
+    board.cards.get(orphan78.itemId)?.status === cfg.columns.needs_human &&
+    orphanSummary.orphans === 2
+  ) {
+    console.log(
+      "PASS: unsupported and missing In Progress records fail closed",
     );
-  },
-);
-if (
-  malformedAgentSummary.needsHuman === malformedAgentCases.length &&
-  malformedAgentSummary.errors === 0 &&
-  malformedAgentGuardsPassed
-) {
-  console.log(
-    "PASS: malformed timeout metadata falls back safely and invalid durations are omitted",
-  );
-} else console.log("FAIL: malformed timeout metadata guards");
-
-const trustedIdentity = board.add("PVTI_37", 37);
-await executor.launch(trustedIdentity, "demo");
-complete(trustedIdentity.itemId, [
-  {
-    taskKey: "37",
-    itemId: "37",
-    status: "success",
-    branch: "task/t037",
-    summary: "done",
-  },
-]);
-await executor.reconcile(board.all());
-if (
-  board.cards.get(trustedIdentity.itemId)?.status === cfg.columns.review &&
-  !recordFor(trustedIdentity.itemId).activeRunId
-)
-  console.log(
-    "PASS: persisted run identity overrides incorrect echoed identity",
-  );
-else console.log("FAIL: trusted persisted run identity");
-
-const malformedIdentity = [855, 856, 857].map((number) =>
-  board.add(`PVTI_${number}`, number),
-);
-for (const card of malformedIdentity) await executor.launch(card, "demo");
-complete(malformedIdentity[0].itemId, [
-  {
-    taskKey: "T855",
-    itemId: malformedIdentity[0].itemId,
-    status: "success",
-    branch: "task/t855",
-  },
-  {
-    taskKey: "T999",
-    itemId: "PVTI_999",
-    status: "failure",
-    error: "extra result",
-  },
-]);
-complete(malformedIdentity[1].itemId, [
-  {
-    taskKey: "T856",
-    itemId: malformedIdentity[1].itemId,
-    status: "success",
-    branch: "task/wrong",
-  },
-]);
-const wrongArgsRun = runFor(malformedIdentity[2].itemId);
-wrongArgsRun.status = "completed";
-wrongArgsRun.result = [
-  {
-    taskKey: "T857",
-    itemId: malformedIdentity[2].itemId,
-    status: "success",
-    branch: "task/t857",
-  },
-];
-wrongArgsRun.args = { itemId: "PVTI_wrong", issueNumber: 857, taskKey: "T857" };
-await executor.reconcile(board.all());
-if (
-  malformedIdentity.every(
-    (card) => board.cards.get(card.itemId)?.status === cfg.columns.needs_human,
+  } else fail("FAIL: unsupported execution record quarantine");
+  await board.setStatus(corrupt76.itemId, cfg.columns.ready);
+  const corruptRelaunch = await executor.launch(corrupt76, "demo");
+  if (
+    corruptRelaunch.status === "needs-human" &&
+    readFileSync(
+      join(repo, ".pi", "board-agent", "ticket-worktrees", "pvti_76.json"),
+      "utf8",
+    ) === "{ corrupt"
+  ) {
+    console.log(
+      "PASS: corrupt execution JSON is never overwritten by a new run",
+    );
+  } else fail("FAIL: corrupt execution record was overwritten");
+  const launched79 = await executor.launch(card79, "demo");
+  if (launched79.status === "launched")
+    console.log("PASS: a valid Ready Issue launches after isolated quarantine");
+  else fail("FAIL: valid Ready Issue was blocked by an orphan sibling");
+  const builderScript = runFor(card79.itemId).script;
+  const builderStartOptions = stateFor(
+    recordFor(card79.itemId).path,
+  ).lastStartOptions;
+  if (
+    builderStartOptions?.agentTimeoutMs === 21600000 &&
+    builderStartOptions.agentRetries === 1 &&
+    builderScript.includes('"builder_timeout_ms":21600000') &&
+    builderScript.includes('"builder_retries":1') &&
+    builderScript.includes("timeoutMs: PAYLOAD.cfg.builder_timeout_ms")
   )
-) {
-  console.log(
-    "PASS: multiple results, wrong branch, and mismatched run args remain quarantined",
-  );
-} else console.log("FAIL: malformed persisted result guards");
-
-const terminalCards = [86, 87, 88, 89].map((number) =>
-  board.add(`PVTI_${number}`, number),
-);
-for (const card of terminalCards) await executor.launch(card, "demo");
-runFor(terminalCards[0].itemId).status = "failed";
-runFor(terminalCards[0].itemId).error = "agent failed";
-runFor(terminalCards[1].itemId).status = "aborted";
-complete(terminalCards[2].itemId, { malformed: true });
-const missingRecord = recordFor(terminalCards[3].itemId);
-stateFor(missingRecord.path).runs.delete(missingRecord.activeRunId!);
-await executor.reconcile(board.all());
-if (
-  terminalCards.every(
-    (card) => board.cards.get(card.itemId)?.status === cfg.columns.needs_human,
+    console.log(
+      "PASS: six-hour timeout and one retry reach executor and generated agent",
+    );
+  else fail("FAIL: builder timeout launch propagation");
+  if (
+    builderScript.includes("git status --short") &&
+    builderScript.includes("git diff") &&
+    builderScript.includes("the persistent worktree for this ticket") &&
+    builderScript.includes("Only pull") &&
+    builderScript.includes("Never reset, stash, overwrite, or discard") &&
+    builderScript.includes("clean, committed, and pushed")
   )
-) {
-  console.log(
-    "PASS: failed, aborted, malformed, and missing runs all require human",
+    console.log(
+      "PASS: builder preserves and completes a ticket-owned partial diff",
+    );
+  else fail("FAIL: ticket-owned dirty-worktree contract");
+  const startsBeforeDuplicate = [...managerStates.values()].reduce(
+    (sum, state) => sum + state.starts,
+    0,
   );
-} else console.log("FAIL: terminal failure policy");
-
-const explained = board.add("PVTI_894", 894);
-await executor.launch(explained, "demo");
-complete(explained.itemId, [
-  {
-    taskKey: "T894",
-    itemId: explained.itemId,
-    status: "failure",
-    error: "Deployment target is missing.",
-    attempted: "Checked repository configuration.",
-    limitations: "Choosing a target would be unsafe.",
-    workaround: "Select staging or production.",
-    humanAction: "Reply with the approved target.",
-  },
-]);
-const explainedPath = recordFor(explained.itemId).path;
-writeFileSync(join(explainedPath, "README.md"), "base\nstructured partial\n");
-writeFileSync(join(explainedPath, "structured-untracked.txt"), "keep me\n");
-await executor.reconcile(board.all());
-const blockerComment = (board.comments.get(explained.itemId) ?? []).join("\n");
-if (
-  board.cards.get(explained.itemId)?.status === cfg.columns.needs_human &&
-  blockerComment.includes("## ⚠️ Needs human input") &&
-  blockerComment.includes("Deployment target is missing.") &&
-  blockerComment.includes("Checked repository configuration.") &&
-  blockerComment.includes("Choosing a target would be unsafe.") &&
-  blockerComment.includes("Select staging or production.") &&
-  blockerComment.includes("Reply with the approved target.") &&
-  blockerComment.includes("manually move this Project card to `Ready`") &&
-  !blockerComment.includes("dirty worktree") &&
-  readFileSync(join(explainedPath, "README.md"), "utf8") ===
-    "base\nstructured partial\n" &&
-  readFileSync(join(explainedPath, "structured-untracked.txt"), "utf8") ===
-    "keep me\n"
-)
-  console.log(
-    "PASS: dirty builder failure preserves work and actionable details",
+  await executor.launch(card79, "demo");
+  const startsAfterDuplicate = [...managerStates.values()].reduce(
+    (sum, state) => sum + state.starts,
+    0,
   );
-else console.log("FAIL: dirty builder failure human guidance");
+  if (startsAfterDuplicate === startsBeforeDuplicate)
+    console.log("PASS: active ticket is not dispatched twice");
+  else fail("FAIL: active ticket dispatched twice");
+  const branchCollision = board.add("PVTI_790", 79);
+  board.cards.get(branchCollision.itemId)!.title = "T079 duplicate branch";
+  if (
+    (await executor.launch(branchCollision, "demo")).status === "needs-human"
+  ) {
+    console.log("PASS: two tickets cannot share one task branch/worktree");
+  } else fail("FAIL: duplicate task branch ownership");
+  const card80 = board.add("PVTI_80", 80);
+  if (
+    (await executor.launch(card80, "demo")).status === "launched" &&
+    executor.activeCount() === 2
+  ) {
+    console.log("PASS: two tickets from one plan can run concurrently");
+  } else fail("FAIL: same-plan concurrency");
 
-const wrongBranchFailure = board.add("PVTI_896", 896);
-await executor.launch(wrongBranchFailure, "demo");
-complete(wrongBranchFailure.itemId, [
-  {
-    taskKey: "T896",
-    itemId: wrongBranchFailure.itemId,
-    status: "failure",
-    error: "Build prerequisites are missing.",
-    attempted: "Checked the generated artifacts.",
-    limitations: "Continuing would produce an invalid build.",
-    workaround: "Keep the partial patch for inspection.",
-    humanAction: "Restore the expected branch and provide the prerequisite.",
-  },
-]);
-const wrongBranchFailureRecord = recordFor(wrongBranchFailure.itemId);
-git(wrongBranchFailureRecord.path, "checkout", "-b", "wrong/probe");
-writeFileSync(
-  join(wrongBranchFailureRecord.path, "wrong-branch-partial.txt"),
-  "keep me\n",
-);
-await executor.reconcile(board.all());
-const wrongBranchFailureComment = (
-  board.comments.get(wrongBranchFailure.itemId) ?? []
-).join("\n");
-if (
-  board.cards.get(wrongBranchFailure.itemId)?.status ===
-    cfg.columns.needs_human &&
-  !recordFor(wrongBranchFailure.itemId).activeRunId &&
-  [
-    "Build prerequisites are missing.",
-    "Checked the generated artifacts.",
-    "Continuing would produce an invalid build.",
-    "Keep the partial patch for inspection.",
-    "Restore the expected branch and provide the prerequisite.",
-    "expected branch task/t896, found wrong/probe",
-  ].every((text) => wrongBranchFailureComment.includes(text)) &&
-  existsSync(
-    join(wrongBranchFailureRecord.path, "wrong-branch-partial.txt"),
+  const stale81 = board.add("PVTI_81", 81);
+  board.cards.get(stale81.itemId)!.status = cfg.columns.backlog;
+  const stale82 = board.add("PVTI_82", 82);
+  board.cards.get(stale82.itemId)!.plan = "changed";
+  const stale83 = board.add("PVTI_83", 83);
+  board.cards.get(stale83.itemId)!.closed = true;
+  const staleResults = await Promise.all([
+    executor.launch(stale81, "demo"),
+    executor.launch(stale82, "demo"),
+    executor.launch(stale83, "demo"),
+  ]);
+  if (staleResults.every((result) => result.status === "skipped"))
+    console.log(
+      "PASS: final refetch rejects status, Plan, and issue-state changes",
+    );
+  else fail("FAIL: final refetch validation");
+  const raced = board.add("PVTI_84", 84);
+  board.claimRaces.add(raced.itemId);
+  if (
+    (await executor.launch(raced, "demo")).status === "skipped" &&
+    board.cards.get(raced.itemId)!.assignees.includes("rival")
+  ) {
+    console.log(
+      "PASS: post-claim refetch detects competing assignee and releases bot",
+    );
+  } else fail("FAIL: post-claim race validation");
+
+  await executor.shutdown();
+  if (
+    [card79.itemId, card80.itemId].every(
+      (itemId) => runFor(itemId).status === "paused",
+    )
+  ) {
+    console.log("PASS: shutdown pauses active managers and preserves records");
+  } else fail("FAIL: shutdown persistence");
+  const completed79 = recordFor(card79.itemId);
+  writeFileSync(join(completed79.path, "ticket-79.txt"), "done\n");
+  git(completed79.path, "add", "ticket-79.txt");
+  git(completed79.path, "commit", "-m", "feat: ticket 79");
+  git(completed79.path, "push", "-u", "origin", completed79.taskBranch);
+  complete(card79.itemId, [
+    {
+      taskKey: "T079",
+      itemId: card79.itemId,
+      status: "success",
+      branch: "task/issue-79",
+      summary: "done",
+    },
+  ]);
+  executor = makeExecutor(true);
+  const restartSummary = await executor.reconcile(board.all());
+  if (
+    board.cards.get(card79.itemId)?.status === cfg.columns.review &&
+    board.cards.get(card79.itemId)?.assignees.length === 0 &&
+    !recordFor(card79.itemId).activeRunId &&
+    restartSummary.resumed === 1 &&
+    runFor(card80.itemId).status === "running"
   )
-)
-  console.log(
-    "PASS: wrong-branch builder failure preserves safety reason and actionable details",
-  );
-else console.log("FAIL: wrong-branch builder failure details");
+    console.log(
+      "PASS: restart consumes completed result and resumes clean paused sibling",
+    );
+  else fail("FAIL: startup completed/resume recovery");
+  const successCommentCount = board.comments.get(card79.itemId)?.length ?? 0;
+  await executor.reconcile(board.all());
+  if ((board.comments.get(card79.itemId)?.length ?? 0) === successCommentCount)
+    console.log("PASS: terminal reconciliation is idempotent");
+  else fail("FAIL: duplicate terminal comment");
 
-const manuallyMoved = board.add("PVTI_895", 895);
-await executor.launch(manuallyMoved, "demo");
-complete(manuallyMoved.itemId, { malformed: true });
-await board.setStatus(manuallyMoved.itemId, cfg.columns.backlog);
-await executor.reconcile(board.all());
-if (
-  board.cards.get(manuallyMoved.itemId)?.status === cfg.columns.backlog &&
-  !recordFor(manuallyMoved.itemId).activeRunId
-) {
-  console.log("PASS: manual status wins over a stale terminal result");
-} else console.log("FAIL: stale terminal result overwrote manual status");
+  const dirty = board.add("PVTI_85", 85);
+  const cleanSibling = board.add("PVTI_851", 851);
+  await executor.launch(dirty, "demo");
+  await executor.launch(cleanSibling, "demo");
+  runFor(dirty.itemId).status = "paused";
+  const dirtyRecord = recordFor(dirty.itemId);
+  const dirtyPath = dirtyRecord.path;
+  const dirtyCommentCount = board.comments.get(dirty.itemId)?.length ?? 0;
+  writeFileSync(join(dirtyPath, "README.md"), "base\npartial\n");
+  writeFileSync(join(dirtyPath, "dirty.txt"), "untracked partial\n");
+  await executor.shutdown();
+  executor = makeExecutor(true);
+  const dirtySummary = await executor.reconcile(board.all());
+  if (
+    board.cards.get(dirty.itemId)?.status === cfg.columns.building &&
+    recordFor(dirty.itemId).activeRunId === dirtyRecord.activeRunId &&
+    runFor(dirty.itemId).status === "running" &&
+    runFor(cleanSibling.itemId).status === "running" &&
+    dirtySummary.resumed >= 2 &&
+    readFileSync(join(dirtyPath, "README.md"), "utf8") === "base\npartial\n" &&
+    readFileSync(join(dirtyPath, "dirty.txt"), "utf8") ===
+      "untracked partial\n" &&
+    (board.comments.get(dirty.itemId)?.length ?? 0) === dirtyCommentCount
+  ) {
+    console.log(
+      "PASS: owned dirty paused worktree resumes with tracked and untracked changes preserved",
+    );
+  } else fail("FAIL: owned dirty paused worktree recovery");
 
-const adopting = board.add("PVTI_90", 90);
-const adoptingTask = buildTasksForWave(cfg, "demo", [adopting])[0];
-const adoptingRecord = worktrees.beginLaunch(
-  worktrees.ensure(adoptingTask, "demo").itemId,
-  Date.now() - 10,
-);
-await board.setStatus(adopting.itemId, cfg.columns.building);
-const adoptedRun = makeRun("run-adopt", {
-  itemId: adopting.itemId,
-  issueNumber: 90,
-  taskKey: "T090",
-});
-stateFor(adoptingRecord.path).runs.set(adoptedRun.runId, adoptedRun);
-executor = makeExecutor(true);
-const adoptedSummary = await executor.reconcile(board.all());
-if (
-  recordFor(adopting.itemId).activeRunId === adoptedRun.runId &&
-  adoptedSummary.adopted === 1
-) {
-  console.log("PASS: launch crash adopts uniquely matching persisted args");
-} else console.log("FAIL: persisted run adoption");
-
-const unstarted = board.add("PVTI_91", 91);
-const unstartedTask = buildTasksForWave(cfg, "demo", [unstarted])[0];
-worktrees.beginLaunch(
-  worktrees.ensure(unstartedTask, "demo").itemId,
-  Date.now(),
-);
-await board.setStatus(unstarted.itemId, cfg.columns.building);
-const unstartedSummary = await executor.reconcile(board.all());
-const unstartedAfter = recordFor(unstarted.itemId);
-if (
-  board.cards.get(unstarted.itemId)?.status === cfg.columns.ready &&
-  !unstartedAfter.launchingAt &&
-  unstartedSummary.needsHuman === 0
-) {
-  console.log("PASS: proven zero-side-effect launch crash returns to Ready");
-} else console.log("FAIL: zero-side-effect launch recovery");
-
-const incident = board.add("PVTI_911", 911, cfg.columns.building);
-const incidentTask = buildTasksForWave(cfg, "demo", [incident])[0];
-const incidentRecord = worktrees.ensure(incidentTask, "demo");
-worktrees.clearExecution(incidentRecord.itemId, "run-incident-a");
-await executor.reconcile(board.all());
-const firstIncidentComments = board.comments.get(incident.itemId)?.length ?? 0;
-await board.setStatus(incident.itemId, cfg.columns.building);
-await executor.reconcile(board.all());
-const repeatedIncidentComments =
-  board.comments.get(incident.itemId)?.length ?? 0;
-worktrees.clearExecution(incident.itemId, "run-incident-b");
-await board.setStatus(incident.itemId, cfg.columns.building);
-await executor.reconcile(board.all());
-const incidentComments = board.comments.get(incident.itemId) ?? [];
-const nextIncidentComments = incidentComments.length;
-if (
-  firstIncidentComments === 1 &&
-  repeatedIncidentComments === 1 &&
-  nextIncidentComments === 2 &&
-  incidentComments.some((comment) =>
-    comment.includes(":run-incident-a:needs-human -->"),
-  ) &&
-  incidentComments.some((comment) =>
-    comment.includes(":run-incident-b:needs-human -->"),
+  const usageLimited = board.add("PVTI_852", 852);
+  await executor.launch(usageLimited, "demo");
+  const usageRun = runFor(usageLimited.itemId);
+  usageRun.status = "paused";
+  usageRun.pauseReason = "usage_limit";
+  const usageRecord = recordFor(usageLimited.itemId);
+  const usageState = stateFor(usageRecord.path);
+  const usageResumes = usageState.resumes;
+  const usageStops = usageState.stops;
+  writeFileSync(join(usageRecord.path, "usage-limit.txt"), "checkpoint\n");
+  const usageSummary = await executor.reconcile(board.all());
+  if (
+    board.cards.get(usageLimited.itemId)?.status === cfg.columns.building &&
+    recordFor(usageLimited.itemId).activeRunId === usageRun.runId &&
+    usageRun.status === "paused" &&
+    usageState.resumes === usageResumes &&
+    usageState.stops === usageStops &&
+    usageSummary.active.some(
+      (active) => active.runId === usageRun.runId && active.status === "paused",
+    ) &&
+    existsSync(join(usageRecord.path, "usage-limit.txt")) &&
+    !board.comments.get(usageLimited.itemId)?.length
   )
-) {
-  console.log("PASS: recovery comments deduplicate per run lineage");
-} else console.log("FAIL: recovery comment run lineage");
+    console.log(
+      "PASS: dirty usage-limit checkpoint stays paused for the scheduler",
+    );
+  else fail("FAIL: dirty usage-limit checkpoint recovery");
 
-const flaky = board.add("PVTI_92", 92);
-await executor.launch(flaky, "demo");
-complete(flaky.itemId, [
-  {
-    taskKey: "T092",
-    itemId: flaky.itemId,
-    status: "success",
-    branch: "task/t092",
-    summary: "done",
-  },
-]);
-board.failStatusOnce.add(flaky.itemId);
-await executor.reconcile(board.all());
-const retainedAfterMutationFailure = !!recordFor(flaky.itemId).activeRunId;
-await executor.reconcile(board.all());
-const flakyMarkers = (board.comments.get(flaky.itemId) ?? []).filter(
-  (comment) => comment.includes("board-agent-run:"),
-);
-if (
-  retainedAfterMutationFailure &&
-  board.cards.get(flaky.itemId)?.status === cfg.columns.review &&
-  flakyMarkers.length === 1
-) {
-  console.log(
-    "PASS: GitHub mutation failure retains run and retries outcome exactly once",
+  const ticketOwnedDirty = board.add("PVTI_853", 853);
+  const ticketOwnedDirtyTask = buildTasksForWave(cfg, "demo", [
+    ticketOwnedDirty,
+  ])[0];
+  const ticketOwnedDirtyRecord = worktrees.ensure(ticketOwnedDirtyTask, "demo");
+  writeFileSync(
+    join(ticketOwnedDirtyRecord.path, "checkpoint.txt"),
+    "ticket-owned\n",
   );
-} else console.log("FAIL: mutation retry/idempotence");
-
-const removed = board.add("PVTI_93", 93);
-await executor.launch(removed, "demo");
-const removedRun = runFor(removed.itemId);
-board.cards.delete(removed.itemId);
-const removedSummary = await executor.reconcile(board.all());
-if (
-  removedRun.status === "aborted" &&
-  !recordFor(removed.itemId).activeRunId &&
-  removedSummary.orphans === 1
-) {
-  console.log(
-    "PASS: a removed Project item stops only its run and frees the global slot",
+  const ticketOwnedDirtyLaunch = await executor.launch(
+    ticketOwnedDirty,
+    "demo",
   );
-} else console.log("FAIL: removed Project item recovery");
+  if (
+    ticketOwnedDirtyLaunch.status === "launched" &&
+    ticketOwnedDirtyLaunch.worktree === ticketOwnedDirtyRecord.path &&
+    board.cards.get(ticketOwnedDirty.itemId)?.status === cfg.columns.building &&
+    recordFor(ticketOwnedDirty.itemId).activeRunId &&
+    existsSync(join(ticketOwnedDirtyRecord.path, "checkpoint.txt")) &&
+    !board.comments.get(ticketOwnedDirty.itemId)?.length
+  )
+    console.log(
+      "PASS: ticket-owned dirty worktree launches without a prior run id",
+    );
+  else fail("FAIL: ticket-owned dirty worktree launch");
 
-const slotCards = [board.add("PVTI_100", 100), board.add("PVTI_101", 101)];
-let slotLaunches = 0;
-const slotExecutor: TicketExecutor = {
-  reconcile: async (): Promise<ReconcileSummary> => ({
-    active: [],
-    resumed: 0,
-    adopted: 0,
-    needsHuman: 0,
-    legacy: 0,
-    orphans: 0,
-    errors: 0,
-  }),
-  launch: async () => {
-    slotLaunches++;
-    return {
-      status: "launched",
-      runId: `slot-${slotLaunches}`,
-      worktree: repo,
+  const completedDirty = board.add("PVTI_854", 854);
+  await executor.launch(completedDirty, "demo");
+  complete(completedDirty.itemId, [
+    {
+      taskKey: "T854",
+      itemId: completedDirty.itemId,
+      status: "success",
+      branch: "task/issue-854",
+      summary: "done",
+    },
+  ]);
+  const completedDirtyRecord = recordFor(completedDirty.itemId);
+  const completedDirtyPath = completedDirtyRecord.path;
+  writeFileSync(join(completedDirtyPath, "completed-dirty.txt"), "unsafe\n");
+  await executor.reconcile(board.all());
+  const completedDirtyComment = (
+    board.comments.get(completedDirty.itemId) ?? []
+  ).join("\n");
+  if (
+    board.cards.get(completedDirty.itemId)?.status ===
+      cfg.columns.needs_human &&
+    !recordFor(completedDirty.itemId).activeRunId &&
+    completedDirtyComment.includes(
+      `board-agent-run:${completedDirtyRecord.activeRunId}:malformed`,
+    ) &&
+    completedDirtyComment.includes("dirty worktree") &&
+    existsSync(join(completedDirtyPath, "completed-dirty.txt"))
+  )
+    console.log("PASS: dirty completed-success worktree still fails closed");
+  else fail("FAIL: dirty completed-success worktree gate");
+
+  const timedOut = board.add("PVTI_38", 38);
+  await executor.launch(timedOut, "demo");
+  const timedOutRun = runFor(timedOut.itemId);
+  const timedOutRunId = timedOutRun.runId;
+  timedOutRun.status = "completed";
+  timedOutRun.result = [null];
+  timedOutRun.agentTimeoutMs = 7200000;
+  timedOutRun.agents = [
+    {
+      id: 1,
+      label: "build T038",
+      prompt: "builder prompt",
+      status: "error",
+      errorCode: WorkflowErrorCode.AGENT_TIMEOUT,
+      error: "RAW provider timeout details must stay private",
+    },
+  ];
+  const timedOutPath = recordFor(timedOut.itemId).path;
+  writeFileSync(
+    join(timedOutPath, "README.md"),
+    "base\npartial timeout work\n",
+  );
+  writeFileSync(join(timedOutPath, "timeout-untracked.txt"), "keep me\n");
+  const timedOutSummary = await executor.reconcile(board.all());
+  const timedOutComment = (board.comments.get(timedOut.itemId) ?? []).join(
+    "\n",
+  );
+  const timedOutCommentCount = board.comments.get(timedOut.itemId)?.length ?? 0;
+  await executor.reconcile(board.all());
+  const timedOutRecord = recordFor(timedOut.itemId);
+  if (
+    timedOutSummary.needsHuman === 1 &&
+    board.cards.get(timedOut.itemId)?.status === cfg.columns.needs_human &&
+    !timedOutRecord.activeRunId &&
+    timedOutRecord.lastRunId === timedOutRunId &&
+    timedOutComment.includes(`board-agent-run:${timedOutRunId}:malformed`) &&
+    timedOutComment.includes("Builder agent timed out after 7200000 ms.") &&
+    timedOutComment.includes("preserve useful changes") &&
+    timedOutComment.includes("address the reported blocker before retrying") &&
+    !timedOutComment.includes("RAW provider timeout details") &&
+    !timedOutComment.includes("dirty worktree") &&
+    !timedOutComment.includes("leave the expected task branch clean") &&
+    readFileSync(join(timedOutPath, "README.md"), "utf8") ===
+      "base\npartial timeout work\n" &&
+    readFileSync(join(timedOutPath, "timeout-untracked.txt"), "utf8") ===
+      "keep me\n" &&
+    (board.comments.get(timedOut.itemId)?.length ?? 0) === timedOutCommentCount
+  ) {
+    console.log(
+      "PASS: completed null timeout outranks dirtiness and preserves partial work",
+    );
+  } else fail("FAIL: completed null timeout reconciliation");
+
+  const validTimeoutAgent = {
+    status: "error",
+    errorCode: "AGENT_TIMEOUT",
+    error: "RAW malformed metadata details",
+  };
+  const malformedAgentCases: Array<{
+    number: number;
+    agents: unknown;
+    timeoutMs?: unknown;
+  }> = [
+    { number: 381, agents: {} },
+    { number: 382, agents: [null] },
+    { number: 383, agents: [{ ...validTimeoutAgent, status: "done" }] },
+    { number: 384, agents: [{ ...validTimeoutAgent, errorCode: "OTHER" }] },
+    { number: 385, agents: [validTimeoutAgent], timeoutMs: 0 },
+    { number: 386, agents: [validTimeoutAgent], timeoutMs: 1.5 },
+    {
+      number: 387,
+      agents: [validTimeoutAgent],
+      timeoutMs: Number.POSITIVE_INFINITY,
+    },
+  ];
+  const malformedAgentRuns: Array<{
+    itemId: string;
+    runId: string;
+    timeout: boolean;
+  }> = [];
+  for (const testCase of malformedAgentCases) {
+    const card = board.add(`PVTI_${testCase.number}`, testCase.number);
+    await executor.launch(card, "demo");
+    const run = runFor(card.itemId);
+    run.status = "completed";
+    run.result = [null];
+    const metadata = run as unknown as {
+      agents: unknown;
+      agentTimeoutMs?: unknown;
     };
-  },
-  activeCount: () => 1,
-  shutdown: async () => undefined,
-};
-const loopDeps: LoopDeps = {
-  cwd: repo,
-  cfg,
-  repoOwner: "test",
-  repoName: "repo",
-  botLogin: "bot",
-  meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
-  callback: () => undefined,
-  listCards: async () => slotCards,
-};
-await new BoardLoop(
-  loopDeps,
-  createLoopState(),
-  slotExecutor,
-  worktrees,
-).tickNow();
-if (slotLaunches === 1)
-  console.log(
-    "PASS: global max_workers subtracts active builders without plan guard",
+    metadata.agents = testCase.agents;
+    if ("timeoutMs" in testCase) metadata.agentTimeoutMs = testCase.timeoutMs;
+    malformedAgentRuns.push({
+      itemId: card.itemId,
+      runId: run.runId,
+      timeout: "timeoutMs" in testCase,
+    });
+  }
+  const malformedAgentSummary = await executor.reconcile(board.all());
+  const malformedAgentGuardsPassed = malformedAgentRuns.every(
+    ({ itemId, runId, timeout }) => {
+      const comment = (board.comments.get(itemId) ?? []).join("\n");
+      const expectedProblem = timeout
+        ? "Builder agent timed out."
+        : "persisted builder result is malformed";
+      return (
+        board.cards.get(itemId)?.status === cfg.columns.needs_human &&
+        comment.includes(`board-agent-run:${runId}:malformed`) &&
+        comment.includes(`**Problem**\n${expectedProblem}\n`) &&
+        !comment.includes("RAW") &&
+        !comment.includes("timed out after")
+      );
+    },
   );
-else console.log("FAIL: global worker slot accounting");
+  if (
+    malformedAgentSummary.needsHuman === malformedAgentCases.length &&
+    malformedAgentSummary.errors === 0 &&
+    malformedAgentGuardsPassed
+  ) {
+    console.log(
+      "PASS: malformed timeout metadata falls back safely and invalid durations are omitted",
+    );
+  } else fail("FAIL: malformed timeout metadata guards");
 
-let recoveryLaunches = 0;
-const recoveryExecutor: TicketExecutor = {
-  ...slotExecutor,
-  launch: async () => {
-    recoveryLaunches++;
-    return { status: "launched", runId: "recovery-slot", worktree: repo };
-  },
-};
-const recoveryLoop = new BoardLoop(
-  loopDeps,
-  createLoopState(),
-  recoveryExecutor,
-  worktrees,
-  undefined,
-  false,
-);
-await recoveryLoop.tickNow();
-recoveryLoop.enableAdmissions();
-await recoveryLoop.tickNow();
-if (recoveryLaunches === 1)
-  console.log(
-    "PASS: startup recovery-only mode reconciles without admitting Ready work until promoted",
-  );
-else console.log("FAIL: recovery-only admission gate");
+  const trustedIdentity = board.add("PVTI_37", 37);
+  await executor.launch(trustedIdentity, "demo");
+  complete(trustedIdentity.itemId, [
+    {
+      taskKey: "37",
+      itemId: "37",
+      status: "success",
+      branch: "task/issue-37",
+      summary: "done",
+    },
+  ]);
+  await executor.reconcile(board.all());
+  if (
+    board.cards.get(trustedIdentity.itemId)?.status === cfg.columns.review &&
+    !recordFor(trustedIdentity.itemId).activeRunId
+  )
+    console.log(
+      "PASS: persisted run identity overrides incorrect echoed identity",
+    );
+  else fail("FAIL: trusted persisted run identity");
 
-const lock = acquireOwnerLock(repo, "bot");
-let secondOwnerRejected = false;
-try {
-  acquireOwnerLock(repo, "bot");
-} catch {
-  secondOwnerRejected = true;
-}
-lock.release();
-const replacement = acquireOwnerLock(repo, "bot");
-replacement.release();
-if (secondOwnerRejected)
-  console.log(
-    "PASS: owner lock rejects a second live local process and releases cleanly",
+  const malformedIdentity = [855, 856, 857].map((number) =>
+    board.add(`PVTI_${number}`, number),
   );
-else console.log("FAIL: owner lock exclusivity");
-writeFileSync(
-  lock.path,
-  JSON.stringify({
-    pid: 999999,
-    hostname: hostname(),
-    token: "stale",
+  for (const card of malformedIdentity) await executor.launch(card, "demo");
+  complete(malformedIdentity[0].itemId, [
+    {
+      taskKey: "T855",
+      itemId: malformedIdentity[0].itemId,
+      status: "success",
+      branch: "task/issue-855",
+    },
+    {
+      taskKey: "T999",
+      itemId: "PVTI_999",
+      status: "failure",
+      error: "extra result",
+    },
+  ]);
+  complete(malformedIdentity[1].itemId, [
+    {
+      taskKey: "T856",
+      itemId: malformedIdentity[1].itemId,
+      status: "success",
+      branch: "task/wrong",
+    },
+  ]);
+  const wrongArgsRun = runFor(malformedIdentity[2].itemId);
+  wrongArgsRun.status = "completed";
+  wrongArgsRun.result = [
+    {
+      taskKey: "T857",
+      itemId: malformedIdentity[2].itemId,
+      status: "success",
+      branch: "task/issue-857",
+    },
+  ];
+  wrongArgsRun.args = {
+    itemId: "PVTI_wrong",
+    issueNumber: 857,
+    taskKey: "T857",
+  };
+  await executor.reconcile(board.all());
+  if (
+    malformedIdentity.every(
+      (card) =>
+        board.cards.get(card.itemId)?.status === cfg.columns.needs_human,
+    )
+  ) {
+    console.log(
+      "PASS: multiple results, wrong branch, and mismatched run args remain quarantined",
+    );
+  } else fail("FAIL: malformed persisted result guards");
+
+  const terminalCards = [86, 87, 88, 89].map((number) =>
+    board.add(`PVTI_${number}`, number),
+  );
+  for (const card of terminalCards) await executor.launch(card, "demo");
+  runFor(terminalCards[0].itemId).status = "failed";
+  runFor(terminalCards[0].itemId).error = "agent failed";
+  runFor(terminalCards[1].itemId).status = "aborted";
+  complete(terminalCards[2].itemId, { malformed: true });
+  const missingRecord = recordFor(terminalCards[3].itemId);
+  stateFor(missingRecord.path).runs.delete(missingRecord.activeRunId!);
+  await executor.reconcile(board.all());
+  if (
+    terminalCards.every(
+      (card) =>
+        board.cards.get(card.itemId)?.status === cfg.columns.needs_human,
+    )
+  ) {
+    console.log(
+      "PASS: failed, aborted, malformed, and missing runs all require human",
+    );
+  } else fail("FAIL: terminal failure policy");
+
+  const explained = board.add("PVTI_894", 894);
+  await executor.launch(explained, "demo");
+  complete(explained.itemId, [
+    {
+      taskKey: "T894",
+      itemId: explained.itemId,
+      status: "failure",
+      error: "Deployment target is missing.",
+      attempted: "Checked repository configuration.",
+      limitations: "Choosing a target would be unsafe.",
+      workaround: "Select staging or production.",
+      humanAction: "Reply with the approved target.",
+    },
+  ]);
+  const explainedPath = recordFor(explained.itemId).path;
+  writeFileSync(join(explainedPath, "README.md"), "base\nstructured partial\n");
+  writeFileSync(join(explainedPath, "structured-untracked.txt"), "keep me\n");
+  await executor.reconcile(board.all());
+  const blockerComment = (board.comments.get(explained.itemId) ?? []).join(
+    "\n",
+  );
+  if (
+    board.cards.get(explained.itemId)?.status === cfg.columns.needs_human &&
+    blockerComment.includes("## ⚠️ Needs human input") &&
+    blockerComment.includes("Deployment target is missing.") &&
+    blockerComment.includes("Checked repository configuration.") &&
+    blockerComment.includes("Choosing a target would be unsafe.") &&
+    blockerComment.includes("Select staging or production.") &&
+    blockerComment.includes("Reply with the approved target.") &&
+    blockerComment.includes("manually move this Project card to `Ready`") &&
+    !blockerComment.includes("dirty worktree") &&
+    readFileSync(join(explainedPath, "README.md"), "utf8") ===
+      "base\nstructured partial\n" &&
+    readFileSync(join(explainedPath, "structured-untracked.txt"), "utf8") ===
+      "keep me\n"
+  )
+    console.log(
+      "PASS: dirty builder failure preserves work and actionable details",
+    );
+  else fail("FAIL: dirty builder failure human guidance");
+
+  const wrongBranchFailure = board.add("PVTI_896", 896);
+  await executor.launch(wrongBranchFailure, "demo");
+  complete(wrongBranchFailure.itemId, [
+    {
+      taskKey: "T896",
+      itemId: wrongBranchFailure.itemId,
+      status: "failure",
+      error: "Build prerequisites are missing.",
+      attempted: "Checked the generated artifacts.",
+      limitations: "Continuing would produce an invalid build.",
+      workaround: "Keep the partial patch for inspection.",
+      humanAction: "Restore the expected branch and provide the prerequisite.",
+    },
+  ]);
+  const wrongBranchFailureRecord = recordFor(wrongBranchFailure.itemId);
+  git(wrongBranchFailureRecord.path, "checkout", "-b", "wrong/probe");
+  writeFileSync(
+    join(wrongBranchFailureRecord.path, "wrong-branch-partial.txt"),
+    "keep me\n",
+  );
+  await executor.reconcile(board.all());
+  const wrongBranchFailureComment = (
+    board.comments.get(wrongBranchFailure.itemId) ?? []
+  ).join("\n");
+  if (
+    board.cards.get(wrongBranchFailure.itemId)?.status ===
+      cfg.columns.needs_human &&
+    !recordFor(wrongBranchFailure.itemId).activeRunId &&
+    [
+      "Build prerequisites are missing.",
+      "Checked the generated artifacts.",
+      "Continuing would produce an invalid build.",
+      "Keep the partial patch for inspection.",
+      "Restore the expected branch and provide the prerequisite.",
+      "expected branch task/issue-896, found wrong/probe",
+    ].every((text) => wrongBranchFailureComment.includes(text)) &&
+    existsSync(join(wrongBranchFailureRecord.path, "wrong-branch-partial.txt"))
+  )
+    console.log(
+      "PASS: wrong-branch builder failure preserves safety reason and actionable details",
+    );
+  else fail("FAIL: wrong-branch builder failure details");
+
+  const manuallyMoved = board.add("PVTI_895", 895);
+  await executor.launch(manuallyMoved, "demo");
+  complete(manuallyMoved.itemId, { malformed: true });
+  await board.setStatus(manuallyMoved.itemId, cfg.columns.backlog);
+  await executor.reconcile(board.all());
+  if (
+    board.cards.get(manuallyMoved.itemId)?.status === cfg.columns.backlog &&
+    !recordFor(manuallyMoved.itemId).activeRunId
+  ) {
+    console.log("PASS: manual status wins over a stale terminal result");
+  } else fail("FAIL: stale terminal result overwrote manual status");
+
+  const adopting = board.add("PVTI_90", 90);
+  const adoptingTask = buildTasksForWave(cfg, "demo", [adopting])[0];
+  const adoptingRecord = worktrees.beginLaunch(
+    worktrees.ensure(adoptingTask, "demo").itemId,
+    Date.now() - 10,
+  );
+  await board.setStatus(adopting.itemId, cfg.columns.building);
+  const adoptedRun = makeRun("run-adopt", {
+    itemId: adopting.itemId,
+    issueNumber: 90,
+    taskKey: "T090",
+  });
+  stateFor(adoptingRecord.path).runs.set(adoptedRun.runId, adoptedRun);
+  executor = makeExecutor(true);
+  const adoptedSummary = await executor.reconcile(board.all());
+  if (
+    recordFor(adopting.itemId).activeRunId === adoptedRun.runId &&
+    adoptedSummary.adopted === 1
+  ) {
+    console.log("PASS: launch crash adopts uniquely matching persisted args");
+  } else fail("FAIL: persisted run adoption");
+
+  const unstarted = board.add("PVTI_91", 91);
+  const unstartedTask = buildTasksForWave(cfg, "demo", [unstarted])[0];
+  worktrees.beginLaunch(
+    worktrees.ensure(unstartedTask, "demo").itemId,
+    Date.now(),
+  );
+  await board.setStatus(unstarted.itemId, cfg.columns.building);
+  const unstartedSummary = await executor.reconcile(board.all());
+  const unstartedAfter = recordFor(unstarted.itemId);
+  if (
+    board.cards.get(unstarted.itemId)?.status === cfg.columns.ready &&
+    !unstartedAfter.launchingAt &&
+    unstartedSummary.needsHuman === 0
+  ) {
+    console.log("PASS: proven zero-side-effect launch crash returns to Ready");
+  } else fail("FAIL: zero-side-effect launch recovery");
+
+  const incident = board.add("PVTI_911", 911, cfg.columns.building);
+  const incidentTask = buildTasksForWave(cfg, "demo", [incident])[0];
+  const incidentRecord = worktrees.ensure(incidentTask, "demo");
+  worktrees.clearExecution(incidentRecord.itemId, "run-incident-a");
+  await executor.reconcile(board.all());
+  const firstIncidentComments =
+    board.comments.get(incident.itemId)?.length ?? 0;
+  await board.setStatus(incident.itemId, cfg.columns.building);
+  await executor.reconcile(board.all());
+  const repeatedIncidentComments =
+    board.comments.get(incident.itemId)?.length ?? 0;
+  worktrees.clearExecution(incident.itemId, "run-incident-b");
+  await board.setStatus(incident.itemId, cfg.columns.building);
+  await executor.reconcile(board.all());
+  const incidentComments = board.comments.get(incident.itemId) ?? [];
+  const nextIncidentComments = incidentComments.length;
+  if (
+    firstIncidentComments === 1 &&
+    repeatedIncidentComments === 1 &&
+    nextIncidentComments === 2 &&
+    incidentComments.some((comment) =>
+      comment.includes(":run-incident-a:needs-human -->"),
+    ) &&
+    incidentComments.some((comment) =>
+      comment.includes(":run-incident-b:needs-human -->"),
+    )
+  ) {
+    console.log("PASS: recovery comments deduplicate per run lineage");
+  } else fail("FAIL: recovery comment run lineage");
+
+  const flaky = board.add("PVTI_92", 92);
+  await executor.launch(flaky, "demo");
+  complete(flaky.itemId, [
+    {
+      taskKey: "T092",
+      itemId: flaky.itemId,
+      status: "success",
+      branch: "task/issue-92",
+      summary: "done",
+    },
+  ]);
+  board.failStatusOnce.add(flaky.itemId);
+  await executor.reconcile(board.all());
+  const retainedAfterMutationFailure = !!recordFor(flaky.itemId).activeRunId;
+  await executor.reconcile(board.all());
+  const flakyMarkers = (board.comments.get(flaky.itemId) ?? []).filter(
+    (comment) => comment.includes("board-agent-run:"),
+  );
+  if (
+    retainedAfterMutationFailure &&
+    board.cards.get(flaky.itemId)?.status === cfg.columns.review &&
+    flakyMarkers.length === 1
+  ) {
+    console.log(
+      "PASS: GitHub mutation failure retains run and retries outcome exactly once",
+    );
+  } else fail("FAIL: mutation retry/idempotence");
+
+  const removed = board.add("PVTI_93", 93);
+  await executor.launch(removed, "demo");
+  const removedRun = runFor(removed.itemId);
+  board.cards.delete(removed.itemId);
+  const removedSummary = await executor.reconcile(board.all());
+  if (
+    removedRun.status === "aborted" &&
+    !recordFor(removed.itemId).activeRunId &&
+    removedSummary.orphans === 1
+  ) {
+    console.log(
+      "PASS: a removed Project item stops only its run and frees the global slot",
+    );
+  } else fail("FAIL: removed Project item recovery");
+
+  // Loop admission starts from supported state; keep the earlier corrupt-record
+  // evidence untouched in its separate executor-recovery fixture.
+  const slotRepo = join(root, "slot-repo");
+  mkdirSync(slotRepo);
+  git(slotRepo, "init", "-b", "main");
+  const slotWorktrees = new TicketWorktrees(slotRepo);
+  const slotCards = [board.add("PVTI_100", 100), board.add("PVTI_101", 101)];
+  let slotLaunches = 0;
+  const slotExecutor: TicketExecutor = {
+    reconcile: async (): Promise<ReconcileSummary> => ({
+      active: [],
+      resumed: 0,
+      adopted: 0,
+      needsHuman: 0,
+      orphans: 0,
+      errors: 0,
+    }),
+    finalizeClosed: async () => ({ status: "skipped", reason: "test" }),
+    launch: async () => {
+      slotLaunches++;
+      return {
+        status: "launched",
+        runId: `slot-${slotLaunches}`,
+        worktree: repo,
+      };
+    },
+    activeCount: () => 1,
+    shutdown: async () => undefined,
+  };
+  const loopDeps: LoopDeps = {
+    cwd: slotRepo,
+    cfg,
+    repoOwner: "test",
+    repoName: "repo",
     botLogin: "bot",
-    startedAt: new Date(0).toISOString(),
-  }),
-);
-const reclaimed = acquireOwnerLock(repo, "bot");
-reclaimed.release();
-console.log("PASS: owner lock reclaims a dead same-host process");
-writeFileSync(
-  lock.path,
-  JSON.stringify({
-    pid: 999999,
-    hostname: "another-host",
-    token: "foreign",
-    botLogin: "bot",
-    startedAt: new Date(0).toISOString(),
-  }),
-);
-let foreignOwnerRejected = false;
-try {
-  acquireOwnerLock(repo, "bot");
-} catch {
-  foreignOwnerRejected = true;
+    meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
+    callback: () => undefined,
+    listCards: async () => slotCards,
+  };
+  await new BoardLoop(
+    loopDeps,
+    createLoopState(),
+    slotExecutor,
+    slotWorktrees,
+  ).tickNow();
+  if (slotLaunches === 1)
+    console.log(
+      "PASS: global max_workers subtracts active builders without plan guard",
+    );
+  else fail("FAIL: global worker slot accounting");
+
+  let recoveryLaunches = 0;
+  const recoveryExecutor: TicketExecutor = {
+    ...slotExecutor,
+    launch: async () => {
+      recoveryLaunches++;
+      return { status: "launched", runId: "recovery-slot", worktree: repo };
+    },
+  };
+  const recoveryLoop = new BoardLoop(
+    loopDeps,
+    createLoopState(),
+    recoveryExecutor,
+    slotWorktrees,
+    undefined,
+    false,
+  );
+  await recoveryLoop.tickNow();
+  recoveryLoop.enableAdmissions();
+  await recoveryLoop.tickNow();
+  if (recoveryLaunches === 1)
+    console.log(
+      "PASS: startup recovery-only mode reconciles without admitting Ready work until promoted",
+    );
+  else fail("FAIL: recovery-only admission gate");
+
+  const lock = acquireOwnerLock(slotRepo, "bot");
+  let secondOwnerRejected = false;
+  try {
+    acquireOwnerLock(slotRepo, "bot");
+  } catch {
+    secondOwnerRejected = true;
+  }
+  lock.release();
+  const replacement = acquireOwnerLock(slotRepo, "bot");
+  replacement.release();
+  if (secondOwnerRejected)
+    console.log(
+      "PASS: owner lock rejects a second live local process and releases cleanly",
+    );
+  else fail("FAIL: owner lock exclusivity");
+  writeFileSync(
+    lock.path,
+    JSON.stringify({
+      pid: 999999,
+      hostname: hostname(),
+      token: "stale",
+      botLogin: "bot",
+      startedAt: new Date(0).toISOString(),
+    }),
+  );
+  const reclaimed = acquireOwnerLock(slotRepo, "bot");
+  reclaimed.release();
+  console.log("PASS: owner lock reclaims a dead same-host process");
+  writeFileSync(
+    lock.path,
+    JSON.stringify({
+      pid: 999999,
+      hostname: "another-host",
+      token: "foreign",
+      botLogin: "bot",
+      startedAt: new Date(0).toISOString(),
+    }),
+  );
+  let foreignOwnerRejected = false;
+  try {
+    acquireOwnerLock(slotRepo, "bot");
+  } catch {
+    foreignOwnerRejected = true;
+  }
+  rmSync(lock.path, { force: true });
+  if (foreignOwnerRejected)
+    console.log("PASS: owner lock fails closed for a different hostname");
+  else fail("FAIL: cross-host owner lock");
 }
-rmSync(lock.path, { force: true });
-if (foreignOwnerRejected)
-  console.log("PASS: owner lock fails closed for a different hostname");
-else console.log("FAIL: cross-host owner lock");
+
+// Real Git + real executor + real BoardLoop; only the remote board and builders
+// are offline adapters. Every repository/ref below belongs to this TMP_DIR.
+let finalSequence = 0;
+function finalFixture(
+  strategy: Config["task_merge_strategy"] = "squash",
+  aiReview = false,
+) {
+  const dir = join(root, `final-executor-${++finalSequence}`);
+  const remote = join(dir, "origin.git");
+  const checkout = join(dir, "repo");
+  mkdirSync(checkout, { recursive: true });
+  git(dir, "init", "--bare", remote);
+  git(checkout, "init", "-b", "main");
+  git(checkout, "config", "user.email", "test@example.com");
+  git(checkout, "config", "user.name", "Test");
+  writeFileSync(join(checkout, ".gitignore"), ".pi/\n");
+  writeFileSync(join(checkout, "base.txt"), "base\n");
+  git(checkout, "add", ".");
+  git(checkout, "commit", "-m", "base");
+  git(checkout, "remote", "add", "origin", remote);
+  git(checkout, "push", "-u", "origin", "main");
+  const finalCfg: Config = {
+    ...cfg,
+    task_merge_strategy: strategy,
+    review: { ...cfg.review, enabled: aiReview },
+    safety: { ...cfg.safety, require_clean_worktree: true },
+  };
+  const finalBoard = new FakeBoard();
+  const card = finalBoard.add(
+    `FINAL_${finalSequence}`,
+    2000 + finalSequence,
+    cfg.columns.done,
+  );
+  finalBoard.cards.get(card.itemId)!.closed = true;
+  card.closed = true;
+  const store = new TicketWorktrees(checkout);
+  const record = store.ensure(
+    buildTasksForWave(finalCfg, "demo", [card])[0],
+    "demo",
+  );
+  writeFileSync(join(record.path, "accepted.txt"), "approved exact content\n");
+  git(record.path, "add", "accepted.txt");
+  git(record.path, "commit", "-m", "accepted change");
+  git(record.path, "push", "-u", "origin", record.taskBranch);
+  const taskSha = git(record.path, "rev-parse", "HEAD");
+  const baseSha = git(checkout, "rev-parse", "HEAD");
+  let managers = 0;
+  let ensures = 0;
+  const make = () => {
+    const finalStore = new TicketWorktrees(checkout);
+    finalStore.ensure = () => {
+      ensures++;
+      throw new Error("finalization must never ensure/recreate a worktree");
+    };
+    return new ManagedTicketExecutor({
+      cwd: checkout,
+      cfg: finalCfg,
+      botLogin: "bot",
+      repoOwner: "test",
+      repoName: "repo",
+      board: finalBoard,
+      worktrees: finalStore,
+      callback: () => undefined,
+      createManager: () => {
+        managers++;
+        throw new Error("finalization must never create a builder manager");
+      },
+    });
+  };
+  const tip = (branch = "main") =>
+    git(checkout, "ls-remote", "origin", `refs/heads/${branch}`).split(
+      /\s+/,
+    )[0];
+  const assertNoAdmissions = () => {
+    assert.equal(finalBoard.claims, 0);
+    assert.equal(finalBoard.releases, 0);
+    assert.equal(finalBoard.comments.size, 0);
+    assert.equal(managers, 0);
+    assert.equal(ensures, 0);
+  };
+  return {
+    checkout,
+    remote,
+    finalCfg,
+    finalBoard,
+    card,
+    store,
+    record,
+    taskSha,
+    baseSha,
+    make,
+    tip,
+    assertNoAdmissions,
+  };
+}
+
+for (const strategy of ["squash", "merge"] as const) {
+  const f = finalFixture(strategy);
+  assert.equal(_DEFAULTS.review.enabled, false);
+  assert.equal(f.store.read(f.card.itemId)!.reviewedTaskSha, undefined);
+  const actual = f.make();
+  const loop = new BoardLoop(
+    {
+      cwd: f.checkout,
+      cfg: f.finalCfg,
+      repoOwner: "test",
+      repoName: "repo",
+      botLogin: "bot",
+      meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
+      callback: () => undefined,
+      listCards: async () => f.finalBoard.all(),
+    },
+    createLoopState(),
+    actual,
+    f.store,
+  );
+  await loop.tickNow();
+  const result = f.tip();
+  assert.notEqual(
+    result,
+    f.baseSha,
+    "closed Done must reach finalization through the real loop/executor",
+  );
+  assert.equal(
+    git(f.checkout, "show", `${result}:accepted.txt`),
+    "approved exact content",
+  );
+  assert.equal(
+    git(f.checkout, "show", "-s", "--format=%P", result),
+    strategy === "merge" ? `${f.baseSha} ${f.taskSha}` : f.baseSha,
+  );
+  assert.equal(
+    git(f.checkout, "show", "-s", "--format=%T", result),
+    git(f.checkout, "rev-parse", `${f.taskSha}^{tree}`),
+  );
+  assert.equal(f.store.has(f.card.itemId), false);
+  assert.equal(existsSync(f.record.path), false);
+  assert.equal(f.tip(f.record.taskBranch), "");
+  assert.equal(git(f.checkout, "rev-parse", "HEAD"), f.baseSha);
+  assert.equal(git(f.checkout, "branch", "--show-current"), "main");
+  assert.equal(git(f.checkout, "status", "--porcelain"), "");
+  assert.throws(() =>
+    git(
+      f.checkout,
+      "rev-parse",
+      "--verify",
+      `refs/heads/${f.record.taskBranch}`,
+    ),
+  );
+  await loop.tickNow();
+  await loop.tickNow();
+  assert.equal(f.tip(), result);
+  assert.deepEqual(await f.make().finalizeClosed(f.card), {
+    status: "skipped",
+    reason: "already finalized",
+  });
+  assert.equal(
+    git(
+      f.checkout,
+      "log",
+      "--format=%H",
+      "--fixed-strings",
+      `--grep=Board-Agent-Item: ${f.card.itemId}`,
+      "origin/main",
+    ),
+    result,
+  );
+  f.assertNoAdmissions();
+  console.log(
+    `PASS: closed Done ${strategy} E2E finalizes the exact SHA without claim or worktree recreation; repeated ticks/restart are no-ops`,
+  );
+}
+
+{
+  const f = finalFixture();
+  const expected = structuredClone(f.card);
+  const mutations: Array<Partial<Card>> = [
+    { closed: false },
+    { status: cfg.columns.ready },
+    { number: 9999 },
+    { itemId: "DIFFERENT" },
+    { plan: "changed" },
+    { type: "Story" },
+    { contentType: "PullRequest" },
+    { contentType: "DraftIssue" },
+    { repoOwner: "other" },
+    { repoName: "elsewhere" },
+  ];
+  for (const mutation of mutations) {
+    f.finalBoard.cards.set(expected.itemId, { ...expected, ...mutation });
+    const outcome = await f.make().finalizeClosed(expected);
+    assert.equal(outcome.status, "skipped", JSON.stringify(mutation));
+    assert.equal(f.tip(), f.baseSha);
+    assert.equal(f.store.read(expected.itemId)!.finalization, undefined);
+    assert.ok(existsSync(f.record.path));
+  }
+  f.finalBoard.cards.delete(expected.itemId);
+  assert.equal((await f.make().finalizeClosed(expected)).status, "skipped");
+  f.finalBoard.cards.set(expected.itemId, expected);
+  const fresh = f.finalBoard.getCard;
+  f.finalBoard.getCard = async () => {
+    throw new Error("fresh read unavailable");
+  };
+  assert.deepEqual(await f.make().finalizeClosed(expected), {
+    status: "blocked",
+    reason: "fresh card read failed: fresh read unavailable",
+  });
+  f.finalBoard.getCard = fresh;
+  f.assertNoAdmissions();
+  console.log(
+    "PASS: finalizer fresh read rejects identity, Plan, repository, type, state drift, removal and read errors before any mutation",
+  );
+
+  const file = join(
+    f.checkout,
+    ".pi",
+    "board-agent",
+    "ticket-worktrees",
+    `${expected.itemId.toLowerCase()}.json`,
+  );
+  const original = readFileSync(file, "utf8");
+  for (const patch of [
+    { issueNumber: 9999 },
+    { itemId: "OTHER" },
+    { plan: "other" },
+    { taskBranch: "unrelated" },
+    { baseBranch: "other" },
+    { path: f.checkout },
+    { schemaVersion: 2 },
+    { activeRunId: "still-running" },
+    { launchingAt: 0 },
+  ]) {
+    writeFileSync(file, JSON.stringify({ ...f.record, ...patch }));
+    assert.equal(
+      (await f.make().finalizeClosed(expected)).status,
+      "blocked",
+      JSON.stringify(patch),
+    );
+    assert.equal(f.tip(), f.baseSha);
+    assert.ok(existsSync(f.record.path));
+  }
+  writeFileSync(file, "{ corrupt");
+  assert.equal((await f.make().finalizeClosed(expected)).status, "blocked");
+  assert.equal(readFileSync(file, "utf8"), "{ corrupt");
+  rmSync(file);
+  assert.equal((await f.make().finalizeClosed(expected)).status, "blocked");
+  assert.equal(existsSync(file), false);
+  writeFileSync(file, original);
+  f.assertNoAdmissions();
+  console.log(
+    "PASS: missing/corrupt/legacy and identity/path/active-run record guards fail closed without recreation",
+  );
+}
+{
+  const f = finalFixture("merge", true);
+  const blocked = await f.make().finalizeClosed(f.card);
+  assert.equal(blocked.status, "blocked");
+  assert.match(
+    blocked.status === "blocked" ? blocked.reason : "",
+    /no persisted reviewed task SHA/,
+  );
+  assert.equal(f.tip(), f.baseSha);
+  f.store.setReviewedTaskSha(f.card.itemId, f.taskSha);
+  const done = await f.make().finalizeClosed(f.card);
+  assert.equal(done.status, "finalized");
+  f.assertNoAdmissions();
+  console.log(
+    "PASS: enabling AI review requires its persisted exact-SHA approval, while the disabled default does not",
+  );
+}
+{
+  const f = finalFixture();
+  const journal = {
+    targetBranch: "main",
+    baseSha: f.baseSha,
+    taskSha: f.taskSha,
+  };
+  f.store.update(f.card.itemId, (record) => ({
+    ...record,
+    finalization: journal,
+  }));
+  const before = JSON.stringify(f.store.read(f.card.itemId));
+  const openReady = { ...f.card, closed: false, status: cfg.columns.ready };
+  f.finalBoard.cards.set(f.card.itemId, openReady);
+  const actual = f.make();
+  const launch = await actual.launch(openReady, "demo");
+  assert.equal(launch.status, "skipped");
+  assert.match(
+    launch.status === "skipped" ? launch.reason : "",
+    /pending finalization/,
+  );
+  await actual.reconcile(f.finalBoard.all());
+  await actual.reconcile(f.finalBoard.all());
+  assert.equal(JSON.stringify(f.store.read(f.card.itemId)), before);
+  assert.equal(f.tip(), f.baseSha);
+  f.assertNoAdmissions();
+  console.log(
+    "PASS: reopened Ready tickets cannot erase or resume builders over pending finalization, including repeated reconciliation",
+  );
+}
+
+{
+  const f = finalFixture();
+  const hook = join(f.remote, "hooks", "pre-receive");
+  writeFileSync(
+    hook,
+    `#!/bin/sh\nwhile read old new ref; do\n if [ "$ref" = refs/heads/${f.record.taskBranch} ] && [ "$new" = 0000000000000000000000000000000000000000 ]; then exit 1; fi\ndone\nexit 0\n`,
+  );
+  chmodSync(hook, 0o755);
+  const first = await f.make().finalizeClosed(f.card);
+  assert.equal(first.status, "blocked");
+  const saved = f.store.read(f.card.itemId)!.finalization!;
+  assert.equal(f.tip(), saved.resultSha);
+  assert.equal(existsSync(f.record.path), false);
+  assert.equal(f.tip(f.record.taskBranch), f.taskSha);
+  assert.throws(() =>
+    git(
+      f.checkout,
+      "rev-parse",
+      "--verify",
+      `refs/heads/${f.record.taskBranch}`,
+    ),
+  );
+  rmSync(hook);
+  const restarted = f.make();
+  const outcome = await restarted.finalizeClosed(f.card);
+  assert.deepEqual(outcome, {
+    status: "finalized",
+    resultSha: saved.resultSha,
+  });
+  assert.equal(f.tip(), saved.resultSha);
+  assert.equal(f.tip(f.record.taskBranch), "");
+  assert.equal(f.store.has(f.card.itemId), false);
+  assert.equal(existsSync(f.record.path), false);
+  assert.deepEqual(await restarted.finalizeClosed(f.card), {
+    status: "skipped",
+    reason: "already finalized",
+  });
+  f.assertNoAdmissions();
+  console.log(
+    "PASS: executor restart after a pushed result and partial cleanup retries only remaining cleanup and is idempotent",
+  );
+}
+{
+  const f = finalFixture();
+  git(f.checkout, "worktree", "remove", f.record.path);
+  const actual = f.make();
+  const outcome = await actual.finalizeClosed(f.card);
+  assert.equal(outcome.status, "blocked");
+  assert.match(
+    outcome.status === "blocked" ? outcome.reason : "",
+    /missing worktree/,
+  );
+  assert.equal((await actual.finalizeClosed(f.card)).status, "blocked");
+  assert.equal(f.tip(), f.baseSha);
+  assert.equal(existsSync(f.record.path), false);
+  assert.ok(f.store.has(f.card.itemId));
+  f.assertNoAdmissions();
+  console.log(
+    "PASS: executor never recreates a missing worktree for a closed Done ticket",
+  );
+}
+{
+  const f = finalFixture();
+  const journal = {
+    targetBranch: "main",
+    baseSha: f.baseSha,
+    taskSha: f.taskSha,
+  };
+  // Emulate a mixed journal written by the earlier unsafe implementation.
+  const file = join(
+    f.checkout,
+    ".pi",
+    "board-agent",
+    "ticket-worktrees",
+    `${f.card.itemId.toLowerCase()}.json`,
+  );
+  writeFileSync(
+    file,
+    JSON.stringify({
+      ...f.record,
+      finalization: journal,
+      activeRunId: "old-mixed-run",
+      activeRunStartedAt: Date.now(),
+    }),
+  );
+  const before = readFileSync(file, "utf8");
+  const actual = f.make();
+  assert.equal((await actual.finalizeClosed(f.card)).status, "blocked");
+  let boardReads = 0;
+  const loop = new BoardLoop(
+    {
+      cwd: f.checkout,
+      cfg: f.finalCfg,
+      botLogin: "bot",
+      repoOwner: "test",
+      repoName: "repo",
+      meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
+      callback: () => undefined,
+      listCards: async () => {
+        boardReads++;
+        return f.finalBoard.all();
+      },
+    },
+    createLoopState(),
+    actual,
+    f.store,
+  );
+  await assert.rejects(loop.tickNow(), /Unsupported pre-0.2.0/);
+  assert.equal(boardReads, 0);
+  assert.equal(f.store.read(f.card.itemId), undefined);
+  assert.equal(readFileSync(file, "utf8"), before);
+  assert.equal(f.finalBoard.cards.get(f.card.itemId)!.status, cfg.columns.done);
+  assert.equal(f.tip(), f.baseSha);
+  f.assertNoAdmissions();
+  console.log(
+    "PASS: invalid mixed finalization/execution state stays read-only; no inferred builder ownership or automatic migration",
+  );
+}

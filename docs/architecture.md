@@ -1,151 +1,239 @@
 # Architecture
 
-`pi-board-agent` polls a GitHub Project, but ticket execution is durable and per-ticket. The board loop selects work; `TicketExecutor` owns claims, persistent worktrees, WorkflowManager runs, recovery, and terminal transitions.
+`pi-board-agent` is a foreground Pi extension with a durable, per-Issue
+execution model. The GitHub Project is the scheduler UI; local atomic records
+and pi-dynamic-workflows journals are the recovery source of truth.
 
 ## Module map
 
 ```text
-src/index.ts
-├── lifecycle hooks, commands, project metadata validation
-├── owner-lock.ts             one local repo owner (`fs.open(..., "wx")`)
-└── loop.ts                   reconcile/finalize, then share worker slots
-    ├── ticket-executor.ts    claim → worktree → managed run → recovery/outcome
-    │   ├── ticket-worktree.ts  v2 ticket execution record + retained worktree
-    │   ├── inflight.ts         legacy lock detection/archive only
-    │   └── pi-dynamic-workflows WorkflowManager + UsageLimitScheduler
-    ├── refine.ts / review.ts / watchdog.ts
-    └── plan.ts               plan progress summaries
+src/index.ts                 commands, lifecycle, revision/state gates
+├── config.ts                strict 0.2.0 schema and origin identity
+├── owner-lock.ts            one local owner via atomic file creation
+├── unsupported-state.ts     read-only legacy/v1/v2 detector
+└── loop.ts                  fair selection and bounded admissions
+    ├── ticket-executor.ts   claim, launch, reconcile, finalize
+    │   ├── ticket-worktree.ts  schema-v3 record + exact-SHA Git operations
+    │   └── WorkflowManager     durable one-agent builder journal
+    ├── refine.ts            Story/Task design and Story creation journal
+    ├── review.ts            detached fresh-SHA review worktree
+    ├── watchdog.ts          CI monitoring and trusted mention replies
+    └── plan.ts              read-only board summaries
+
+process-runner.ts            shared non-interactive, deadline-bound Git/gh calls
 ```
 
-`dispatch.ts` only normalizes persisted builder results. It no longer starts workflows or stores in-memory promises.
+`dispatch.ts` only validates persisted builder results. `plan.ts` never creates
+branches or pull requests.
 
-## Durable state
+## Identity boundary
 
-Each ticket has one atomic JSON record under `.pi/board-agent/ticket-worktrees/`:
+A mutable candidate must satisfy all of these conditions:
+
+1. Project content `__typename` is `Issue`.
+2. Its repository owner/name equals the repository parsed from `origin`.
+3. Its configured `Type` is exactly `Story` or `Task` for the selected lane.
+4. Lane-specific status, open/closed state, Plan, and claim conditions match.
+
+The Project owner is independent: Project GraphQL operations use
+`project.owner`; Issue operations use the origin repository. Pull requests,
+drafts, cross-repository Issues, and untyped items remain visible for summary
+purposes but cannot enter a mutation lane.
+
+Every claim is followed by a complete fresh Project-item read. Task design and
+review perform another read after their agent finishes and before any write.
+
+## Durable ticket record
+
+Each ticket has one atomically replaced JSON file at
+`.pi/board-agent/ticket-worktrees/<safe-item-id>.json`:
 
 ```ts
 interface TicketExecutionRecord {
-  schemaVersion: 2;
+  schemaVersion: 3;
   itemId: string;
   issueNumber: number;
   taskKey: string;
   plan: string;
-  taskBranch: string;
-  planBranch: string;
+  taskBranch: string; // task/issue-<issueNumber>
+  baseBranch: string;
   path: string;
   createdAt: number;
   launchingAt?: number;
   activeRunId?: string;
   activeRunStartedAt?: number;
   lastRunId?: string;
+  reviewedTaskSha?: string;
+  finalization?: {
+    targetBranch: string;
+    baseSha: string;
+    taskSha: string;
+    resultSha?: string;
+  };
 }
 ```
 
-The record associates a card, retained worktree, and managed run. New records use
-`branches.base` as `planBranch`; older plan-based records keep their original
-baseline so retained worktrees can resume safely. WorkflowManager's persisted
-run is the execution truth for status, journal, result, and lease. Legacy v1
-worktree records remain readable and are upgraded when reused.
+Only schema v3 is accepted. Legacy inflight files, malformed files, and v1/v2
+records are reported read-only by startup, `lint`, and `run`; 0.2.0 never moves,
+archives, upgrades, or deletes them.
 
-WorkflowManager stores runs outside the repository under Pi's workflow project storage. One manager is created lazily per ticket worktree with `concurrency=1` and `maxAgents=1`. Its usage-limit scheduler remains enabled.
+WorkflowManager stores each run outside the repository in Pi's workflow
+storage. One manager with one agent owns each persistent ticket worktree.
 
-## Tick flow
-
-```text
-listCards()
-  ↓
-TicketExecutor.reconcile(cards)
-  ├─ adopt a run persisted during the launch write window
-  ├─ resume a clean interrupted run
-  ├─ apply a completed result once
-  ├─ quarantine dirty/missing/malformed/failed runs in Needs Human
-  └─ quarantine legacy inflight and record-less In Progress cards individually
-  ↓
-if activeCount() < max_workers: run the Needs Design Task gate/refinement lane
-  ↓
-run Story refinement, watchdog, and direct-to-base finalization lanes
-  ↓
-build Review and Ready candidate lists
-  ↓
-available = max(0, max_workers - active builders)
-  ├─ reserve one slot when Review work is pending
-  └─ give every other available slot to builders
-  ↓
-launch Ready task builders in the background
-  ↓
-await at most one claimed Review card
-  ↓
-recount active builders and immediately refill Ready slots
-```
-
-`max_workers` is shared by task design, active builders, and the current reviewer.
-Task design remains a foreground workflow and starts only when a worker slot is
-available. Builders run in the background, so the reviewer overlaps their work.
-The tick awaits the single reviewer lane but never waits for a builder; later
-ticks reconcile persisted builder state.
-
-## Task design gate
-
-An open non-Story Task entering `Needs Design` first receives one requirements-gate marker under a temporary assignee claim. Only well-formed marker comments authored by the configured bot login (matched case-insensitively) affect this state machine. The bot then waits without claiming until an `OWNER`, `MEMBER`, or `COLLABORATOR` replies after the latest authentic gate or task-design-question marker. An authentic completed marker closes that request; moving the Task back to `Needs Design` starts a new gate.
-
-After claiming and before running the designer, the loop re-reads the Project item and every issue comment. Before any post-design write, it re-reads both again and requires the issue to remain open and in `Needs Design`, the title and body to be unchanged, no competing assignee, and the complete trusted-comment input snapshot (timestamps, authors, and bodies) to remain unchanged. A status change prevents every write; a changed body or decision is left for the next tick. Open questions create a fresh request boundary.
-
-For a resolved contract, the bot writes the authentic audit marker first, updates the issue body second, and exposes `Ready` last. The marker is the durable decision-consumption boundary, not a transactional or exactly-once guarantee. A failure before that marker is visible may retry the decision. Once it is visible, the same decision is not replayed: if the card remains in or returns to `Needs Design`, the next tick opens a fresh gate so a maintainer can inspect the current body and explicitly authorize recovery. An ambiguous `Ready` response is safe because the body and marker were already written.
-
-Candidates start at `tickCount % candidates.length`, so one failing Task cannot starve its siblings. Each tick invokes at most one Task designer.
-
-## Launch ordering
-
-1. Re-read the Project item and verify it is open, Ready, on the expected Plan, unclaimed, and has no active run.
-2. Add the bot assignee, then re-read again. A competing assignee or changed card releases the bot and cancels launch.
-3. Create/reuse the retained ticket worktree and atomically set `launchingAt`.
-4. Move the card to In Progress.
-5. Call `WorkflowManager.startInBackground()`. The manager persists the run before starting its agent.
-6. Atomically write `activeRunId` and clear `launchingAt`.
-
-If the process dies between steps 5 and 6, persisted args (`itemId`, `issueNumber`, `taskKey`) identify the unique run for adoption. If no run exists, the card returns to Ready only when the worktree is clean and the task branch has no delta. Unknown side effects go to Needs Human.
-
-## Recovery policy
-
-| Persisted state | Action |
-| --- | --- |
-| running with a live lease | Keep In Progress |
-| paused, expected branch, clean worktree | Resume (usage-limit pauses wait for the built-in scheduler) |
-| completed with one valid success result | Comment once, move to Review, release assignee, clear active association |
-| builder failure, failed/aborted run, malformed/missing run | Needs Human |
-| paused/completed worktree dirty or branch/path mismatch | Needs Human; retain worktree |
-| card manually moved out of In Progress | Stop stale run and preserve the manual status; Ready is accepted only when clean |
-| In Progress without an execution record | Needs Human for that card only |
-| Project item removed while active | Stop its run, clear the active association, retain the worktree |
-
-Outcome comments use `<!-- board-agent-run:<runId>:<outcome> -->`, so a retry after a GitHub mutation failure does not duplicate comments. The active record is cleared only after all terminal mutations succeed.
-
-## Process lifecycle
-
-`owner.lock` contains pid, hostname, bot identity, and a random token. A live local owner or any different-host owner fails closed; a dead same-host pid can be reclaimed.
-
-`BoardLoop.stop()` is asynchronous: it stops admissions and new ticks, waits for the current tick (including its reviewer), pauses managed runs and waits for their leases to settle, then releases the owner lock. `session_shutdown` awaits it. On startup or reload, an existing active/launching record (or legacy inflight file) starts a recovery-only loop even when `auto_start` is false; it reconciles existing tickets but does not admit Ready work. `/board-agent run` promotes that loop to autonomous mode.
-
-## Branch and human gate
+## Tick order
 
 ```text
-main
- ├─ task/t001 + retained worktree → Review → Done → human closes issue ─┐
- ├─ task/t002 + retained worktree → Review → Done → human closes issue ├─→ main
- └─ task/t003 + retained worktree → Review → Done → human closes issue ─┘
+reject unsupported state read-only
+  → list/hydrate all Project items
+  → reconcile persisted ticket runs and launch windows
+  → finalize eligible closed Done Tasks (also in recovery-only mode)
+  → check pinned revision, admissions, and main-checkout cleanliness
+  → process at most one Needs Design Task when a worker slot is free
+  → process fair Story lane (at most one external Story action)
+  → await the serialized watchdog tick
+  → reserve one shared worker slot for Review when needed
+  → launch Ready Task builders into remaining slots
+  → run at most one foreground reviewer
+  → recount active builders and refill Ready slots
 ```
 
-Closing a Done issue is the approval signal to merge its task branch directly
-into `branches.base`, remove its worktree, and delete the task branch locally
-and from `origin`. A refined Story reaches Done after every task is closed and
-finalized.
+Waiting Stories are skipped rather than returned from the whole lane. Candidate
+order rotates by tick, so one persistent blocker cannot starve siblings. The
+same principle applies to Needs Design Tasks.
 
-## Safety boundaries
+`max_workers` covers active builders and foreground Story/Task refinement or
+review. Watchdog maintenance is a separate serialized lane.
+Builders remain background-managed; Story and review mutations complete before
+their lane advances.
 
-- GitHub assignee plus post-mutation refetch handles claim races.
-- WorkflowManager supplies durable journals and per-run cross-process leases.
-- The owner lock limits one board-agent process per checkout.
-- Dirty interrupted worktrees are never handed back to a builder automatically.
-- `Needs Human` is terminal for automation until a human moves the card to Ready.
-- Legacy `.pi/board-agent/inflight/*.json` files are quarantined and archived; they are not part of new execution.
-- No database, queue, heartbeat, custom lease, or board retry counter is maintained.
+## Builder launch and recovery
+
+1. Validate an open Ready Task Issue from the origin repository.
+2. Add the bot assignee.
+3. Re-read and require sole claim, unchanged Plan/identity/status.
+4. Create or resume the registered persistent worktree from fresh
+   `origin/<base>` on `task/issue-<number>`.
+5. Refuse pending finalization; atomically record `launchingAt` and clear a
+   prior reviewed SHA only for a new builder attempt.
+6. Move the card to `In Progress`.
+7. Start WorkflowManager; it persists the run before starting the agent.
+8. Atomically associate `activeRunId`.
+
+A crash between steps 7 and 8 is recovered by matching the persisted
+`itemId`, `issueNumber`, and `taskKey`. Ambiguous or unprovable state goes to
+`Needs Human`. Run-lineage comment markers make terminal GitHub writes
+idempotent. The active association is cleared only after the terminal comment,
+status, and assignee operations succeed.
+
+Paused managed runs resume when record, args, path, branch, and card identity
+match. Usage-limit pauses remain under the scheduler. Dirty partial work may be
+continued only by the same structurally owned ticket; dirty completed work,
+wrong branches, missing runs, malformed results, and identity drift fail
+closed.
+
+## Review and human approval
+
+Review is opt-in (`review.enabled: false` by default). Without it, humans
+validate the retained worktree, move the Task to `Done`, and close the Issue.
+Finalization then pins the fresh task SHA after local/remote agreement. When AI
+review is enabled, a persisted PASS is required; any existing reviewed SHA is
+binding even if AI review is later disabled.
+
+When enabled, a Review Task is claimed and re-read. `review.ts` then:
+
+1. snapshots branch, HEAD, and status of the main checkout;
+2. fetches `origin/<base>` and `origin/<task>` with a fixed deadline;
+3. creates a detached worktree under `.pi/worktrees/review-*` at the fresh
+   `origin/<task>` SHA;
+4. verifies detached HEAD and a clean review worktree;
+5. runs the reviewer there without nested workflow isolation;
+6. force-removes/prunes the review worktree; and
+7. verifies the main checkout snapshot is unchanged.
+
+A fetch, setup, agent, cleanup, or checkout-integrity failure leaves the card in
+`Review`. After a PASS, the loop re-reads the card again, atomically persists
+the returned `reviewedTaskSha`, and only then moves the card to `Done`.
+
+The Issue remains open and the persistent task worktree remains available for
+human validation. Closing a Done Issue is the approval signal; no claim or new
+worktree is created during finalization.
+
+## Exact-SHA finalization
+
+For a closed Done Task with no active run:
+
+1. Require the existing clean, registered, unlocked persistent worktree.
+2. Fetch base/task and require local task HEAD, local task ref, and remote task
+   ref to be identical. If present, `reviewedTaskSha` must also match. The
+   executor requires that approval when `review.enabled` is true.
+3. Atomically persist `{targetBranch, baseSha, taskSha}`.
+4. Re-fetch and re-check those SHAs.
+5. Use `git merge-tree --write-tree` to compute the result tree.
+6. Use `git commit-tree` to create either a one-parent squash commit or a
+   two-parent merge commit with `Board-Agent-Item: <itemId>`.
+7. Atomically persist `resultSha`.
+8. Re-fetch/re-check, then normally push `resultSha:refs/heads/<base>`.
+9. Fetch and verify `resultSha` is reachable from `origin/<base>`.
+10. Preflight every cleanup condition, then remove the worktree, exact local
+    task ref, exact remote task ref (force-with-lease), and record.
+
+A restart resumes from the journal, verifying its exact result tree, ordered
+parents, and complete item marker. If the result already reached the base,
+only guarded cleanup is retried. A new builder cannot overwrite or erase a
+pending journal; abandoning a proven-unpushed intent is an explicit, backed-up
+manual recovery operation. Dirty/missing/locked/unregistered worktrees,
+base/task/reviewed-SHA drift, merge conflicts, push rejection, or cleanup drift
+preserve the journal and recoverable artifacts. The card stays `Done`.
+
+## Story exactly-once state machine
+
+`.pi/board-agent/refine-state.json` is atomically replaced. Before the first
+child mutation it stores the complete refinement output and a creation plan for
+every child: index, digest, deterministic marker, title, body, and task key.
+
+On every attempt, `refine.ts` reconciles in this order:
+
+1. paginate all current sub-Issues and match the marker;
+2. create the child only when no target-repository match exists;
+3. paginate Project contents and find/add the Issue;
+4. re-read the Project item;
+5. reconcile `Ready`, exact Plan, and `Task`, persisting after each step.
+
+Attempt markers are persisted before non-idempotent create/add/comment calls.
+Visible remote results can be adopted after an ambiguous failure; an attempted
+operation whose result cannot be confirmed is never blindly repeated. Multiple
+matching markers fail closed. Partial failure keeps the journal, posts
+a marker-deduplicated blocker, and moves the Story to `Needs Human`. Returning it
+to `Ready` resumes creation without rerunning refinement.
+
+Needs Design comment cursors bootstrap without replay and advance only after
+trusted input is handled successfully. A waiting Story does not block another
+Story or Task in the same tick.
+
+## Process and lifecycle boundaries
+
+All runtime Git and `gh` calls use `process-runner.ts`: shell-free command argv,
+credential prompts disabled, fixed deadlines, and independent supervisors.
+POSIX process groups and Windows Job Objects terminate ordinary descendants,
+including inherited pipes; deliberate POSIX `setsid()` escape or host SIGKILL
+is outside this containment guarantee. Windows requires PowerShell
+FullLanguage with `Add-Type`/PInvoke available. Telegram composes caller
+cancellation with its mandatory 15-second deadline.
+
+`owner.lock` records pid, hostname, bot identity, and a random token. A live
+same-host owner and every different-host owner fail closed; only a provably dead
+same-host lock can be reclaimed. A separate `owner.lock.reclaim` serializes
+stale takeovers; an interrupted takeover fails closed until manually resolved.
+
+`BoardLoop.stop()` stops admissions, waits for the current tick, pauses active
+managers, waits for their leases, writes stopped runtime state, and releases the
+owner lock. A failed tick still drains managers; failed draining retains the
+lock. A revision mismatch allows settlement/reconciliation but never new
+admissions.
+
+Watchdog ticks are awaited and coalesced across instances. Admission is
+rechecked before agents and mutations, including the host-controlled CI push.
+CI fixes use detached `.pi/worktrees/watchdog-<pr>-*` worktrees and a normal
+exact-commit push; failures retain the worktree and block a replacement fix
+until a human resolves it. Mention replies use an effective empty tool policy,
+not an ignored inline workflow option.

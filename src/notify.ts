@@ -2,11 +2,10 @@
  * Phase E — Telegram notifications.
  *
  * Wrapper around the Bot API (sendMessage, HTML parse mode, 4096-char limit).
- * Token/chat id come from the environment (never from the yml): the container
- * passes TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID. Same bot + channel already
- * used by board-game-organizer's release notifications.
+ * Token/chat id come from the environment (never from the yml).
  */
 import type { Config } from "./config.js";
+import { TELEGRAM_TIMEOUT_MS } from "./process-runner.js";
 
 export interface NotifyInput {
   botToken: string;
@@ -14,6 +13,7 @@ export interface NotifyInput {
   title: string;
   body?: string;
   links?: string[];
+  signal?: AbortSignal;
 }
 
 const escapeHtml = (s: string): string =>
@@ -48,24 +48,35 @@ export async function sendTelegram(input: NotifyInput): Promise<boolean> {
   if (text.length > 4000) text = `${text.slice(0, 3999)}…`;
 
   try {
-    const res = await fetch(`https://api.telegram.org/bot${input.botToken}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: input.chatId,
-        text,
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-      }),
-    });
+    const res = await fetch(
+      `https://api.telegram.org/bot${input.botToken}/sendMessage`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.any([
+          AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+          ...(input.signal ? [input.signal] : []),
+        ]),
+        body: JSON.stringify({
+          chat_id: input.chatId,
+          text,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+        }),
+      },
+    );
     const json = (await res.json()) as { ok?: boolean; description?: string };
     if (!json.ok) {
-      console.error(`[board-agent] Telegram error: ${json.description ?? "unknown"}`);
+      console.error(
+        `[board-agent] Telegram error: ${json.description ?? "unknown"}`,
+      );
       return false;
     }
     return true;
   } catch (err) {
-    console.error(`[board-agent] Telegram send failed: ${(err as Error).message}`);
+    console.error(
+      `[board-agent] Telegram send failed: ${(err as Error).message}`,
+    );
     return false;
   }
 }

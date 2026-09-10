@@ -1,188 +1,104 @@
 #!/usr/bin/env bash
-# scripts/setup.sh
-#
-# Interactive project setup wizard for pi-board-agent.
-#  - Checks prerequisites: gh auth, gh project scope, git origin
-#  - Scans the GitHub Project (v2) for Status / Plan fields
-#  - Writes .pi/board-agent.yml with the detected values
-#
-# Usage:
-#   bash scripts/setup.sh [--non-interactive]
-#
-# Requirements: bash >= 4, gh CLI, git
-
+# Interactive setup; only reads GitHub metadata and writes local config.
+# Usage: bash scripts/setup.sh [--non-interactive]
+# Non-interactive overrides: PROJECT_OWNER, PROJECT_NUMBER, STATUS_FIELD,
+# PLAN_FIELD, TYPE_FIELD, READY_COL, DONE_COL. Requires Bash 4+, Node 22.19+, git, gh.
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CWD="${PWD}"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-ok()  { echo -e "${GREEN}✓${NC} $1"; }
-warn(){ echo -e "${YELLOW}⚠${NC} $1"; }
-err() { echo -e "${RED}✗${NC} $1"; exit 1; }
+NON_INTERACTIVE=false
+case "${1:-}" in
+  "") ;;
+  --non-interactive) NON_INTERACTIVE=true ;;
+  *) printf 'Usage: bash scripts/setup.sh [--non-interactive]\n' >&2; exit 1 ;;
+esac
+[[ $# -le 1 ]] || { printf 'Too many arguments\n' >&2; exit 1; }
+err() { printf 'Error: %s\n' "$1" >&2; exit 1; }
+warn() { printf 'Warning: %s\n' "$1" >&2; }
 ask() {
-  local prompt="$1"; local default="$2"
-  if [[ -t 0 ]]; then read -rp "$prompt [$default]: " val; echo "${val:-$default}"
-  else echo "$default"; fi
+  local val=""
+  if [[ "$NON_INTERACTIVE" == false && -t 0 ]]; then
+    read -rp "$1 [$2]: " val
+  fi
+  printf '%s\n' "${val:-$2}"
 }
 
-echo "pi-board-agent setup wizard"
-echo "==========================="
-echo
+echo 'pi-board-agent setup (0.2.0)'
+for tool in node git gh; do
+  command -v "$tool" >/dev/null 2>&1 || err "Missing prerequisite: $tool"
+done
+node -e 'const [major,minor]=process.versions.node.split(".").map(Number); process.exit(major>22 || (major===22 && minor>=19) ? 0 : 1)' || err 'Node 22.19.0 or newer is required.'
 
-# 1. gh CLI
-echo "→ Checking prerequisites..."
-command -v gh >/dev/null 2>&1 || err "gh CLI not found. Install: https://cli.github.com/"
-ok "gh CLI found"
+REMOTE="$(git remote get-url origin 2>/dev/null)" || err 'Set a GitHub origin remote first.'
+IDENTITY="$(node -e '
+const match = process.argv[1].match(/^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com(?::22)?\/|git@github\.com:)([a-z0-9][a-z0-9-]*)\/([a-z0-9_.-]+?)(?:\.git)?$/i);
+if (!match || match[2] === "." || match[2] === "..") process.exit(1);
+console.log(match[1], match[2]);
+' "$REMOTE")" || err 'origin must be a GitHub HTTPS or SSH remote with exactly owner/repository.'
+read -r OWNER REPO <<< "$IDENTITY"
+printf 'Target repository: %s/%s\n' "$OWNER" "$REPO"
 
-# 2. gh auth
-gh auth status >/dev/null 2>&1 || err "gh not authenticated. Run: gh auth login"
-ok "gh authenticated"
+PROJECT_OWNER="$(ask 'Project owner' "${PROJECT_OWNER:-$OWNER}")"
+PROJECT_NUMBER="$(ask 'Project number' "${PROJECT_NUMBER:-1}")"
+node -e '
+if (!/^[a-z0-9][a-z0-9-]*$/i.test(process.argv[1]) || !/^[1-9][0-9]*$/.test(process.argv[2]) || Number(process.argv[2]) > 2147483647) process.exit(1);
+' "$PROJECT_OWNER" "$PROJECT_NUMBER" || err 'Project owner must be a GitHub login; Project number must be an integer from 1 to 2147483647.'
 
-# 3. gh project scope
-if gh auth status 2>&1 | grep -q "project"; then
-  ok "gh has project scope"
+gh auth status >/dev/null 2>&1 || err 'gh is not authenticated. Run: gh auth login'
+if ! gh auth status 2>&1 | grep -q 'project'; then
+  # Never refresh credentials or launch an interactive flow from unattended setup.
+  err "Project scope was not detected. Run: gh auth refresh -s project; then rerun setup."
+fi
+
+printf 'Project fields for %s/#%s:\n' "$PROJECT_OWNER" "$PROJECT_NUMBER"
+if FIELDS_JSON="$(gh project field-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json)"; then
+  printf '%s' "$FIELDS_JSON" | node -e '
+const fields = JSON.parse(require("node:fs").readFileSync(0, "utf8")).fields;
+if (!Array.isArray(fields)) process.exit(1);
+for (const field of fields) {
+  console.log("  " + JSON.stringify(field.name) + (Array.isArray(field.options) ? ": " + field.options.map(o => JSON.stringify(o.name)).join(", ") : ""));
+}
+' || warn 'Could not parse project fields; configure them manually.'
 else
-  warn "gh is missing the 'project' scope. Running: gh auth refresh -s project"
-  gh auth refresh -s project || err "Failed to add project scope"
-  ok "project scope added"
+  warn 'Could not read project fields; configure them manually.'
 fi
 
-# 4. git origin
-REMOTE="$(git remote get-url origin 2>/dev/null || echo '')"
-if [[ -z "$REMOTE" ]]; then
-  err "No git origin remote. Run: git remote add origin <url>"
+STATUS_FIELD="$(ask 'Status field name' "${STATUS_FIELD:-Status}")"
+PLAN_FIELD="$(ask 'Plan field name' "${PLAN_FIELD:-Plan}")"
+TYPE_FIELD="$(ask 'Type field name' "${TYPE_FIELD:-Kind}")"
+READY_COL="$(ask 'Ready column name' "${READY_COL:-Ready}")"
+DONE_COL="$(ask 'Done column name' "${DONE_COL:-Done}")"
+node -e '
+const names = process.argv.slice(1);
+if (names.some(s => !s || s.trim() !== s || /[\x00-\x1f\x7f]/.test(s))) process.exit(1);
+const statuses = [names[3], names[4], "Backlog", "In Progress", "Needs Design", "Needs Human", "Review"].map(s => s.toLowerCase());
+if (new Set(statuses).size !== statuses.length) process.exit(1);
+' "$STATUS_FIELD" "$PLAN_FIELD" "$TYPE_FIELD" "$READY_COL" "$DONE_COL" || err 'Use non-empty single-line field names and seven distinct status names.'
+
+CONFIG_PATH="$PWD/.pi/board-agent.yml"
+[[ ! -L "$PWD/.pi" && ! -L "$CONFIG_PATH" ]] || err 'Refusing a symlinked config path.'
+if [[ -e "$CONFIG_PATH" ]]; then
+  [[ "$(ask "Overwrite $CONFIG_PATH? (y/n)" n)" == y ]] || { echo 'Setup aborted; existing config unchanged.'; exit 0; }
 fi
-if ! echo "$REMOTE" | grep -qi github.com; then
-  err "origin is not a GitHub remote: $REMOTE"
-fi
-ok "git origin: $REMOTE"
-
-# Derive owner + repo
-OWNER="$(echo "$REMOTE" | sed -E 's|.*github.com[:/]([^/]+)/([^/]+?)(\.git)?$|\1|')"
-REPO="$(echo "$REMOTE" | sed -E 's|.*github.com[:/]([^/]+)/([^/]+?)(\.git)?$|\2|')"
-echo "  → owner=$OWNER  repo=$REPO"
-echo
-
-# 5. Pick project number
-echo "→ GitHub Projects (v2) for $OWNER:"
-gh project list --owner "$OWNER" --format json 2>/dev/null \
-  | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-if not data.get('projects'):
-    print('  (no projects found)')
-    sys.exit(0)
-for p in data['projects']:
-    print(f'  #{p[\"number\"]:>4d}  {p[\"title\"]}')
-" 2>/dev/null || warn "Could not list projects. You can set the number manually later."
-
-PROJECT_NUMBER="$(ask "Project number" "1")"
-echo
-
-# 6. Fetch project fields
-echo "→ Fetching project fields..."
-FIELDS_JSON="$(gh api graphql -f query='
-query($owner: String!, $num: Int!) {
-  user(login: $owner) { projectV2(number: $num) { fields(first:50) {
-    nodes {
-      ... on ProjectV2SingleSelectField { id name options { id name } }
-      ... on ProjectV2Field { id name }
-  }} } }
-  organization(login: $owner) { projectV2(number: $num) { fields(first:50) {
-    nodes {
-      ... on ProjectV2SingleSelectField { id name options { id name } }
-      ... on ProjectV2Field { id name }
-  }} } }
-}' -f owner="$OWNER" -F num="$PROJECT_NUMBER" 2>/dev/null)"
-
-STATUS_FIELDS="$(echo "$FIELDS_JSON" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for scope in ('user','organization'):
-    proj = (data.get(scope) or {}).get('projectV2')
-    if not proj: continue
-    for f in proj.get('fields',{}).get('nodes',[]):
-        if not f: continue
-        if f.get('options'):
-            print(json.dumps({'name':f['name'], 'options':[o['name'] for o in f['options']]}))
-" 2>/dev/null)"
-
-if [[ -z "$STATUS_FIELDS" ]]; then
-  warn "Could not read fields from project #$PROJECT_NUMBER. You will need to configure fields manually."
-else
-  echo "  Single-select fields found:"
-  echo "$STATUS_FIELDS" | while IFS= read -r line; do
-    echo "    $(echo "$line" | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'{d[\"name\"]}: {d[\"options\"]}')")"
-  done
-fi
-echo
-
-# 7. Build config
-STATUS_FIELD="$(ask "Status field name" "Status")"
-PLAN_FIELD="$(ask "Plan field name (empty to skip)" "")"
-READY_COL="$(ask "Ready column name" "Ready")"
-DONE_COL="$(ask "Done column name" "Done")"
-
-CONFIG_PATH="$CWD/.pi/board-agent.yml"
-
-if [[ -f "$CONFIG_PATH" ]]; then
-  warn "$CONFIG_PATH already exists."
-  OVERWRITE="$(ask "Overwrite? (y/n)" "n")"
-  if [[ "$OVERWRITE" != "y" ]]; then
-    echo "Setup aborted. Edit $CONFIG_PATH manually."
-    exit 0
-  fi
-fi
-
-mkdir -p "$CWD/.pi"
-cat > "$CONFIG_PATH" <<YAML
-project:
-  owner: "$OWNER"
-  number: $PROJECT_NUMBER
-
-columns:
-  backlog: "Backlog"
-  ready: "$READY_COL"
-  building: "In Progress"
-  needs_design: "Needs Design"
-  needs_human: "Needs Human"
-  review: "Review"
-  done: "$DONE_COL"
-status_field: "$STATUS_FIELD"
-plan_field: "$PLAN_FIELD"
-
-max_workers: 2
-tick_seconds: 90
-branches:
-  base: "main"
-  plan_prefix: "plan/"
-  task_prefix: "task/"
-task_merge_strategy: "squash"
-
-pr:
-  reviewers: []
-  labels: ["board-agent"]
-
-builder_tier: "medium"
-builder_timeout_ms: 21600000 # 6 hours per attempt
-builder_retries: 1
-
-safety:
-  require_clean_worktree: true
-  skip_closed_issues: true
-
-bot_identity: ""
-YAML
-
-ok "Config written to $CONFIG_PATH"
-echo
-
-# 8. Verify with lint
-echo "→ Running /board-agent lint..."
-echo "  (start pi and run '/board-agent lint' to verify everything works)"
-echo
-echo "Setup complete! Next steps:"
-echo "  1. pi install npm:@mancioshell/pi-board-agent"
-echo "  2. /reload"
-echo "  3. /board-agent lint"
-echo "  4. /board-agent run"
+umask 077
+mkdir -p "$PWD/.pi"
+TEMP_CONFIG="$(mktemp "$PWD/.pi/.board-agent-XXXXXX")"
+trap 'rm -f "$TEMP_CONFIG"' EXIT
+# JSON is a YAML 1.2 mapping. Native serialization safely preserves quotes,
+# backslashes, Unicode and YAML-looking text without a second YAML dependency.
+node -e '
+const [owner, number, status_field, plan_field, type_field, ready, done] = process.argv.slice(1);
+console.log(JSON.stringify({
+  project: { owner, number: Number(number) },
+  columns: { backlog: "Backlog", ready, building: "In Progress", needs_design: "Needs Design", needs_human: "Needs Human", review: "Review", done },
+  status_field, plan_field, type_field,
+  builder_timeout_ms: 21600000,
+  watchdog: { respond_to_mentions: false },
+  auto_start: false
+}, null, 2));
+' "$PROJECT_OWNER" "$PROJECT_NUMBER" "$STATUS_FIELD" "$PLAN_FIELD" "$TYPE_FIELD" "$READY_COL" "$DONE_COL" > "$TEMP_CONFIG"
+mv -f "$TEMP_CONFIG" "$CONFIG_PATH"
+printf 'Config written: %s (YAML-compatible JSON; omitted keys use package defaults)\n' "$CONFIG_PATH"
+echo 'Next steps (replace the placeholder with a reviewed, full 40-character Git SHA):'
+echo '  pi install "git:github.com/Hikoia/pi-board-agent@<FULL_40_CHARACTER_GIT_SHA>"'
+echo '  Restart Pi in this repository, then /board-agent lint and /board-agent run.'
+echo '  Keep the normal Pi session open; --print exits and is not a daemon.'

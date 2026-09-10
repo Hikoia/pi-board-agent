@@ -1,55 +1,95 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-10
+
+### Added
+
+- Strict schema-v3 per-ticket records with atomically persisted reviewed and
+  finalization SHAs.
+- Exact-SHA direct finalization for both squash and merge strategies using
+  `merge-tree`/`commit-tree`, normal base pushes, remote verification, and
+  preflighted cleanup.
+- Read-only startup detection for legacy inflight files and malformed/v1/v2
+  ticket records.
+- Detached, disposable AI-review worktrees pinned to fresh `origin/task` HEADs,
+  with main-checkout integrity verification.
+- Durable Story creation journals, deterministic child markers, paginated
+  sub-Issue/Project reconciliation, and crash-safe per-field progress.
+- A shared non-interactive process runner with fixed Git/`gh` deadlines and
+  process-tree termination; Telegram requests now have a 15-second deadline.
+- Linux/Windows Node 22.19.0 CI, isolated auto-discovered regression suites,
+  and canonical `typecheck`, `test`, and `check` package scripts.
+- Failure-matrix tests for finalization, Story side effects, process timeouts,
+  review isolation, card identity, unsupported state, and mention replay.
+
 ### Changed
 
-- Closed Done tickets now merge directly into `branches.base` and remove their retained worktrees; cumulative plan PR creation is skipped.
-- Made the Hikoia fork Git-only with npm's private-package guard and removed its release/publish workflow.
-- Hardened Needs Design Task refinement with fresh trusted-decision gates, temporary claims, post-design revalidation, worker-budget admission, and rotating candidates.
-- Issue comment reads now paginate the complete GraphQL history and fail on missing or repeated cursors.
-- Replaced process-local workflow promises and inflight locks with one durable WorkflowManager run per retained ticket worktree.
-- Added startup reconciliation, launch-window adoption, owner locking, global worker accounting, idempotent outcomes, and the `Needs Human` recovery lane.
-- Graceful stop now pauses and settles managed runs; legacy inflight files are quarantine-only.
-- Bundled `@quintinshaw/pi-dynamic-workflows` 3.10 and raised the Pi peer minimum to 0.80.8.
+- New task branches are named `task/issue-<issue-number>` and start from the
+  configured base branch.
+- AI Review PASS persists the first fresh post-claim task SHA before moving the
+  card to `Done`. Human Issue closure remains the integration signal. With AI
+  review disabled, manual validation plus `Done` and closure approves the fresh
+  matching local/remote SHA; any prior AI approval remains binding.
+- GitHub Project cards retain their content type and comment author association.
+  Only target-repository Issues with exact `Story`/`Task` Type enter mutation
+  lanes.
+- Project ownership is separate from origin repository ownership.
+- Mention replies are disabled by default and, when enabled, accept only
+  `OWNER`, `MEMBER`, or `COLLABORATOR` mentions from non-bot authors. Cursors
+  bootstrap without replay and advance only after successful handling.
+- Story and Needs Design scheduling rotates fairly and skips waiting items;
+  each lane performs at most one agent/side-effect action per tick.
+- The clean-worktree gate ignores only Board Agent runtime paths, not source or
+  user configuration changes.
+- Closed Done Task finalization no longer claims the Issue or creates a missing
+  worktree. Every blocked state leaves the card in `Done` and preserves
+  recovery artifacts.
+
+### Removed
+
+- Legacy inflight runtime support and automatic v1/v2 ticket-record upgrades.
+- Plan-branch creation/merge helpers and dead PR-open/find orchestration.
+- Configuration keys `pr`, `builder_tier`, `branches.plan_prefix`, and
+  `watchdog.interval_seconds`.
+- Bundled-dependency metadata for `pi-dynamic-workflows`.
+- Dockerfile, Compose, entrypoint, `.dockerignore`, and daemon/container
+  documentation.
+
+### Security
+
+- Added post-claim and post-agent identity revalidation before builder, Task
+  design, Story, review, and finalization mutations.
+- Pull requests, DraftIssues, cross-repository Issues, and untyped/mistyped
+  Project items now cause zero mutation.
+- Review agents have no main-checkout fallback, and mention reply agents receive
+  an empty tool allowlist.
+- SHA drift, dirty/missing/unregistered/locked worktrees, merge conflicts, push
+  rejection, and cleanup drift fail closed. Retry journals cannot be overwritten
+  by a builder or substituted with a different result tree/parent history.
+- Windows Job Objects and POSIX process groups enforce subprocess deadlines;
+  Windows requires PowerShell `Add-Type`/PInvoke permission.
+- Watchdog ticks are serialized and drained on stop. CI fixes use detached
+  worktrees, recheck admissions before host-controlled pushes, and retain
+  failures for manual recovery.
+
+### Migration
+
+0.2.0 does not mutate unsupported pre-0.2.0 state. Stop Board Agent, back up
+`.pi/board-agent/`, worktrees, and refs, finish or preserve old active work,
+then manually remove/migrate every path reported by startup or
+`/board-agent lint`. Remove all deleted configuration keys before running.
+See [`docs/runbook.md`](docs/runbook.md).
 
 ## [0.1.1] - 2026-06-22
 
 ### Added
 
-- Initial release.
-- `/board-agent run` command — autonomous polling loop that picks `Ready`
-  cards from a GitHub Project (v2), dispatches parallel builder agents
-  via pi-dynamic-workflows with `isolation: "worktree"`, and monitors
-  the board until all cards are resolved.
-- `/board-agent status` — live board snapshot with column counts, per-plan
-  progress, and loop statistics.
-- `/board-agent stop` — graceful shutdown: releases assignee mutexes,
-  clears inflight lockfiles, posts "stopped mid-flight" comments.
-- `/board-agent init` — scaffold a `.pi/board-agent.yml` config from the
-  template.
-- `/board-agent lint` — pre-flight checks: config validity, `gh` auth,
-  project existence, Status/Plan field presence.
-- `skills/board-agent/SKILL.md` — builder agent procedure: worktree →
-  task branch → implement → conventional commit → push → merge into plan
-  branch → return JSON outcome.
-- `agents/board-agent-builder.md` — agentType for pi-dynamic-workflows
-  with board-agent skill and git + gh tools pre-bound.
-- Plan-level PR batching: when all cards in a plan reach the `Done`
-  column, a single PR `plan/<slug>` → `main` is opened via `gh pr create`,
-  with optional reviewers (`config.pr.reviewers`) and labels.
-- Safety rails: assignee mutex (atomic claim via `gh issue edit
-  --add-assignee`), local inflight lockfiles, orphan scan, dirty-worktree
-  guard, stuck-building guard.
-- Configurable concurrency (`max_workers`: 1–16), polling interval
-  (`tick_seconds`), task merge strategy (`squash` / `merge`), tier routing
-  (`builder_tier`), per-agent timeout (`builder_timeout_ms`), retries
-  (`builder_retries`).
-- Offline test runner: mocks `gh` + `git`, validates polling logic,
-  card-claim round-trip, plan-summary computation, PR-opening flow, and
-  inflight file lifecycle.
+- Initial GitHub Project polling loop and commands.
+- Plan-grouped builder workflows, assignee claims, local inflight files, Task
+  worktrees, plan pull requests, configuration, and offline tests.

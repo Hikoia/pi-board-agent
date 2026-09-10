@@ -13,6 +13,7 @@ import { normalizeWaveResults, type WaveOutcome } from "./dispatch.js";
 import {
   createComment,
   getCard,
+  isTargetIssue,
   listIssueComments,
   release,
   resolveIssueId,
@@ -21,8 +22,6 @@ import {
   type Card,
   type ProjectMetadata,
 } from "./gh.js";
-import { ensurePlanBranch } from "./git-helpers.js";
-import { Inflight } from "./inflight.js";
 import {
   TicketWorktrees,
   type TicketExecutionRecord,
@@ -48,7 +47,6 @@ export interface ReconcileSummary {
   resumed: number;
   adopted: number;
   needsHuman: number;
-  legacy: number;
   orphans: number;
   errors: number;
 }
@@ -58,9 +56,15 @@ export type LaunchResult =
   | { status: "skipped"; reason: string }
   | { status: "needs-human"; reason: string };
 
+export type FinalizeOutcome =
+  | { status: "finalized"; resultSha: string }
+  | { status: "skipped"; reason: string }
+  | { status: "blocked"; reason: string };
+
 export interface TicketExecutor {
   reconcile(cards: Card[]): Promise<ReconcileSummary>;
   launch(card: Card, planSlug: string): Promise<LaunchResult>;
+  finalizeClosed(card: Card): Promise<FinalizeOutcome>;
   activeCount(): number;
   shutdown(): Promise<void>;
 }
@@ -96,12 +100,12 @@ export interface TicketExecutorDeps {
   cwd: string;
   cfg: Config;
   botLogin: string;
+  repoOwner: string;
+  repoName: string;
   board: TicketBoardAdapter;
   callback: ExecutorStatusCallback;
   worktrees: TicketWorktrees;
-  legacyInflight: Inflight;
   createManager(worktree: string): TicketWorkflowManager;
-  ensurePlan(planBranch: string): void;
   context?(): Promise<string | undefined>;
 }
 
@@ -118,7 +122,7 @@ function runArgsMatch(
   return (
     args.itemId === record.itemId &&
     args.taskKey === record.taskKey &&
-    (!record.issueNumber || args.issueNumber === record.issueNumber)
+    args.issueNumber === record.issueNumber
   );
 }
 
@@ -261,7 +265,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
   constructor(private readonly deps: TicketExecutorDeps) {}
 
   private manager(path: string): TicketWorkflowManager {
-    const key = path.toLowerCase();
+    const key = process.platform === "win32" ? path.toLowerCase() : path;
     let manager = this.managers.get(key);
     if (!manager) {
       manager = this.deps.createManager(path);
@@ -320,9 +324,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
       uniqueMarker = marker(runId, markerOutcome);
     } else {
       const incident =
-        record.schemaVersion === 2
-          ? (record.lastRunId ?? record.launchingAt ?? record.createdAt)
-          : record.createdAt;
+        record.lastRunId ?? record.launchingAt ?? record.createdAt;
       uniqueMarker = `<!-- board-agent-recovery:${record.itemId}:${incident}:${markerOutcome} -->`;
     }
     await this.commentOnce(
@@ -338,8 +340,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
       card.status = this.deps.cfg.columns.needs_human;
     }
     await this.deps.board.release(card);
-    if (record.schemaVersion === 2)
-      this.deps.worktrees.clearExecution(record.itemId, runId);
+    this.deps.worktrees.clearExecution(record.itemId, runId);
     this.deps.callback(
       `"${card.title}" → ${this.deps.cfg.columns.needs_human}: ${reason}`,
       "warn",
@@ -706,54 +707,12 @@ export class ManagedTicketExecutor implements TicketExecutor {
       resumed: 0,
       adopted: 0,
       needsHuman: 0,
-      legacy: 0,
       orphans: 0,
       errors: 0,
     };
     const cardsById = new Map(cards.map((card) => [card.itemId, card]));
     const records = this.deps.worktrees.list();
     const recordIds = new Set(records.map((record) => record.itemId));
-
-    for (const legacy of this.deps.legacyInflight.list()) {
-      const card = cardsById.get(legacy.itemId);
-      if (!card) {
-        summary.errors++;
-        this.deps.callback(
-          `Legacy inflight record has no board card: ${legacy.itemId}`,
-          "warn",
-        );
-        continue;
-      }
-      try {
-        const fresh = (await this.deps.board.getCard(card.itemId)) ?? card;
-        const uniqueMarker = `<!-- board-agent-legacy-inflight:${legacy.itemId} -->`;
-        await this.commentOnce(
-          fresh,
-          uniqueMarker,
-          "⚠️ A pre-persistence builder lock was found. The ticket was quarantined instead of retried.",
-        );
-        await this.deps.board.setStatus(
-          fresh.itemId,
-          this.deps.cfg.columns.needs_human,
-        );
-        fresh.status = this.deps.cfg.columns.needs_human;
-        card.status = fresh.status;
-        await this.deps.board.release(fresh);
-        this.deps.legacyInflight.archive(legacy.itemId);
-        summary.legacy++;
-        summary.needsHuman++;
-        this.deps.callback(
-          `Archived legacy inflight state for "${fresh.title}" → ${this.deps.cfg.columns.needs_human}.`,
-          "warn",
-        );
-      } catch (error: any) {
-        summary.errors++;
-        this.deps.callback(
-          `Legacy recovery failed for ${legacy.itemId}: ${error.message}`,
-          "warn",
-        );
-      }
-    }
 
     for (const original of records) {
       let snapshot = cardsById.get(original.itemId);
@@ -769,10 +728,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
           continue;
         }
         if (!snapshot) {
-          if (
-            original.schemaVersion === 2 &&
-            (original.activeRunId || original.launchingAt)
-          ) {
+          if (original.activeRunId || original.launchingAt !== undefined) {
             try {
               await this.stopMissingCardRun(original, summary);
             } catch (error: any) {
@@ -786,29 +742,33 @@ export class ManagedTicketExecutor implements TicketExecutor {
           continue;
         }
       }
-      if (snapshot.type?.toLowerCase() === "story") continue;
+      if (
+        !isTargetIssue(
+          snapshot,
+          this.deps.repoOwner,
+          this.deps.repoName,
+          "Task",
+        )
+      )
+        continue;
       try {
         const card =
           (await this.deps.board.getCard(original.itemId)) ?? snapshot;
+        if (
+          !isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task")
+        )
+          continue;
         snapshot.status = card.status;
         snapshot.plan = card.plan;
         snapshot.assignees = card.assignees;
         snapshot.closed = card.closed;
 
-        if (original.schemaVersion !== 2) {
-          if (statusIs(card, this.deps.cfg.columns.building)) {
-            await this.moveToNeedsHuman(
-              original,
-              card,
-              "legacy worktree record has no managed workflow run",
-            );
-            summary.needsHuman++;
-          }
-          continue;
-        }
+        // A valid finalization journal owns the ticket until cleanup finishes.
+        // Mixed execution/finalization files are unsupported, never migrated here.
+        if (original.finalization) continue;
 
         let record: TicketExecutionRecord | undefined = original;
-        if (record.launchingAt && !record.activeRunId)
+        if (record.launchingAt !== undefined && !record.activeRunId)
           record = await this.recoverLaunching(record, card, summary);
         if (record?.activeRunId)
           await this.reconcileActive(record, card, summary);
@@ -831,7 +791,12 @@ export class ManagedTicketExecutor implements TicketExecutor {
 
     for (const snapshot of cards) {
       if (
-        snapshot.type?.toLowerCase() === "story" ||
+        !isTargetIssue(
+          snapshot,
+          this.deps.repoOwner,
+          this.deps.repoName,
+          "Task",
+        ) ||
         !statusIs(snapshot, this.deps.cfg.columns.building) ||
         recordIds.has(snapshot.itemId)
       )
@@ -876,6 +841,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
     expectedPlan: string,
     requireClaim = false,
   ): string | undefined {
+    if (!isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task"))
+      return "card is not a Task Issue in the configured repository";
     if (card.closed) return "issue is closed";
     if (!statusIs(card, this.deps.cfg.columns.ready))
       return `status is ${card.status ?? "unset"}`;
@@ -886,10 +853,9 @@ export class ManagedTicketExecutor implements TicketExecutor {
     if (requireClaim && !card.assignees.includes(this.deps.botLogin))
       return "claim was not retained";
     const record = this.deps.worktrees.read(card.itemId);
-    if (
-      record?.schemaVersion === 2 &&
-      (record.activeRunId || record.launchingAt)
-    )
+    if (record?.finalization)
+      return "ticket has a pending finalization; recover it before starting another builder";
+    if (record && (record.activeRunId || record.launchingAt !== undefined))
       return "ticket already has an active run";
     return undefined;
   }
@@ -923,12 +889,26 @@ export class ManagedTicketExecutor implements TicketExecutor {
   async launch(snapshot: Card, expectedPlan: string): Promise<LaunchResult> {
     let card = await this.deps.board.getCard(snapshot.itemId);
     if (!card) return { status: "skipped", reason: "card no longer exists" };
+    if (card.itemId !== snapshot.itemId || card.number !== snapshot.number)
+      return { status: "skipped", reason: "issue identity changed" };
     const preClaim = this.eligible(card, expectedPlan);
     if (preClaim) return { status: "skipped", reason: preClaim };
 
     if (!(await this.deps.board.claim(card)))
       return { status: "skipped", reason: "claim lost" };
-    card = (await this.deps.board.getCard(snapshot.itemId)) ?? card;
+    const claimed = card;
+    card = await this.deps.board.getCard(snapshot.itemId);
+    if (
+      !card ||
+      card.itemId !== snapshot.itemId ||
+      card.number !== snapshot.number
+    ) {
+      await this.deps.board.release(claimed);
+      return {
+        status: "skipped",
+        reason: "issue identity changed after claim",
+      };
+    }
     const postClaim = this.eligible(card, expectedPlan, true);
     if (postClaim) {
       await this.deps.board.release(card);
@@ -936,15 +916,6 @@ export class ManagedTicketExecutor implements TicketExecutor {
     }
 
     const task = buildTasksForWave(this.deps.cfg, expectedPlan, [card])[0];
-    try {
-      this.deps.ensurePlan(task.planBranch);
-    } catch (error: any) {
-      await this.deps.board.release(card);
-      return {
-        status: "skipped",
-        reason: `baseline branch preparation failed: ${error.message}`,
-      };
-    }
 
     let record: TicketExecutionRecord;
     try {
@@ -998,7 +969,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         cfg: this.deps.cfg,
         planSlug: expectedPlan,
         baseBranch: this.deps.cfg.branches.base,
-        tasks: [{ ...task, planBranch: record.planBranch }],
+        tasks: [{ ...task, baseBranch: record.baseBranch }],
         skillName: "board-agent",
         context,
       });
@@ -1061,11 +1032,99 @@ export class ManagedTicketExecutor implements TicketExecutor {
     return { status: "launched", runId, worktree: record.path };
   }
 
+  async finalizeClosed(snapshot: Card): Promise<FinalizeOutcome> {
+    let card: Card | undefined;
+    try {
+      card = await this.deps.board.getCard(snapshot.itemId);
+    } catch (error) {
+      return {
+        status: "blocked",
+        reason: `fresh card read failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    if (!card) return { status: "skipped", reason: "card no longer exists" };
+    if (!isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task"))
+      return {
+        status: "skipped",
+        reason: "card is not a Task Issue in the configured repository",
+      };
+    if (
+      card.itemId !== snapshot.itemId ||
+      card.number !== snapshot.number ||
+      !card.plan ||
+      !snapshot.plan ||
+      planSlug(card.plan) !== planSlug(snapshot.plan)
+    )
+      return { status: "skipped", reason: "issue or Plan changed" };
+    if (!card.closed || !statusIs(card, this.deps.cfg.columns.done))
+      return {
+        status: "skipped",
+        reason: "ticket is no longer closed and Done",
+      };
+
+    const target = this.deps.cfg.branches.base;
+    try {
+      if (
+        !this.deps.worktrees.has(card.itemId) &&
+        this.deps.worktrees.isMerged(card.itemId, target)
+      )
+        return { status: "skipped", reason: "already finalized" };
+      const record = this.deps.worktrees.read(card.itemId);
+      if (!record)
+        return {
+          status: "blocked",
+          reason: "missing or unsupported v3 execution record",
+        };
+      const task = buildTasksForWave(this.deps.cfg, planSlug(card.plan), [
+        card,
+      ])[0];
+      if (
+        record.itemId !== card.itemId ||
+        record.issueNumber !== card.number ||
+        record.plan !== planSlug(card.plan) ||
+        record.taskBranch !== task.taskBranch ||
+        record.baseBranch !== target
+      )
+        return {
+          status: "blocked",
+          reason: "execution record does not match the fresh ticket",
+        };
+      if (record.activeRunId || record.launchingAt !== undefined)
+        return {
+          status: "blocked",
+          reason: "builder execution is still active",
+        };
+      if (this.deps.cfg.review.enabled && !record.reviewedTaskSha)
+        return {
+          status: "blocked",
+          reason:
+            "AI review is enabled but the ticket has no persisted reviewed task SHA",
+        };
+
+      const result = this.deps.worktrees.finalizeAccepted(
+        record,
+        this.deps.cfg.task_merge_strategy,
+        card.title,
+        target,
+      );
+      this.deps.callback(
+        `Finalized "${card.title}" at ${result.resultSha} in ${target}.`,
+      );
+      return { status: "finalized", resultSha: result.resultSha };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.deps.callback(
+        `Finalization blocked for "${card.title}": ${reason}`,
+        "warn",
+      );
+      return { status: "blocked", reason };
+    }
+  }
+
   activeCount(): number {
     let count = 0;
     for (const record of this.deps.worktrees.list()) {
-      if (record.schemaVersion !== 2) continue;
-      if (record.launchingAt && !record.activeRunId) {
+      if (record.launchingAt !== undefined && !record.activeRunId) {
         count++;
         continue;
       }
@@ -1112,6 +1171,8 @@ export function createProductionTicketExecutor(options: {
   cfg: Config;
   meta: ProjectMetadata;
   botLogin: string;
+  repoOwner: string;
+  repoName: string;
   callback: ExecutorStatusCallback;
   modelRegistry?: ModelRegistry;
   mainModel?: string;
@@ -1150,10 +1211,11 @@ export function createProductionTicketExecutor(options: {
     cwd: options.cwd,
     cfg: options.cfg,
     botLogin: options.botLogin,
+    repoOwner: options.repoOwner,
+    repoName: options.repoName,
     board,
     callback: options.callback,
     worktrees,
-    legacyInflight: new Inflight(options.cwd),
     createManager: (cwd) =>
       createWorkflowManagerAdapter({
         cwd,
@@ -1164,8 +1226,6 @@ export function createProductionTicketExecutor(options: {
         defaultAgentRetries: options.cfg.builder_retries,
         callback: options.callback,
       }),
-    ensurePlan: (branch) =>
-      ensurePlanBranch(branch, options.cfg.branches.base, options.cwd),
     context: options.cfg.context.enabled
       ? async () => {
           const { generateContext } = await import("./context.js");
@@ -1185,14 +1245,13 @@ export function inspectTicketExecutions(
   cfg: Config,
 ): {
   active: ActiveTicketRun[];
-  legacy: number;
   orphans: number;
   needsHuman: number;
 } {
   const worktrees = new TicketWorktrees(cwd);
   const records = worktrees.list();
   const active = records.flatMap((record): ActiveTicketRun[] => {
-    if (record.schemaVersion !== 2 || !record.activeRunId) return [];
+    if (!record.activeRunId) return [];
     let status = "missing";
     try {
       status =
@@ -1229,7 +1288,6 @@ export function inspectTicketExecutions(
       orphanIds.add(run.itemId);
   return {
     active,
-    legacy: new Inflight(cwd).list().length,
     orphans: orphanIds.size,
     needsHuman: cards.filter((card) => statusIs(card, cfg.columns.needs_human))
       .length,

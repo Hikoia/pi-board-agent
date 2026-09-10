@@ -1,8 +1,8 @@
 {
   "name": "@mancioshell/pi-board-agent",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
-  "description": "Autonomous GitHub Project (v2) board executor for Pi — builds Ready cards in parallel worktrees and merges accepted tasks into the base branch.",
+  "description": "Durable GitHub Project executor for Pi with isolated builders, exact-SHA review, and human-approved finalization.",
   "license": "MIT",
   "type": "module",
   "author": {
@@ -10,13 +10,13 @@
     "email": "dott.alessandro.mancini@gmail.com",
     "url": "https://github.com/mancioshell"
   },
-  "homepage": "https://github.com/mancioshell/pi-board-agent",
+  "homepage": "https://github.com/Hikoia/pi-board-agent",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mancioshell/pi-board-agent.git"
+    "url": "https://github.com/Hikoia/pi-board-agent.git"
   },
   "bugs": {
-    "url": "https://github.com/mancioshell/pi-board-agent/issues"
+    "url": "https://github.com/Hikoia/pi-board-agent/issues"
   },
   "keywords": [
     "pi-package",
@@ -27,7 +27,6 @@
     "github-projects",
     "kanban",
     "automation",
-    "spec-kit",
     "agents",
     "workflows"
   ],
@@ -44,7 +43,8 @@
     "agents",
     "skills",
     "scripts",
-    "docs",
+    "docs/architecture.md",
+    "docs/runbook.md",
     "config-template.yml",
     "README.md",
     "CHANGELOG.md",
@@ -54,17 +54,19 @@
     "@quintinshaw/pi-dynamic-workflows": "^3.10.0",
     "yaml": "^2.5.0"
   },
-  "bundledDependencies": [
-    "@quintinshaw/pi-dynamic-workflows"
-  ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.8"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bash tests/run-offline.sh",
+    "check": "npm run typecheck && npm test"
   },
   "devDependencies": {
-    "@types/node": "^26.0.0",
+    "@types/node": "22.19.19",
     "tsx": "^4.22.4",
     "typescript": "^7.0.2"
   }

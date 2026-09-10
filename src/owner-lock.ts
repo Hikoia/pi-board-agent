@@ -1,8 +1,17 @@
-import { spawnSync } from "node:child_process";
+import { runProcessSync } from "./process-runner.js";
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  mkdirSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
+import { assertSupportedState } from "./unsupported-state.js";
 
 export interface OwnerLockRecord {
   pid: number;
@@ -19,8 +28,10 @@ export interface OwnerLock {
 }
 
 function repoRoot(cwd: string): string {
-  const result = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" });
-  return result.status === 0 ? result.stdout.trim() : resolve(cwd);
+  const result = runProcessSync("git", ["rev-parse", "--show-toplevel"], {
+    cwd,
+  });
+  return result.ok ? result.stdout.trim() : resolve(cwd);
 }
 
 function processIsAlive(pid: number): boolean {
@@ -33,20 +44,57 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
+function readOwnerLock(path: string): OwnerLockRecord {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink())
+    throw new Error("Not a regular owner lock");
+  let value: Partial<OwnerLockRecord> | null;
+  try {
+    value = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    throw new Error(`Invalid owner lock JSON: ${path}`, { cause: error });
+  }
+  if (
+    !value ||
+    !Number.isSafeInteger(value.pid) ||
+    value.pid! <= 0 ||
+    value.pid! > 2_147_483_647 ||
+    typeof value.hostname !== "string" ||
+    !value.hostname.trim() ||
+    value.hostname !== value.hostname.trim() ||
+    typeof value.token !== "string" ||
+    !value.token.trim() ||
+    typeof value.botLogin !== "string" ||
+    typeof value.startedAt !== "string" ||
+    !Number.isFinite(Date.parse(value.startedAt))
+  ) {
+    throw new Error("Invalid owner lock record");
+  }
+  return value as OwnerLockRecord;
+}
+
+function releaseToken(path: string, token: string): void {
+  try {
+    if (readOwnerLock(path).token === token) unlinkSync(path);
+  } catch {
+    // A corrupt, missing or replaced lock is not ours to remove.
+  }
+}
+
 /** Keep non-owner Pi processes from overwriting the active owner's runtime heartbeat. */
 export function ownerLockHeldByOther(cwd: string): boolean {
   const path = join(repoRoot(cwd), ".pi", "board-agent", "owner.lock");
-  if (!existsSync(path)) return false;
   try {
-    const record = JSON.parse(readFileSync(path, "utf8")) as OwnerLockRecord;
+    const record = readOwnerLock(path);
     if (record.hostname.toLowerCase() !== hostname().toLowerCase()) return true;
     return record.pid !== process.pid && processIsAlive(record.pid);
-  } catch {
-    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ENOENT";
   }
 }
 
 export function acquireOwnerLock(cwd: string, botLogin: string): OwnerLock {
+  assertSupportedState(cwd);
   const dir = join(repoRoot(cwd), ".pi", "board-agent");
   const path = join(dir, "owner.lock");
   mkdirSync(dir, { recursive: true });
@@ -71,33 +119,51 @@ export function acquireOwnerLock(cwd: string, botLogin: string): OwnerLock {
         path,
         record,
         release() {
-          if (!existsSync(path)) return;
-          try {
-            const current = JSON.parse(readFileSync(path, "utf8")) as OwnerLockRecord;
-            if (current.token === record.token) unlinkSync(path);
-          } catch {
-            // A corrupt or replaced lock is not ours to remove.
-          }
+          releaseToken(path, record.token);
         },
       };
     } catch (error: any) {
       if (error?.code !== "EEXIST") throw error;
-      let current: OwnerLockRecord;
+      // Serialize stale removal. A check-then-unlink without this guard can delete
+      // another contender's newly acquired live lock. An interrupted reclaim is
+      // deliberately manual recovery, rather than recursively stealing its guard.
+      const reclaimPath = `${path}.reclaim`;
+      let fd: number;
       try {
-        current = JSON.parse(readFileSync(path, "utf8")) as OwnerLockRecord;
+        fd = openSync(reclaimPath, "wx", 0o600);
       } catch {
-        throw new Error(`Board-agent owner lock is corrupt; remove it manually: ${path}`);
-      }
-      if (current.hostname.toLowerCase() !== record.hostname.toLowerCase()) {
-        throw new Error(`Board-agent is owned by ${current.hostname} (pid ${current.pid}); refusing cross-host takeover.`);
-      }
-      if (processIsAlive(current.pid)) {
-        throw new Error(`Board-agent is already running locally (pid ${current.pid}, bot ${current.botLogin || "unknown"}).`);
+        throw new Error(
+          `Owner lock recovery is busy or interrupted. Inspect ${reclaimPath}; remove it manually only after all contenders have stopped.`,
+        );
       }
       try {
+        writeFileSync(fd, JSON.stringify(record), "utf8");
+      } finally {
+        closeSync(fd);
+      }
+      try {
+        let current: OwnerLockRecord;
+        try {
+          current = readOwnerLock(path);
+        } catch (readError) {
+          if ((readError as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw new Error(
+            `Board-agent owner lock is corrupt; inspect and repair it manually: ${path}`,
+          );
+        }
+        if (current.hostname.toLowerCase() !== record.hostname.toLowerCase()) {
+          throw new Error(
+            `Board-agent is owned by ${current.hostname} (pid ${current.pid}); refusing cross-host takeover.`,
+          );
+        }
+        if (processIsAlive(current.pid)) {
+          throw new Error(
+            `Board-agent is already running locally (pid ${current.pid}, bot ${current.botLogin || "unknown"}).`,
+          );
+        }
         unlinkSync(path);
-      } catch (unlinkError: any) {
-        if (unlinkError?.code !== "ENOENT") throw unlinkError;
+      } finally {
+        releaseToken(reclaimPath, record.token);
       }
     }
   }

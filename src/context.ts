@@ -19,8 +19,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { runProcessSync } from "./process-runner.js";
 
 export interface ContextOptions {
   cwd: string;
@@ -99,7 +99,7 @@ function collectFiles(root: string, opts: ContextOptions): FileEntry[] {
     }
     for (const name of entries) {
       const full = join(dir, name);
-      const rel = relative(root, full);
+      const rel = relative(root, full).replace(/\\/g, "/");
       if (isExcluded(rel, opts)) continue;
       let st: ReturnType<typeof statSync>;
       try {
@@ -149,7 +149,12 @@ function extractSymbols(file: string): { symbols: string[]; head: string } {
     const t = line.trim();
     if (t.startsWith("/*")) inBlock = true;
     if (inBlock || t.startsWith("//")) {
-      headLines.push(t.replace(/^\/\*+|\*+\/$/g, "").trim().replace(/^\*+ ?/, ""));
+      headLines.push(
+        t
+          .replace(/^\/\*+|\*+\/$/g, "")
+          .trim()
+          .replace(/^\*+ ?/, ""),
+      );
       if (headLines.length >= 6) break;
     }
     if (t.includes("*/")) inBlock = false;
@@ -162,13 +167,10 @@ function extractSymbols(file: string): { symbols: string[]; head: string } {
 }
 
 function gitLog(cwd: string): string[] {
-  const res = spawnSync(
-    "git",
-    ["log", "--pretty=format:%s", "-30"],
-    { cwd, encoding: "utf-8" },
-  );
-  if (res.status !== 0) return [];
-  return res.stdout.split("\n").filter(Boolean);
+  const result = runProcessSync("git", ["log", "--pretty=format:%s", "-30"], {
+    cwd,
+  });
+  return result.ok ? result.stdout.split("\n").filter(Boolean) : [];
 }
 
 function groupCommits(commits: string[]): string {
@@ -187,11 +189,8 @@ function groupCommits(commits: string[]): string {
 }
 
 function readHead(cwd: string): string {
-  const res = spawnSync("git", ["rev-parse", "HEAD"], {
-    cwd,
-    encoding: "utf-8",
-  });
-  return res.status === 0 ? res.stdout.trim() : "no-git";
+  const result = runProcessSync("git", ["rev-parse", "HEAD"], { cwd });
+  return result.ok ? result.stdout.trim() : "no-git";
 }
 
 /** Generate the context digest (pure, no cache). */
@@ -203,18 +202,20 @@ export function renderContext(opts: ContextOptions): string {
   // 1) Tree overview
   const byDir = new Map<string, number>();
   for (const f of files) {
-    const dir = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : ".";
+    const dir = f.path.includes("/")
+      ? f.path.slice(0, f.path.lastIndexOf("/"))
+      : ".";
     byDir.set(dir, (byDir.get(dir) ?? 0) + 1);
   }
   const treeLines = Array.from(byDir.entries())
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([dir, n]) => `- \`${dir}/\` — ${n} file`);
-  sections.push(`## Repo tree (${files.length} files)\n\n${treeLines.join("\n")}`);
+  sections.push(
+    `## Repo tree (${files.length} files)\n\n${treeLines.join("\n")}`,
+  );
 
   // 2) File inventory with symbols (ts/tsx/js/jsx only)
-  const codeFiles = files.filter((f) =>
-    /\.(ts|tsx|js|jsx)$/.test(f.path),
-  );
+  const codeFiles = files.filter((f) => /\.(ts|tsx|js|jsx)$/.test(f.path));
   const inv: string[] = [];
   for (const f of codeFiles.slice(0, 150)) {
     const { symbols, head } = extractSymbols(join(cwd, f.path));
@@ -235,7 +236,12 @@ export function renderContext(opts: ContextOptions): string {
 
   // 4) package.json scripts (root + apps/*)
   const pkgLines: string[] = [];
-  for (const p of ["package.json", "apps/web/package.json", "apps/api/package.json", "apps/mobile/package.json"]) {
+  for (const p of [
+    "package.json",
+    "apps/web/package.json",
+    "apps/api/package.json",
+    "apps/mobile/package.json",
+  ]) {
     const pj = join(cwd, p);
     if (!existsSync(pj)) continue;
     try {
