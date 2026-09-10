@@ -1130,6 +1130,10 @@ function finalFixture(
   git(record.path, "push", "-u", "origin", record.taskBranch);
   const taskSha = git(record.path, "rev-parse", "HEAD");
   const baseSha = git(checkout, "rev-parse", "HEAD");
+  const notifications: Array<{
+    message: string;
+    level: "info" | "warn" | "error";
+  }> = [];
   let managers = 0;
   let ensures = 0;
   const make = () => {
@@ -1146,7 +1150,9 @@ function finalFixture(
       repoName: "repo",
       board: finalBoard,
       worktrees: finalStore,
-      callback: () => undefined,
+      callback: (message, level = "info") => {
+        notifications.push({ message, level });
+      },
       createManager: () => {
         managers++;
         throw new Error("finalization must never create a builder manager");
@@ -1174,6 +1180,7 @@ function finalFixture(
     record,
     taskSha,
     baseSha,
+    notifications,
     make,
     tip,
     assertNoAdmissions,
@@ -1251,9 +1258,15 @@ for (const strategy of ["squash", "merge"] as const) {
     ),
     result,
   );
+  assert.deepEqual(f.notifications, [
+    {
+      message: `Finalized #${f.card.number} "${f.card.title}" at ${result} in main. Deleted local/remote branch ${f.record.taskBranch} and removed its worktree.`,
+      level: "info",
+    },
+  ]);
   f.assertNoAdmissions();
   console.log(
-    `PASS: closed Done ${strategy} E2E finalizes the exact SHA without claim or worktree recreation; repeated ticks/restart are no-ops`,
+    `PASS: closed Done ${strategy} E2E finalizes the exact SHA and notifies branch cleanup once; repeated ticks/restart are no-ops`,
   );
 }
 
@@ -1292,6 +1305,7 @@ for (const strategy of ["squash", "merge"] as const) {
     reason: "fresh card read failed: fresh read unavailable",
   });
   f.finalBoard.getCard = fresh;
+  assert.deepEqual(f.notifications, []);
   f.assertNoAdmissions();
   console.log(
     "PASS: finalizer fresh read rejects identity, Plan, repository, type, state drift, removal and read errors before any mutation",
@@ -1395,6 +1409,11 @@ for (const strategy of ["squash", "merge"] as const) {
   chmodSync(hook, 0o755);
   const first = await f.make().finalizeClosed(f.card);
   assert.equal(first.status, "blocked");
+  assert.deepEqual(
+    f.notifications.map((notice) => notice.level),
+    ["warn"],
+  );
+  assert.match(f.notifications[0].message, /Finalization blocked/);
   const saved = f.store.read(f.card.itemId)!.finalization!;
   assert.equal(f.tip(), saved.resultSha);
   assert.equal(existsSync(f.record.path), false);
@@ -1422,9 +1441,16 @@ for (const strategy of ["squash", "merge"] as const) {
     status: "skipped",
     reason: "already finalized",
   });
+  assert.equal(f.notifications.length, 2);
+  assert.equal(f.notifications[1].level, "info");
+  assert.ok(
+    f.notifications[1].message.includes(
+      `Deleted local/remote branch ${f.record.taskBranch} and removed its worktree.`,
+    ),
+  );
   f.assertNoAdmissions();
   console.log(
-    "PASS: executor restart after a pushed result and partial cleanup retries only remaining cleanup and is idempotent",
+    "PASS: partial cleanup warns without a success notice; restart finishes cleanup and notifies once",
   );
 }
 {

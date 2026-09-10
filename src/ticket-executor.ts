@@ -1108,7 +1108,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         target,
       );
       this.deps.callback(
-        `Finalized "${card.title}" at ${result.resultSha} in ${target}.`,
+        `Finalized #${card.number} "${card.title}" at ${result.resultSha} in ${target}. Deleted local/remote branch ${record.taskBranch} and removed its worktree.`,
       );
       return { status: "finalized", resultSha: result.resultSha };
     } catch (error) {
