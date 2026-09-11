@@ -135,9 +135,8 @@ closed.
 
 Review is opt-in (`review.enabled: false` by default). Without it, humans
 validate the retained worktree, move the Task to `Done`, and close the Issue.
-Finalization then pins the fresh task SHA after local/remote agreement. When AI
-review is enabled, a persisted PASS is required; any existing reviewed SHA is
-binding even if AI review is later disabled.
+Closing a Done Issue approves the current local task branch, including unpushed
+commits. Finalization does not require a persisted review SHA or Plan.
 
 When enabled, a Review Task is claimed and re-read. `review.ts` then:
 
@@ -158,32 +157,31 @@ The Issue remains open and the persistent task worktree remains available for
 human validation. Closing a Done Issue is the approval signal; no claim or new
 worktree is created during finalization.
 
-## Exact-SHA finalization
+## Local-branch finalization
 
-For a closed Done Task with no active run:
+For a fresh, closed Done Task in the origin repository:
 
-1. Require the existing clean, registered, unlocked persistent worktree.
-2. Fetch base/task and require local task HEAD, local task ref, and remote task
-   ref to be identical. If present, `reviewedTaskSha` must also match. The
-   executor requires that approval when `review.enabled` is true.
-3. Atomically persist `{targetBranch, baseSha, taskSha}`.
-4. Re-fetch and re-check those SHAs.
-5. Use `git merge-tree --write-tree` to compute the result tree.
-6. Use `git commit-tree` to create either a one-parent squash commit or a
-   two-parent merge commit with `Board-Agent-Item: <itemId>`.
-7. Atomically persist `resultSha`.
-8. Re-fetch/re-check, then normally push `resultSha:refs/heads/<base>`.
-9. Fetch and verify `resultSha` is reachable from `origin/<base>`.
-10. Preflight every cleanup condition, then remove the worktree, exact local
-    task ref, exact remote task ref (force-with-lease), and record.
+1. Derive `task/issue-<number>` using the configured task prefix. If the local
+   branch is absent, it is settled: no remote lookup, record requirement,
+   warning, or leftover-file cleanup. Git errors are not treated as absence.
+2. Refuse active builders and unsafe registered task worktrees. A branch does
+   not need to be checked out, pushed, or accompanied by an execution record.
+3. Fetch `origin/<base>` and use native `git merge-tree` / `git commit-tree`
+   to merge or squash the local tip, leaving the main checkout untouched.
+4. Push normally and fetch again to verify the result reached the remote base.
+5. Recheck the local ref/worktrees, delete only an integrated remote task ref
+   with an exact deletion lease, remove clean managed worktrees, then delete
+   the local ref with its expected SHA. Clear a matching builder record if any.
 
-A restart resumes from the journal, verifying its exact result tree, ordered
-parents, and complete item marker. If the result already reached the base,
-only guarded cleanup is retried. A new builder cannot overwrite or erase a
-pending journal; abandoning a proven-unpushed intent is an explicit, backed-up
-manual recovery operation. Dirty/missing/locked/unregistered worktrees,
-base/task/reviewed-SHA drift, merge conflicts, push rejection, or cleanup drift
-preserve the journal and recoverable artifacts. The card stays `Done`.
+The local branch is the retry/completion signal and is deleted last. There is
+no new finalization journal. Merge ancestry or an unchanged squash result tree
+avoids duplicate integration on retry; conflicting later edits after a squash
+need manual resolution. Dirty/locked worktrees, conflicts, rejected pushes,
+failed verification, and ref races preserve work rather than forcing cleanup.
+`Plan` and `reviewedTaskSha` remain useful build/review metadata, not completion
+gates. Story completion uses the same closed-Done/no-local-branch rule for its
+children. Existing legacy journals remain protected against builder relaunch;
+the finalizer does not depend on them.
 
 ## Story exactly-once state machine
 

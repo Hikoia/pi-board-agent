@@ -1187,6 +1187,115 @@ function finalFixture(
   };
 }
 
+{
+  const f = finalFixture("merge", true);
+  f.card.plan = undefined;
+  f.finalBoard.cards.get(f.card.itemId)!.plan = undefined;
+  rmSync(
+    join(
+      f.checkout,
+      ".pi",
+      "board-agent",
+      "ticket-worktrees",
+      `${f.card.itemId.toLowerCase()}.json`,
+    ),
+  );
+  git(f.checkout, "worktree", "remove", f.record.path);
+  git(f.checkout, "push", "origin", "--delete", f.record.taskBranch);
+  const loop = new BoardLoop(
+    {
+      cwd: f.checkout,
+      cfg: f.finalCfg,
+      repoOwner: "test",
+      repoName: "repo",
+      botLogin: "bot",
+      meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
+      callback: (message, level = "info") =>
+        f.notifications.push({ message, level }),
+      listCards: async () => f.finalBoard.all(),
+    },
+    createLoopState(),
+    f.make(),
+    f.store,
+  );
+  await loop.tickNow();
+  assert.notEqual(
+    f.tip(),
+    f.baseSha,
+    "Done + Closed must merge a local-only branch without Plan, record, worktree or AI approval",
+  );
+  assert.equal(
+    git(f.checkout, "show", "origin/main:accepted.txt"),
+    "approved exact content",
+  );
+  assert.deepEqual(await f.make().finalizeClosed(f.card), {
+    status: "skipped",
+    reason: "no local task branch",
+  });
+  f.assertNoAdmissions();
+  console.log(
+    "PASS: Done + Closed finalizes a local-only branch without Plan or execution metadata",
+  );
+}
+
+{
+  const f = finalFixture();
+  git(f.checkout, "worktree", "remove", f.record.path);
+  git(
+    f.checkout,
+    "update-ref",
+    "-d",
+    `refs/heads/${f.record.taskBranch}`,
+    f.taskSha,
+  );
+  mkdirSync(f.record.path);
+  writeFileSync(join(f.record.path, "leftover.txt"), "do not delete\n");
+  const before = f.finalBoard.all();
+  // Remote branch and stale record still exist; neither is needed to settle.
+  git(
+    f.checkout,
+    "remote",
+    "set-url",
+    "origin",
+    join(f.checkout, "unavailable.git"),
+  );
+  for (let restart = 0; restart < 2; restart++) {
+    const actual = f.make();
+    const loop = new BoardLoop(
+      {
+        cwd: f.checkout,
+        cfg: f.finalCfg,
+        repoOwner: "test",
+        repoName: "repo",
+        botLogin: "bot",
+        meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
+        callback: (message, level = "info") =>
+          f.notifications.push({ message, level }),
+        listCards: async () => f.finalBoard.all(),
+      },
+      createLoopState(),
+      actual,
+      f.store,
+    );
+    await loop.tickNow();
+    assert.deepEqual(await actual.finalizeClosed(f.card), {
+      status: "skipped",
+      reason: "no local task branch",
+    });
+  }
+  assert.deepEqual(f.notifications, []);
+  assert.deepEqual(f.finalBoard.all(), before);
+  assert.equal(
+    readFileSync(join(f.record.path, "leftover.txt"), "utf8"),
+    "do not delete\n",
+  );
+  assert.ok(f.store.has(f.card.itemId));
+  f.assertNoAdmissions();
+  console.log(
+    "PASS: no local task branch settles silently offline, regardless of Plan, stale records or remote/worktree leftovers",
+  );
+}
+
 for (const strategy of ["squash", "merge"] as const) {
   const f = finalFixture(strategy);
   assert.equal(_DEFAULTS.review.enabled, false);
@@ -1245,7 +1354,7 @@ for (const strategy of ["squash", "merge"] as const) {
   assert.equal(f.tip(), result);
   assert.deepEqual(await f.make().finalizeClosed(f.card), {
     status: "skipped",
-    reason: "already finalized",
+    reason: "no local task branch",
   });
   assert.equal(
     git(
@@ -1278,7 +1387,6 @@ for (const strategy of ["squash", "merge"] as const) {
     { status: cfg.columns.ready },
     { number: 9999 },
     { itemId: "DIFFERENT" },
-    { plan: "changed" },
     { type: "Story" },
     { contentType: "PullRequest" },
     { contentType: "DraftIssue" },
@@ -1308,64 +1416,32 @@ for (const strategy of ["squash", "merge"] as const) {
   assert.deepEqual(f.notifications, []);
   f.assertNoAdmissions();
   console.log(
-    "PASS: finalizer fresh read rejects identity, Plan, repository, type, state drift, removal and read errors before any mutation",
+    "PASS: finalizer fresh read rejects identity, repository, type, state drift, removal and read errors before any mutation",
   );
-
-  const file = join(
-    f.checkout,
-    ".pi",
-    "board-agent",
-    "ticket-worktrees",
-    `${expected.itemId.toLowerCase()}.json`,
+  f.finalBoard.cards.get(expected.itemId)!.plan = "changed-after-build";
+  assert.equal((await f.make().finalizeClosed(expected)).status, "finalized");
+  assert.equal(
+    f.finalBoard.cards.get(expected.itemId)!.plan,
+    "changed-after-build",
   );
-  const original = readFileSync(file, "utf8");
-  for (const patch of [
-    { issueNumber: 9999 },
-    { itemId: "OTHER" },
-    { plan: "other" },
-    { taskBranch: "unrelated" },
-    { baseBranch: "other" },
-    { path: f.checkout },
-    { schemaVersion: 2 },
-    { activeRunId: "still-running" },
-    { launchingAt: 0 },
-  ]) {
-    writeFileSync(file, JSON.stringify({ ...f.record, ...patch }));
-    assert.equal(
-      (await f.make().finalizeClosed(expected)).status,
-      "blocked",
-      JSON.stringify(patch),
-    );
-    assert.equal(f.tip(), f.baseSha);
-    assert.ok(existsSync(f.record.path));
-  }
-  writeFileSync(file, "{ corrupt");
-  assert.equal((await f.make().finalizeClosed(expected)).status, "blocked");
-  assert.equal(readFileSync(file, "utf8"), "{ corrupt");
-  rmSync(file);
-  assert.equal((await f.make().finalizeClosed(expected)).status, "blocked");
-  assert.equal(existsSync(file), false);
-  writeFileSync(file, original);
-  f.assertNoAdmissions();
-  console.log(
-    "PASS: missing/corrupt/legacy and identity/path/active-run record guards fail closed without recreation",
-  );
+  console.log("PASS: changing Plan does not prevent closed Done finalization");
 }
 {
   const f = finalFixture("merge", true);
-  const blocked = await f.make().finalizeClosed(f.card);
-  assert.equal(blocked.status, "blocked");
-  assert.match(
-    blocked.status === "blocked" ? blocked.reason : "",
-    /no persisted reviewed task SHA/,
-  );
-  assert.equal(f.tip(), f.baseSha);
   f.store.setReviewedTaskSha(f.card.itemId, f.taskSha);
-  const done = await f.make().finalizeClosed(f.card);
-  assert.equal(done.status, "finalized");
+  writeFileSync(join(f.record.path, "local-only.txt"), "latest local work\n");
+  git(f.record.path, "add", "local-only.txt");
+  git(f.record.path, "commit", "-m", "local work after review");
+  const localSha = git(f.record.path, "rev-parse", "HEAD");
+  assert.equal((await f.make().finalizeClosed(f.card)).status, "finalized");
+  assert.equal(
+    git(f.checkout, "show", "origin/main:local-only.txt"),
+    "latest local work",
+  );
+  git(f.checkout, "merge-base", "--is-ancestor", localSha, "origin/main");
   f.assertNoAdmissions();
   console.log(
-    "PASS: enabling AI review requires its persisted exact-SHA approval, while the disabled default does not",
+    "PASS: closing Done approves the current local branch, including unpushed commits after review",
   );
 }
 {
@@ -1409,67 +1485,48 @@ for (const strategy of ["squash", "merge"] as const) {
   chmodSync(hook, 0o755);
   const first = await f.make().finalizeClosed(f.card);
   assert.equal(first.status, "blocked");
-  assert.deepEqual(
-    f.notifications.map((notice) => notice.level),
-    ["warn"],
-  );
-  assert.match(f.notifications[0].message, /Finalization blocked/);
-  const saved = f.store.read(f.card.itemId)!.finalization!;
-  assert.equal(f.tip(), saved.resultSha);
-  assert.equal(existsSync(f.record.path), false);
+  const published = f.tip();
+  assert.notEqual(published, f.baseSha);
+  assert.equal(f.store.localBranchSha(f.record.taskBranch), f.taskSha);
+  assert.equal(existsSync(f.record.path), true);
   assert.equal(f.tip(f.record.taskBranch), f.taskSha);
-  assert.throws(() =>
-    git(
-      f.checkout,
-      "rev-parse",
-      "--verify",
-      `refs/heads/${f.record.taskBranch}`,
-    ),
-  );
+  assert.equal(f.store.read(f.card.itemId)!.finalization, undefined);
+  assert.deepEqual(f.notifications, []);
   rmSync(hook);
   const restarted = f.make();
-  const outcome = await restarted.finalizeClosed(f.card);
-  assert.deepEqual(outcome, {
+  assert.deepEqual(await restarted.finalizeClosed(f.card), {
     status: "finalized",
-    resultSha: saved.resultSha,
+    resultSha: published,
   });
-  assert.equal(f.tip(), saved.resultSha);
+  assert.equal(
+    f.tip(),
+    published,
+    "retry must not create a second squash commit",
+  );
   assert.equal(f.tip(f.record.taskBranch), "");
-  assert.equal(f.store.has(f.card.itemId), false);
+  assert.equal(f.store.localBranchSha(f.record.taskBranch), undefined);
   assert.equal(existsSync(f.record.path), false);
   assert.deepEqual(await restarted.finalizeClosed(f.card), {
     status: "skipped",
-    reason: "already finalized",
+    reason: "no local task branch",
   });
-  assert.equal(f.notifications.length, 2);
-  assert.equal(f.notifications[1].level, "info");
-  assert.ok(
-    f.notifications[1].message.includes(
-      `Deleted local/remote branch ${f.record.taskBranch} and removed its worktree.`,
-    ),
-  );
+  assert.equal(f.notifications.length, 1);
   f.assertNoAdmissions();
   console.log(
-    "PASS: partial cleanup warns without a success notice; restart finishes cleanup and notifies once",
+    "PASS: cleanup failure retains the local retry signal; restart finishes without another merge or execution journal",
   );
 }
 {
   const f = finalFixture();
-  git(f.checkout, "worktree", "remove", f.record.path);
-  const actual = f.make();
-  const outcome = await actual.finalizeClosed(f.card);
+  f.store.setActiveRun(f.card.itemId, "still-running");
+  const outcome = await f.make().finalizeClosed(f.card);
   assert.equal(outcome.status, "blocked");
-  assert.match(
-    outcome.status === "blocked" ? outcome.reason : "",
-    /missing worktree/,
-  );
-  assert.equal((await actual.finalizeClosed(f.card)).status, "blocked");
+  assert.match(outcome.status === "blocked" ? outcome.reason : "", /active/);
   assert.equal(f.tip(), f.baseSha);
-  assert.equal(existsSync(f.record.path), false);
-  assert.ok(f.store.has(f.card.itemId));
+  assert.ok(existsSync(f.record.path));
   f.assertNoAdmissions();
   console.log(
-    "PASS: executor never recreates a missing worktree for a closed Done ticket",
+    "PASS: an active builder is never merged or deleted during finalization",
   );
 }
 {
@@ -1498,7 +1555,6 @@ for (const strategy of ["squash", "merge"] as const) {
   );
   const before = readFileSync(file, "utf8");
   const actual = f.make();
-  assert.equal((await actual.finalizeClosed(f.card)).status, "blocked");
   let boardReads = 0;
   const loop = new BoardLoop(
     {

@@ -175,19 +175,19 @@ persistent ticket worktree path. Use `/board-agent status` and the record's
 | Message / state | Automation behavior | Required human action |
 | --- | --- | --- |
 | `Unsupported pre-0.2.0 Board Agent state detected` | Startup/lint/run stop read-only | Stop Pi, back up the listed paths and refs, finish/preserve old work, then remove or deliberately migrate each listed artifact. |
+| Closed `Done`, no local task branch | Settled silently, without remote queries or leftover-file deletion | Nothing to change. Keep `Plan`; stale records or remote-only branches do not make the finalizer run again. |
+| Closed `Done`, local task branch exists | Merge into fresh `origin/<base>`, push and verify, then delete; no Plan, execution record or AI-review marker required | Validate the current local commits before closing the Issue. Local-only branches are supported. |
 | `In Progress` without a valid v3 record | That card moves to `Needs Human`; siblings continue | Inspect Issue history and branches. Restore a verified record/worktree from backup or restart intentionally from `Ready`. |
 | Missing WorkflowManager run or mismatched persisted args | Stops/quarantines only that ticket | Preserve the worktree, inspect the run journal and record, then move to `Ready` only when ownership and intended diff are known. |
 | Dirty completed worktree / wrong branch / unmanaged path | Fails closed to `Needs Human` | Do not reset automatically. Inspect and commit/push valid ticket work, or discard it explicitly; restore the expected registered branch/path before retry. |
 | Usage-limit pause | Remains paused for the scheduler | Wait or repair provider access. Do not create a second run. |
 | `AI review failed ... Leaving in Review` | Card stays `Review`; no reviewed SHA or Done transition | Fix fetch/auth/agent/cleanup failure. The next tick retries in a new detached worktree. |
 | Main checkout changed during isolated review | Review fails and ephemeral cleanup is attempted | Inspect the main checkout immediately; preserve unexpected changes and restore its prior branch/HEAD/status before retry. |
-| AI review enabled but no persisted reviewed task SHA | Closed Done finalization is blocked | Reopen the Issue, move the Task to `Review` (or `Ready` if rebuilding), and obtain a fresh PASS. With AI review disabled, manual validation plus `Done` and Issue closure approves the matching fresh local/remote SHA instead. Existing reviewed SHAs remain binding in either mode. |
-| `origin/task/... moved after review` | No merge or cleanup | If movement was unauthorized, restore the exact reviewed SHA. Otherwise reopen the Issue, move to `Ready`, rebuild/review the new SHA, validate, then close again. |
-| Base/task moved after the finalization journal was written | No push or cleanup; new builders cannot overwrite pending intent | Restore the journaled identities, or follow **Abandoning an unpushed finalization** below. Moving to `Ready` alone does not clear the journal. |
-| Dirty, missing, unregistered, or locked finalization worktree | Card remains closed and `Done`; artifacts stay | For a lock, verify no process uses it and run `git worktree unlock <path>`. For a missing registration, restore the exact branch at the recorded path with `git worktree add <path> <task-branch>` and verify HEAD equals `reviewedTaskSha`. Dirty changes require a new review. |
-| Merge conflict / unrelated history | No result is pushed | Reopen the Issue and resolve on the task branch in its retained worktree, push, run review again, validate, and close. |
-| Push rejected | Journal retains `resultSha`; worktree/refs remain | Repair credentials or branch protection for a normal non-force base push. The next tick retries the same result SHA after revalidation. |
-| Cleanup drift/failure after base integration | Result remains on base; record and remaining artifacts are retained | Do not merge again. Restore the task ref to the journaled SHA or remove the external lock, then let the next tick retry guarded cleanup. |
+| Missing or older AI-reviewed SHA on a closed Done Task | Not a finalization gate; closure approves the current local branch | Reopen the Issue if the current commits are not approved. AI review still governs automated `Review` → `Done`. |
+| Dirty, missing, locked or unmanaged registered task worktree | No unsafe removal; card remains closed and `Done` | Stop Board Agent and preserve/resolve the worktree. For a lock, confirm no process uses it before `git worktree unlock <path>`. A branch without a registered worktree needs no recreation. |
+| Merge conflict / unrelated history | No result is pushed | Reopen the Issue, resolve and commit on the local task branch, validate, then close again. |
+| Push rejected / verification failed | Local branch and worktrees remain | Repair credentials, connectivity or branch protection. The next tick merges against the fresh remote base and retries a normal, non-force push. |
+| Cleanup drift/failure after base integration | Local branch remains as the retry signal | Resolve the reported lock or ref race. Unmerged remote-only commits must be preserved/integrated, never force-deleted. Retries avoid duplicate merges by ancestry or an unchanged squash result tree. |
 | `Story creation needs human input` | Creation journal and completed children remain; Story moves to `Needs Human` | Fix auth, Project fields, duplicate marker ambiguity, or incorrect item identity. Move the Story to `Ready`; it resumes without rerunning refinement or duplicating children. |
 | Story/Task in `Needs Design` | Waits without consuming untrusted comments | Reply as repository OWNER/MEMBER/COLLABORATOR after the latest authentic question/gate. |
 | Story create/add/comment attempted but result unconfirmed | Keeps attempt markers and refuses blind repetition | Inspect paginated sub-Issues, Project items, and bot comments. Restore/adopt the intended remote result where possible. Clear an attempt marker only while stopped, after backup and positive confirmation that the operation did not take effect. |
@@ -199,7 +199,7 @@ persistent ticket worktree path. Use `/board-agent status` and the record's
 
 ## Manual verification before retry
 
-For a ticket record, compare all immutable identities:
+Before retrying a local task branch, inspect its commits and worktrees:
 
 ```bash
 git -C <repo> worktree list --porcelain
@@ -209,17 +209,20 @@ git -C <worktree> rev-parse HEAD
 git -C <repo> ls-remote origin refs/heads/<task-branch> refs/heads/<base>
 ```
 
-Before finalization, the worktree HEAD, local task ref, remote task ref, and
-journal `taskSha` must agree. A stored `reviewedTaskSha` must also agree; it is
-mandatory when AI review is enabled. Never force-push the base as a recovery
-shortcut.
+Done + closed approves committed work on the current local task branch.
+The remote task branch may be absent or behind it. Registered task worktrees
+must be clean; remote-only commits and concurrent ref changes prevent deletion.
+Stop the owner before manually resolving completed-ticket branches. Never
+force-push the base as a recovery shortcut.
 
-### Abandoning an unpushed finalization
+### Legacy journal recovery before a new builder run
 
-Stop the owner and back up the record, worktree, and refs first. Fetch the base
-and inspect the journal's `resultSha` and remote history. If that result is
-integrated, resume guarded cleanup instead of rebuilding or merging again.
-If its push/integration status cannot be established, preserve the journal.
+The current finalizer needs no journal; local branch presence determines whether
+it has work to do. Older v3 records may still contain a `finalization` member,
+which remains protected against accidental builder relaunch. Before deliberately
+starting a new build, stop the owner and back up the record, worktree and refs.
+Inspect the old `resultSha` and remote history. If its integration status cannot
+be established, preserve the journal.
 
 Only after proving the intent was not integrated may an operator remove the
 `finalization` member from the backed-up v3 record, preserving all other

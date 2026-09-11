@@ -1048,76 +1048,31 @@ export class ManagedTicketExecutor implements TicketExecutor {
         status: "skipped",
         reason: "card is not a Task Issue in the configured repository",
       };
-    if (
-      card.itemId !== snapshot.itemId ||
-      card.number !== snapshot.number ||
-      !card.plan ||
-      !snapshot.plan ||
-      planSlug(card.plan) !== planSlug(snapshot.plan)
-    )
-      return { status: "skipped", reason: "issue or Plan changed" };
+    if (card.itemId !== snapshot.itemId || card.number !== snapshot.number)
+      return { status: "skipped", reason: "issue changed" };
     if (!card.closed || !statusIs(card, this.deps.cfg.columns.done))
       return {
         status: "skipped",
         reason: "ticket is no longer closed and Done",
       };
 
-    const target = this.deps.cfg.branches.base;
     try {
-      if (
-        !this.deps.worktrees.has(card.itemId) &&
-        this.deps.worktrees.isMerged(card.itemId, target)
-      )
-        return { status: "skipped", reason: "already finalized" };
-      const record = this.deps.worktrees.read(card.itemId);
-      if (!record)
-        return {
-          status: "blocked",
-          reason: "missing or unsupported v3 execution record",
-        };
-      const task = buildTasksForWave(this.deps.cfg, planSlug(card.plan), [
-        card,
-      ])[0];
-      if (
-        record.itemId !== card.itemId ||
-        record.issueNumber !== card.number ||
-        record.plan !== planSlug(card.plan) ||
-        record.taskBranch !== task.taskBranch ||
-        record.baseBranch !== target
-      )
-        return {
-          status: "blocked",
-          reason: "execution record does not match the fresh ticket",
-        };
-      if (record.activeRunId || record.launchingAt !== undefined)
-        return {
-          status: "blocked",
-          reason: "builder execution is still active",
-        };
-      if (this.deps.cfg.review.enabled && !record.reviewedTaskSha)
-        return {
-          status: "blocked",
-          reason:
-            "AI review is enabled but the ticket has no persisted reviewed task SHA",
-        };
-
-      const result = this.deps.worktrees.finalizeAccepted(
-        record,
+      const task = buildTasksForWave(this.deps.cfg, "", [card])[0];
+      const resultSha = this.deps.worktrees.finalizeAccepted(
+        task,
         this.deps.cfg.task_merge_strategy,
-        card.title,
-        target,
       );
+      if (!resultSha)
+        return { status: "skipped", reason: "no local task branch" };
       this.deps.callback(
-        `Finalized #${card.number} "${card.title}" at ${result.resultSha} in ${target}. Deleted local/remote branch ${record.taskBranch} and removed its worktree.`,
+        `Finalized #${card.number} "${card.title}" at ${resultSha} in ${task.baseBranch}. Deleted local/remote branch ${task.taskBranch} and removed its worktree.`,
       );
-      return { status: "finalized", resultSha: result.resultSha };
+      return { status: "finalized", resultSha };
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      this.deps.callback(
-        `Finalization blocked for "${card.title}": ${reason}`,
-        "warn",
-      );
-      return { status: "blocked", reason };
+      return {
+        status: "blocked",
+        reason: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 

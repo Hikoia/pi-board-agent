@@ -27,10 +27,16 @@ Task Ready
   → optional detached AI review, or manual validation
   → Done (still unmerged; worktree retained)
   → human closes the Issue
-  → exact-SHA merge/squash into branches.base
-  → verify origin/base
-  → remove worktree and local/remote task branch
+  → no local task branch? already settled
+  → otherwise merge/squash local task branch into branches.base (main by default)
+  → push and verify origin/base
+  → delete remote branch, worktree, then local task branch
 ```
+
+`Plan` is required to claim/build a ticket, not to finish one. A closed `Done`
+Task needs no execution record or review marker for finalization. If its local
+`task/issue-<number>` branch is absent, Board Agent leaves it settled without
+querying remote branches or deleting leftover files.
 
 `Needs Design` accepts decisions only from repository `OWNER`, `MEMBER`, or
 `COLLABORATOR` comments. `Needs Human` is terminal until a human fixes the
@@ -85,8 +91,9 @@ graceful stop that pauses managed runs before releasing ownership.
 
 Stop Board Agent, install the new reviewed SHA, restart Pi, and run lint:
 
-```bash
-LATEST_SHA=$(gh api repos/Hikoia/pi-board-agent/commits/main --jq .sha)
+```powershell
+$LATEST_SHA = gh api repos/Hikoia/pi-board-agent/commits/main --jq .sha
+if ($LASTEXITCODE -ne 0 -or -not $LATEST_SHA) { throw "Failed to retrieve commit SHA" }
 pi install "git:github.com/Hikoia/pi-board-agent@$LATEST_SHA"
 ```
 
@@ -147,10 +154,10 @@ uses `project.owner`; Issue reads and mutations always use the repository
 parsed from `git remote get-url origin`.
 
 AI review is disabled by default. Validate the retained worktree, move the Task
-to `Done`, then close its Issue to approve integration of the matching local and
-fresh remote task SHA. Set `review.enabled: true` for automated `Review` →
-`Done`; this mode requires a persisted PASS. Any existing reviewed SHA must
-still match, even if AI review is subsequently disabled.
+to `Done`, then close its Issue to approve integration of its current local task
+branch, including committed changes not yet pushed. Set `review.enabled: true`
+for automated `Review` → `Done`. Finalization itself does not require an AI
+review record; closing the Done Issue is the human approval.
 
 The full annotated schema is in [`config-template.yml`](config-template.yml).
 All counts and timers must be finite safe integers; durations must also fit a
@@ -168,12 +175,12 @@ JavaScript timer after unit conversion.
 - AI review never runs in the main checkout. It uses a detached, disposable
   managed worktree pinned to the first fresh post-claim `origin/task` SHA.
 - Review PASS persists that exact SHA before exposing `Done`.
-- Finalization records its base/task SHAs before creating a merge result,
-  records the result SHA before a normal push, verifies `origin/base`, and
-  only then cleans up.
-- Dirty, missing, unregistered, locked, conflicting, moved-SHA, rejected-push,
-  and cleanup failures preserve recovery artifacts and leave the card in
-  `Done`.
+- Finalization merges the local task branch into the fresh remote base without
+  modifying the main checkout. It verifies the normal, non-force push before
+  cleanup, and deletes the local branch last so failures remain retryable.
+- Active builders, dirty/locked/unmanaged registered task worktrees, merge
+  conflicts, failed pushes, and concurrent ref changes prevent unsafe cleanup.
+  Remote-only commits are never discarded. The card stays `Done`.
 - Story child markers, sub-Issue reconciliation, Project-content
   reconciliation, and atomic journals prevent duplicate children after a
   crash or ambiguous GitHub mutation result.

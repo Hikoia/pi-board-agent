@@ -53,11 +53,6 @@ export interface WorktreeCheck {
   reason?: string;
 }
 
-export interface FinalizeResult {
-  resultSha: string;
-  resumed: boolean;
-}
-
 const SHA = /^[0-9a-f]{40}$/i;
 const RECORD_FIELDS = new Set([
   "schemaVersion",
@@ -206,7 +201,7 @@ export function isTicketExecutionRecord(
   );
 }
 
-/** Persistent per-ticket worktrees and exact-SHA finalization state. */
+/** Persistent builder worktrees and local-branch finalization. */
 export class TicketWorktrees {
   private readonly repoRoot: string;
   private readonly gitCommonDir?: string;
@@ -272,6 +267,22 @@ export class TicketWorktrees {
 
   has(itemId: string): boolean {
     return existsSync(this.recordPath(itemId));
+  }
+
+  /** Only a missing local ref means done; Git errors must not look like absence. */
+  localBranchSha(branch: string): string | undefined {
+    this.validateBranches(branch);
+    const ref = `refs/heads/${branch}`;
+    const args = ["show-ref", "--verify", "--quiet", ref];
+    const result = git(args, this.repoRoot);
+    if (!result.ok) {
+      if (result.status === 1) return undefined;
+      throw processFailure("git", args, result);
+    }
+    const symbolic = git(["symbolic-ref", "--quiet", ref], this.repoRoot);
+    if (symbolic.ok || symbolic.status !== 1)
+      throw new Error(`Local ${branch} is symbolic or unreadable.`);
+    return mustGit(["rev-parse", "--verify", `${ref}^{commit}`], this.repoRoot);
   }
 
   private save(record: TicketExecutionRecord): void {
@@ -384,32 +395,6 @@ export class TicketWorktrees {
       throw new Error(
         "Ticket has a pending finalization; recover it before starting another builder or review.",
       );
-  }
-
-  isMerged(itemId: string, targetBranch: string): boolean {
-    if (!singleLine(itemId) || !this.fetch(targetBranch).ok) return false;
-    const escaped = itemId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const result = git(
-      [
-        "log",
-        "--format=%B%x00",
-        "--extended-regexp",
-        `--grep=^Board-Agent-Item: ${escaped}$`,
-        `refs/remotes/origin/${targetBranch}`,
-        "--",
-      ],
-      this.repoRoot,
-    );
-    return (
-      result.ok &&
-      result.stdout
-        .split("\0")
-        .some(
-          (message) =>
-            message.trimEnd().split(/\r?\n/).at(-1) ===
-            `Board-Agent-Item: ${itemId}`,
-        )
-    );
   }
 
   private clear(itemId: string): void {
@@ -665,114 +650,51 @@ export class TicketWorktrees {
     return record;
   }
 
-  /** Finalize from immutable remote SHAs, verify the pushed result, then clean up. */
+  /** Closed + Done approves the current local branch, not an execution record. */
   finalizeAccepted(
-    record: TicketExecutionRecord,
+    task: BuilderTask,
     strategy: Config["task_merge_strategy"],
-    title: string,
-    targetBranch: string,
-  ): FinalizeResult {
-    let current = this.read(record.itemId);
-    if (!current || !sameIdentity(current, record))
-      throw new Error(`Missing or changed v3 record for ${record.itemId}.`);
+  ): string | undefined {
+    const taskSha = this.localBranchSha(task.taskBranch);
+    if (!taskSha) return undefined;
+    this.validateBranches(task.baseBranch);
+    if (task.taskBranch === task.baseBranch)
+      throw new Error("Task branch must differ from the base branch.");
     if (
-      current.baseBranch !== targetBranch ||
-      current.taskBranch === targetBranch
+      this.list().some(
+        (record) =>
+          record.taskBranch === task.taskBranch &&
+          (record.activeRunId || record.launchingAt !== undefined),
+      )
     )
-      throw new Error(
-        "Ticket base/task branch identity does not match the finalization target.",
-      );
-    this.validateBranches(targetBranch, current.taskBranch);
-    this.assertOwnedPath(current);
-    if (current.activeRunId || current.launchingAt !== undefined)
       throw new Error("Builder execution is still active.");
-    const resumed = !!current.finalization;
-
-    if (!current.finalization) {
-      const check = this.check(current, true);
-      if (!check.ok) throw new Error(check.reason ?? "worktree is unsafe");
-      this.fetchRequired(targetBranch, current.taskBranch);
-      const baseSha = this.fetchedSha(targetBranch);
-      const taskSha = this.fetchedSha(current.taskBranch);
-      // AI review is optional. A human-only closed Done ticket approves this
-      // fresh remote SHA; an existing AI approval must still match exactly.
-      if (current.reviewedTaskSha && taskSha !== current.reviewedTaskSha)
-        throw new Error(
-          `origin/${current.taskBranch} moved after review from ${current.reviewedTaskSha} to ${taskSha}.`,
-        );
-      this.assertTaskSha(current, taskSha);
-      current = this.update(current.itemId, (value) => ({
-        ...value,
-        finalization: { targetBranch, baseSha, taskSha },
-      }));
-    }
-
-    let state = current.finalization!;
-    if (state.targetBranch !== targetBranch)
-      throw new Error(
-        "Saved finalization target changed; refusing to continue.",
-      );
-    if (current.reviewedTaskSha && state.taskSha !== current.reviewedTaskSha)
-      throw new Error(
-        "Saved finalization SHA does not match the reviewed task SHA.",
-      );
-
+    this.checkedTaskWorktrees(task.taskBranch, taskSha);
+    this.fetchRequired(task.baseBranch);
+    const baseSha = this.fetchedSha(task.baseBranch);
+    const state = { targetBranch: task.baseBranch, baseSha, taskSha };
     const treeSha = this.resultTree(state);
-    if (!state.resultSha) {
-      this.assertReadyToPush(current, state);
-      const subject = `chore(board): merge ${current.taskKey} after validation`;
-      const body = `${title.replace(/[\r\n]+/g, " ")}\n\nRefs #${current.issueNumber}\nBoard-Agent-Item: ${current.itemId}`;
-      const parents = this.resultParents(state, strategy).flatMap((sha) => [
-        "-p",
-        sha,
-      ]);
-      const resultSha = mustGit(
-        ["commit-tree", treeSha, ...parents],
+    const parents = this.resultParents(state, strategy);
+    // ponytail: squash retries use tree equality; conflicting later edits need a manual merge.
+    const integrated =
+      this.isAncestor(taskSha, baseSha) ||
+      (strategy === "squash" &&
+        treeSha === mustGit(["rev-parse", `${baseSha}^{tree}`], this.repoRoot));
+    let resultSha = baseSha;
+    if (!integrated) {
+      resultSha = mustGit(
+        ["commit-tree", treeSha, ...parents.flatMap((sha) => ["-p", sha])],
         this.repoRoot,
-        `${subject}\n\n${body}\n`,
+        `chore(board): merge ${task.taskKey} after validation\n\n${task.title.replace(/[\r\n]+/g, " ")}\n\nRefs #${task.issueNumber}\nBoard-Agent-Item: ${task.itemId}\n`,
       );
       if (!SHA.test(resultSha))
         throw new Error("git commit-tree returned no result commit.");
-      current = this.update(current.itemId, (value) => ({
-        ...value,
-        finalization: { ...state, resultSha },
-      }));
-      state = current.finalization!;
-    }
-
-    const resultSha = state.resultSha!;
-    // The journal is recovery input, not proof: verify the exact tree, ordered
-    // parents and marker even when the saved result is already on the remote.
-    const [tree, parents, ...message] = mustGit(
-      ["show", "-s", "--format=%T%n%P%n%B", resultSha, "--"],
-      this.repoRoot,
-    ).split(/\r?\n/);
-    if (
-      tree !== treeSha ||
-      parents !== this.resultParents(state, strategy).join(" ") ||
-      message.at(-1) !== `Board-Agent-Item: ${current.itemId}`
-    )
-      throw new Error(
-        "Saved finalization result does not match its exact tree, parents or item marker.",
-      );
-
-    this.fetchRequired(targetBranch);
-    if (!this.isAncestor(resultSha, this.fetchedSha(targetBranch))) {
-      // Every retry must pass the same worktree and SHA gates as the first push.
-      this.assertReadyToPush(current, state);
       mustGit(
-        ["push", "origin", `${resultSha}:refs/heads/${targetBranch}`],
+        ["push", "origin", `${resultSha}:refs/heads/${task.baseBranch}`],
         this.repoRoot,
       );
-      this.fetchRequired(targetBranch);
-      if (!this.isAncestor(resultSha, this.fetchedSha(targetBranch)))
-        throw new Error(
-          `Pushed result ${resultSha} is not on origin/${targetBranch}.`,
-        );
     }
-
-    this.cleanupFinalized(current, state);
-    return { resultSha, resumed };
+    this.cleanupFinalized(task, taskSha, resultSha);
+    return resultSha;
   }
 
   private resultTree(state: TicketFinalizationState): string {
@@ -796,146 +718,95 @@ export class TicketWorktrees {
       : [state.baseSha];
   }
 
-  private assertReadyToPush(
-    record: TicketExecutionRecord,
-    state: TicketFinalizationState,
-  ): void {
-    const check = this.check(record, true);
-    if (!check.ok) throw new Error(check.reason ?? "worktree is unsafe");
-    this.assertRemoteShas(record, state);
-  }
-
-  private assertTaskSha(record: TicketExecutionRecord, expected: string): void {
-    const local = branchSha(record.taskBranch, this.repoRoot);
-    const head = git(["rev-parse", "HEAD"], record.path);
-    if (
-      !local ||
-      local !== expected ||
-      !head.ok ||
-      head.stdout.trim() !== expected
-    )
-      throw new Error(
-        `${record.taskBranch} does not exactly match approved origin SHA ${expected}.`,
-      );
-  }
-
-  private assertRemoteShas(
-    record: TicketExecutionRecord,
-    state: TicketFinalizationState,
-  ): void {
-    this.fetchRequired(state.targetBranch, record.taskBranch);
-    const base = this.fetchedSha(state.targetBranch);
-    const task = this.fetchedSha(record.taskBranch);
-    if (base !== state.baseSha)
-      throw new Error(
-        `origin/${state.targetBranch} moved from approved ${state.baseSha} to ${base}.`,
-      );
-    if (task !== state.taskSha)
-      throw new Error(
-        `origin/${record.taskBranch} moved from approved ${state.taskSha} to ${task}.`,
-      );
-    this.assertTaskSha(record, state.taskSha);
+  private checkedTaskWorktrees(branch: string, taskSha: string): string[] {
+    const entries = this.worktreeEntries().filter(
+      (entry) => entry.branch === branch,
+    );
+    for (const entry of entries) {
+      if (!this.isManagedPath(entry.path))
+        throw new Error(`Refusing to remove unmanaged worktree: ${entry.path}`);
+      if (entry.locked) throw new Error(`Locked worktree: ${entry.path}`);
+      if (!existsSync(entry.path))
+        throw new Error(`Missing worktree: ${entry.path}`);
+      if (
+        mustGit(["branch", "--show-current"], entry.path) !== branch ||
+        mustGit(["rev-parse", "HEAD"], entry.path) !== taskSha
+      )
+        throw new Error(`Worktree branch or HEAD changed: ${entry.path}`);
+      if (
+        mustGit(
+          ["status", "--porcelain=v1", "--untracked-files=all"],
+          entry.path,
+        )
+      )
+        throw new Error(`Dirty worktree: ${entry.path}`);
+    }
+    return entries.map((entry) => entry.path);
   }
 
   private cleanupFinalized(
-    record: TicketExecutionRecord,
-    state: TicketFinalizationState,
+    task: BuilderTask,
+    taskSha: string,
+    resultSha: string,
   ): void {
-    if (record.taskBranch === state.targetBranch)
+    this.fetchRequired(task.baseBranch);
+    const baseSha = this.fetchedSha(task.baseBranch);
+    if (!this.isAncestor(resultSha, baseSha))
       throw new Error(
-        `Refusing to delete target branch: ${state.targetBranch}`,
+        `Pushed result ${resultSha} is not on origin/${task.baseBranch}.`,
       );
-    this.fetchRequired(state.targetBranch);
-    if (
-      !state.resultSha ||
-      !this.isAncestor(state.resultSha, this.fetchedSha(state.targetBranch))
-    )
-      throw new Error(
-        "Remote finalization result is not verified; cleanup refused.",
-      );
-
-    this.assertOwnedPath(record);
-    const entries = this.worktreeEntries();
-    const entry = entries.find((entry) => samePath(entry.path, record.path));
-    if (
-      entries.some(
-        (entry) =>
-          entry.branch === record.taskBranch &&
-          !samePath(entry.path, record.path),
-      )
-    )
-      throw new Error(
-        `Task branch is registered at another worktree; cleanup refused.`,
-      );
-    if (existsSync(record.path)) {
-      const check = this.check(record, true);
-      if (!check.ok)
-        throw new Error(check.reason ?? "Unsafe worktree remains.");
-      this.assertTaskSha(record, state.taskSha);
-    } else if (entry) {
-      throw new Error(
-        `Missing registered worktree cannot be cleaned: ${record.path}`,
-      );
-    }
-
-    const symbolic = git(
-      ["symbolic-ref", "--quiet", `refs/heads/${record.taskBranch}`],
-      this.repoRoot,
-    );
-    if (symbolic.ok || symbolic.status !== 1)
-      throw new Error(
-        `Local ${record.taskBranch} is symbolic or unreadable; cleanup refused.`,
-      );
-    const local = branchSha(record.taskBranch, this.repoRoot);
-    if (local && local !== state.taskSha)
-      throw new Error(`Local ${record.taskBranch} moved; cleanup refused.`);
-    const remote = git(
-      [
-        "ls-remote",
-        "--exit-code",
-        "--heads",
-        "origin",
-        `refs/heads/${record.taskBranch}`,
-      ],
-      this.repoRoot,
-    );
+    if (this.localBranchSha(task.taskBranch) !== taskSha)
+      throw new Error(`Local ${task.taskBranch} moved; cleanup refused.`);
+    const paths = this.checkedTaskWorktrees(task.taskBranch, taskSha);
+    const args = [
+      "ls-remote",
+      "--exit-code",
+      "--heads",
+      "origin",
+      `refs/heads/${task.taskBranch}`,
+    ];
+    const remote = git(args, this.repoRoot);
     if (remote.ok) {
       const remoteSha = remote.stdout.trim().split(/\s+/)[0];
-      if (remoteSha !== state.taskSha)
-        throw new Error(`Remote ${record.taskBranch} moved; cleanup refused.`);
-    } else if (remote.status !== 2) {
-      throw processFailure(
-        "git",
-        ["ls-remote", "origin", record.taskBranch],
-        remote,
-      );
-    }
-
-    if (existsSync(record.path))
-      mustGit(["worktree", "remove", record.path], this.repoRoot);
-    if (local)
-      mustGit(
-        [
-          "update-ref",
-          "--no-deref",
-          "-d",
-          `refs/heads/${record.taskBranch}`,
-          state.taskSha,
-        ],
-        this.repoRoot,
-      );
-    if (remote.ok)
+      if (
+        !SHA.test(remoteSha) ||
+        (!this.isAncestor(remoteSha, taskSha) &&
+          !this.isAncestor(remoteSha, baseSha))
+      )
+        throw new Error(
+          `Remote ${task.taskBranch} has unmerged work; cleanup refused.`,
+        );
       mustGit(
         [
           "push",
           "origin",
-          `--force-with-lease=refs/heads/${record.taskBranch}:${state.taskSha}`,
-          `:refs/heads/${record.taskBranch}`,
+          `--force-with-lease=refs/heads/${task.taskBranch}:${remoteSha}`,
+          `:refs/heads/${task.taskBranch}`,
         ],
         this.repoRoot,
       );
-
-    this.clear(record.itemId);
+    } else if (remote.status !== 2) {
+      throw processFailure("git", args, remote);
+    }
+    for (const path of paths)
+      mustGit(["worktree", "remove", path], this.repoRoot);
+    // Delete the local ref last: its presence is the retry/completion signal.
+    mustGit(
+      [
+        "update-ref",
+        "--no-deref",
+        "-d",
+        `refs/heads/${task.taskBranch}`,
+        taskSha,
+      ],
+      this.repoRoot,
+    );
+    const record = this.read(task.itemId);
+    if (
+      record?.issueNumber === task.issueNumber &&
+      record.taskBranch === task.taskBranch
+    )
+      this.clear(task.itemId);
   }
 
   private validateBranches(...branches: string[]): void {

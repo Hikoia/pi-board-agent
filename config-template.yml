@@ -90,9 +90,9 @@ refine:
 # ── AI review gate ──────────────────────────────────────────────────────────
 # Review cards are independently checked against their acceptance criteria.
 # PASS → Done; FAIL → a findings comment is posted and the card returns to
-# Ready. When disabled, validate the retained worktree manually, move the Task
-# to Done, then close its Issue to approve the matching local/remote task SHA.
-# Any prior AI-reviewed SHA must still match, even after disabling this gate.
+# Ready. Closing a Done Issue approves its current local task branch, including
+# unpushed commits. Finalization needs no Plan or AI-review record: no local
+# task branch means settled; otherwise merge, push, verify, then delete.
 review:
   enabled: false
   timeout_ms: 600000 # per-review agent timeout (10 min)
@@ -131,7 +131,8 @@ auto_start: false
 safety:
   # Refuse to launch new work if the main working tree is dirty. Only untracked
   # runtime paths are excluded; tracked source/config changes always block.
-  # Existing managed runs are still reconciled; one ticket cannot block the board.
+  # Existing managed runs are still reconciled;
+  # one ticket cannot block the board.
   require_clean_worktree: true
   # Skip cards whose linked issue is already closed.
   skip_closed_issues: true

@@ -1,6 +1,6 @@
 /** Core polling loop: reconcile durable ticket runs, then fill global worker slots. */
 import type { Config } from "./config.js";
-import { planSlug } from "./config.js";
+import { planSlug, taskBranch } from "./config.js";
 import {
   type Card,
   type IssueComment,
@@ -858,8 +858,10 @@ export class BoardLoop {
         (task) =>
           task.closed &&
           task.status?.toLowerCase() === cfg.columns.done.toLowerCase() &&
-          !this.ticketWorktrees.has(task.itemId) &&
-          this.ticketWorktrees.isMerged(task.itemId, cfg.branches.base),
+          task.number !== undefined &&
+          !this.ticketWorktrees.localBranchSha(
+            taskBranch(cfg.branches.task_prefix, task.number),
+          ),
       )
     );
   }
@@ -1296,7 +1298,6 @@ export class BoardLoop {
     const candidates = cards.filter(
       (card) =>
         card.closed === true &&
-        !!card.plan &&
         (card.status ?? "").toLowerCase() === cfg.columns.done.toLowerCase() &&
         isTargetIssue(card, repoOwner, repoName, "Task"),
     );

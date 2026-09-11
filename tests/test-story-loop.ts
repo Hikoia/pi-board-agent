@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { _DEFAULTS, type Config } from "../src/config.js";
+import { _DEFAULTS, taskBranch, type Config } from "../src/config.js";
 import type {
   Card,
   IssueComment,
@@ -81,7 +81,13 @@ const reply = (
   createdAt: "2026-01-01T00:00:00Z",
 });
 type Operation =
-  "create" | "add" | "plan" | "type" | "ready" | "comment" | "status";
+  | "create"
+  | "add"
+  | "plan"
+  | "type"
+  | "ready"
+  | "comment"
+  | "status";
 function harness(stories: Card[] = [story()]) {
   const cwd = mkdtempSync(join(root, "case-"));
   const cards = structuredClone(stories);
@@ -256,8 +262,14 @@ function harness(stories: Card[] = [story()]) {
   };
   const worktrees = new TicketWorktrees(cwd);
   const merged = new Set<string>();
-  worktrees.has = () => false;
-  worktrees.isMerged = (itemId) => merged.has(itemId);
+  worktrees.localBranchSha = (branch) => {
+    const card = cards.find(
+      (card) =>
+        card.number !== undefined &&
+        taskBranch(cfg.branches.task_prefix, card.number) === branch,
+    );
+    return card && merged.has(card.itemId) ? undefined : "a".repeat(40);
+  };
   const deps: LoopDeps = {
     cwd,
     cfg,
