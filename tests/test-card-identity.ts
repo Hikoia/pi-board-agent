@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -428,6 +429,10 @@ console.log(
 {
   const events: string[] = [];
   const closed = card({ status: cfg.columns.done, closed: true });
+  const finalizationRoot = mkdtempSync(join(cwd, "finalization-"));
+  execFileSync("git", ["init", "-b", "main", finalizationRoot], { stdio: "ignore" });
+  execFileSync("git", ["-C", finalizationRoot, "-c", "user.name=Offline", "-c", "user.email=offline@example.test", "commit", "--allow-empty", "-m", "finalization fixture"], { stdio: "ignore" });
+  execFileSync("git", ["-C", finalizationRoot, "branch", "task/issue-42"], { stdio: "ignore" });
   const recoveryExecutor: TicketExecutor = {
     ...executor,
     reconcile: async () => {
@@ -452,6 +457,7 @@ console.log(
   await new BoardLoop(
     {
       ...deps([closed]),
+      cwd: finalizationRoot,
       cfg: { ...cfg, safety: { ...cfg.safety, require_clean_worktree: true } },
       revisionCheck: () => ({ ok: false }),
     },
@@ -466,19 +472,42 @@ console.log(
     "PASS: closed Done reaches executor finalization before dirty/admission/revision gates (adapter routing, not a Git merge E2E)",
   );
 }
-{
+for (const skip_closed_issues of [true, false]) {
   const before = launches;
-  await new BoardLoop(
+  let closedCalls = 0;
+  const noClosedWork = async (): Promise<never> => {
+    closedCalls++;
+    assert.fail("closed Issue entered a design/review/board operation");
+  };
+  const closedDesign = card({ closed: true, status: cfg.columns.needs_design });
+  const config = { ...cfg, safety: { ...cfg.safety, skip_closed_issues } };
+  const closedOps: TaskDesignOps = {
+    claim: noClosedWork, refresh: noClosedWork, release: noClosedWork,
+    listComments: noClosedWork, design: noClosedWork, updateBody: noClosedWork,
+    comment: noClosedWork, setReady: noClosedWork,
+  };
+  const loop = new BoardLoop(
     {
-      ...deps([card({ closed: true })]),
-      cfg: { ...cfg, safety: { ...cfg.safety, skip_closed_issues: false } },
+      ...deps([
+        card({ closed: true }), closedDesign,
+        card({ closed: true, status: cfg.columns.review }),
+        card({ closed: true, type: "Story" }),
+        card({ closed: true, type: "Story", status: cfg.columns.needs_design }),
+      ]),
+      cfg: config, taskDesignOps: closedOps, refine: noClosedWork, review: noClosedWork,
+      boardOps: { claim: noClosedWork, refresh: noClosedWork, release: noClosedWork, listComments: noClosedWork, comment: noClosedWork, setStatus: noClosedWork },
     },
     createLoopState(),
     executor,
-  ).tickNow();
-  assert.equal(launches, before);
+  );
+  try {
+    await loop.tickNow();
+    assert.equal(await processNeedsDesignTask({ card: closedDesign, cfg: config, cwd, contextDigest: "", botLogin: "bot", callback: () => {} }, closedOps), "skipped");
+    assert.equal(closedCalls, 0);
+    assert.equal(launches, before);
+  } finally { await loop.stop(); }
   console.log(
-    "PASS: closed Ready Tasks never launch, even when the legacy safety preference is false",
+    `PASS: closed Issues never start builders, Task design, Story refinement or review with skip_closed_issues=${skip_closed_issues}`,
   );
 }
 

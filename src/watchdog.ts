@@ -262,16 +262,25 @@ type ExecuteWorkflow = (
   options: WorkflowRunOptions,
 ) => Promise<{ result?: unknown }>;
 
+/** Loop-local admission around a real model invocation, not Git/PR maintenance.
+ * Undefined means deferred; the caller must preserve its pending work. */
+export type WatchdogModelRunner = <T>(
+  label: string,
+  run: () => Promise<T>,
+) => Promise<T | undefined>;
+
 /** Inline toolNames is ignored by the workflow DSL. Bind a private registry,
  * never a project/user-overridable Markdown definition. */
 export function runReplyWorkflow(
   source: string,
   cwd: string,
   execute: ExecuteWorkflow = runWorkflow,
+  signal?: AbortSignal,
 ): Promise<{ result?: unknown }> {
   return execute(source, {
     cwd,
     persistLogs: true,
+    signal,
     maxAgents: 1,
     concurrency: 1,
     agentRetries: 0,
@@ -310,10 +319,12 @@ const STATUS_ARGS = [
 export async function runCiFix(
   input: FixWorkflowInput & {
     cwd: string;
+    signal?: AbortSignal;
     canStartWork?: () => Promise<boolean>;
+    runModel?: WatchdogModelRunner;
   },
   execute: ExecuteWorkflow = runWorkflow,
-): Promise<{ result?: unknown }> {
+): Promise<{ result?: unknown } | undefined> {
   if (!/^[a-f0-9]{40}$/i.test(input.headSha))
     throw new Error("Invalid PR head SHA.");
   const root = await git(input.cwd, ["rev-parse", "--show-toplevel"]);
@@ -366,14 +377,25 @@ export async function runCiFix(
       throw new Error("CI fix worktree SHA verification failed.");
     if (input.canStartWork && !(await input.canStartWork()))
       throw new Error("CI fix admission closed.");
-    const result = await execute(renderFixWorkflowSource(input), {
+    const run = () => execute(renderFixWorkflowSource(input), {
       cwd: path,
       persistLogs: true,
+      signal: input.signal,
       maxAgents: 1,
       concurrency: 1,
       agentRetries: 0,
       agentRegistry: new Map(),
     });
+    // Git setup above can await for a long time. Admission belongs HERE, directly
+    // around execute, so a full pool neither starts a model nor occupies a slot.
+    const result = input.runModel
+      ? await input.runModel(`PR #${input.prNumber} CI fix`, run)
+      : await run();
+    if (!result) {
+      await verify();
+      await git(root, ["worktree", "remove", path]);
+      return undefined;
+    }
     if (
       (result.result as { status?: string } | undefined)?.status !== "success"
     )
@@ -419,17 +441,14 @@ export interface WatchdogDeps {
   botLogin: string;
   meta: ProjectMetadata;
   callback: (msg: string, level?: "info" | "warn" | "error") => void;
+  signal?: AbortSignal;
   /** Rechecked after awaits, before admitting another agent or mutation. */
   canStartWork?: () => boolean | Promise<boolean>;
+  runModel?: WatchdogModelRunner;
   ciOps?: {
     listPrs(): Promise<AgentPr[]>;
     checks(pr: AgentPr): ReturnType<typeof getCheckRuns>;
-    fix(
-      input: FixWorkflowInput & {
-        cwd: string;
-        canStartWork?: () => Promise<boolean>;
-      },
-    ): Promise<{ result?: unknown }>;
+    fix(input: Parameters<typeof runCiFix>[0]): ReturnType<typeof runCiFix>;
   };
   mentionOps?: {
     listComments(prNumber: number): ReturnType<typeof listPrComments>;
@@ -476,7 +495,19 @@ export class Watchdog {
   }
 
   private async allowed(): Promise<boolean> {
-    return this.deps.canStartWork ? this.deps.canStartWork() : true;
+    if (this.deps.signal?.aborted) return false;
+    const allowed = this.deps.canStartWork
+      ? await this.deps.canStartWork()
+      : true;
+    return allowed && !this.deps.signal?.aborted;
+  }
+
+  private async runModel<T>(
+    label: string,
+    run: () => Promise<T>,
+  ): Promise<T | undefined> {
+    if (!(await this.allowed())) return undefined;
+    return this.deps.runModel ? this.deps.runModel(label, run) : run();
   }
 
   /** No detached work: BoardLoop.stop() drains this entire tick before unlock. */
@@ -597,17 +628,21 @@ export class Watchdog {
       );
       return;
     }
-    callback(
-      `Watchdog: PR #${pr.number} failing. Fix round ${st.fixAttempts + 1}/${cfg.watchdog.fix_rounds_max}.`,
-    );
-    // Persist before invoking the workflow, including errors/timeouts. No blind retry.
-    this.state.update(pr.number, {
-      fixAttempts: st.fixAttempts + 1,
-      lastFixAtMs: Date.now(),
-    });
     const result = await (this.deps.ciOps?.fix ?? runCiFix)({
       cwd: this.deps.cwd,
+      signal: this.deps.signal,
       canStartWork: () => this.allowed(),
+      runModel: (label, run) => this.runModel(label, () => {
+        callback(
+          `Watchdog: PR #${pr.number} failing. Fix round ${st.fixAttempts + 1}/${cfg.watchdog.fix_rounds_max}.`,
+        );
+        // Persist at actual invocation, including errors/timeouts, not deferral.
+        this.state.update(pr.number, {
+          fixAttempts: st.fixAttempts + 1,
+          lastFixAtMs: Date.now(),
+        });
+        return run();
+      }),
       prNumber: pr.number,
       repoOwner,
       repoName,
@@ -618,6 +653,7 @@ export class Watchdog {
       model: cfg.models.watch,
       timeoutMs: cfg.builder_timeout_ms ?? 1_800_000,
     });
+    if (!result) return;
     const value = result.result as
       | { status?: string; summary?: string; error?: string }
       | undefined;
@@ -637,7 +673,8 @@ export class Watchdog {
       ({
         listComments: (number: number) =>
           listPrComments(repoOwner, repoName, number),
-        run: (script: string) => runReplyWorkflow(script, this.deps.cwd),
+        run: (script: string) =>
+          runReplyWorkflow(script, this.deps.cwd, undefined, this.deps.signal),
         post: async (number: number, body: string) => {
           const issueId = await resolvePullRequestId(
             repoOwner,
@@ -686,15 +723,16 @@ export class Watchdog {
       try {
         const contextDigest = await this.getContextDigest();
         if (!(await this.allowed())) return;
-        const result = await ops.run(
-          renderReplyWorkflowSource({
+        const result = await this.runModel(`PR #${pr.number} reply`, () =>
+          ops.run(renderReplyWorkflowSource({
             prNumber: pr.number,
             mentionBody: comment.body,
             contextDigest,
             model: cfg.models.watch,
             timeoutMs: cfg.refine.timeout_ms,
-          }),
+          })),
         );
+        if (!result) return;
         const reply = (result.result as { reply?: unknown } | undefined)?.reply;
         if (typeof reply !== "string" || !reply.trim())
           throw new Error("reply workflow returned no reply");

@@ -64,8 +64,12 @@ try {
 
   const template = readConfigTemplate();
   const parsedTemplate = parseYaml(template);
-  parsedTemplate.project.number = 1;
-  validateConfig(parsedTemplate);
+  assert.equal(Object.hasOwn(parsedTemplate.safety, "skip_closed_issues"), false, "recommended template omits the deprecated no-op key");
+  writeFileSync(file, template.replace("number: 0", "number: 1"));
+  const templateWarnings: string[] = [];
+  validateConfig(loadConfig(cwd, (message) => templateWarnings.push(message)));
+  assert.deepEqual(templateWarnings, []);
+  rmSync(file);
   check(
     !/\bpr:|builder_tier|plan_prefix|interval_seconds/.test(template) &&
       parsedTemplate.watchdog.respond_to_mentions === false,

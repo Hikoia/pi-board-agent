@@ -1,4 +1,8 @@
-import { runProcessSync } from "./process-runner.js";
+import {
+  runProcess,
+  runProcessSync,
+  type ProcessResult,
+} from "./process-runner.js";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -174,18 +178,51 @@ export function resolveExpectedRevision(
   };
 }
 
-export function inspectPackageCheckout(packageRoot: string): {
-  revision: string | null;
-  dirty: boolean;
-  error?: string;
-} {
-  const run = (args: string[]) =>
-    runProcessSync("git", args, {
-      cwd: packageRoot,
-      env: { GIT_OPTIONAL_LOCKS: "0" },
-    });
-  const head = run(["rev-parse", "--show-toplevel", "HEAD"]);
-  const status = run(["status", "--porcelain", "--untracked-files=normal"]);
+/** Local admission check only: async Git observation owns disk/dirty checking.
+ * Re-read settings after the final remote await without another Git scan. */
+export function runtimeSettingsUnchanged(
+  projectRoot: string,
+  loaded: LoadedRuntimeIdentity,
+  agentDir?: string,
+): boolean {
+  const expected = resolveExpectedRevision(projectRoot, agentDir);
+  return (
+    !expected.error &&
+    FULL_GIT_SHA.test(expected.revision ?? "") &&
+    expected.revision === loaded.expectedRevisionAtLoad &&
+    expected.source === loaded.expectedSourceAtLoad &&
+    expected.error === loaded.expectedErrorAtLoad
+  );
+}
+
+const CHECKOUT_HEAD = ["rev-parse", "--show-toplevel", "HEAD"];
+const CHECKOUT_STATUS = ["status", "--porcelain", "--untracked-files=normal"];
+const checkoutOptions = (cwd: string) => ({
+  cwd,
+  env: { GIT_OPTIONAL_LOCKS: "0" },
+});
+
+export function inspectPackageCheckout(packageRoot: string) {
+  const options = checkoutOptions(packageRoot);
+  return packageCheckout(
+    packageRoot,
+    runProcessSync("git", CHECKOUT_HEAD, options),
+    runProcessSync("git", CHECKOUT_STATUS, options),
+  );
+}
+
+async function inspectPackageCheckoutAsync(packageRoot: string) {
+  const options = checkoutOptions(packageRoot);
+  const head = await runProcess("git", CHECKOUT_HEAD, options);
+  const status = await runProcess("git", CHECKOUT_STATUS, options);
+  return packageCheckout(packageRoot, head, status);
+}
+
+function packageCheckout(
+  packageRoot: string,
+  head: ProcessResult,
+  status: ProcessResult,
+): { revision: string | null; dirty: boolean; error?: string } {
   const [top, revision] = head.stdout.trim().split(/\r?\n/);
   let error =
     !head.ok || !status.ok
@@ -237,8 +274,37 @@ export function checkRuntimeRevision(
   agentDir?: string,
   mismatchLatched = false,
 ): RevisionCheck {
-  const expected = resolveExpectedRevision(projectRoot, agentDir);
-  const disk = inspectPackageCheckout(loaded.packageRoot);
+  return revisionDecision(
+    loaded,
+    resolveExpectedRevision(projectRoot, agentDir),
+    inspectPackageCheckout(loaded.packageRoot),
+    mismatchLatched,
+  );
+}
+
+/** Live gate: only Git execution differs from immutable synchronous capture. */
+export async function checkRuntimeRevisionAsync(
+  projectRoot: string,
+  loaded: LoadedRuntimeIdentity,
+  agentDir?: string,
+  mismatchLatched: boolean | (() => boolean) = false,
+): Promise<RevisionCheck> {
+  const disk = await inspectPackageCheckoutAsync(loaded.packageRoot);
+  // Settings and the process latch may change while Git is awaited.
+  return revisionDecision(
+    loaded,
+    resolveExpectedRevision(projectRoot, agentDir),
+    disk,
+    typeof mismatchLatched === "function" ? mismatchLatched() : mismatchLatched,
+  );
+}
+
+function revisionDecision(
+  loaded: LoadedRuntimeIdentity,
+  expected: ExpectedRevision,
+  disk: ReturnType<typeof inspectPackageCheckout>,
+  mismatchLatched: boolean,
+): RevisionCheck {
   const reasons: string[] = [];
   if (mismatchLatched)
     reasons.push(

@@ -74,6 +74,7 @@ class FakeBoard implements TicketBoardAdapter {
   readonly comments = new Map<string, string[]>();
   readonly claimRaces = new Set<string>();
   readonly failStatusOnce = new Set<string>();
+  readonly failReleaseOnce = new Set<string>();
   claims = 0;
   releases = 0;
 
@@ -123,6 +124,8 @@ class FakeBoard implements TicketBoardAdapter {
   }
   async release(card: Card): Promise<void> {
     this.releases++;
+    if (this.failReleaseOnce.delete(card.itemId))
+      throw new Error("simulated GitHub release failure");
     const current = this.cards.get(card.itemId);
     if (current)
       current.assignees = current.assignees.filter((login) => login !== "bot");
@@ -256,6 +259,271 @@ const complete = (itemId: string, result: unknown) => {
   run.status = "completed";
   run.result = result;
 };
+
+// Fresh observations, not list snapshots, authorize reconciliation mutations.
+{
+  const executor = makeExecutor();
+  const tracked = board.add("FRESH_TRACKED", 3001, cfg.columns.building);
+  const untracked = board.add("FRESH_UNTRACKED", 3002, cfg.columns.building);
+  const record = await worktrees.ensure(
+    buildTasksForWave(cfg, "demo", [tracked])[0],
+    "demo",
+  );
+  const state = stateFor(record.path);
+  const mutations: Array<Partial<Card> | undefined> = [
+    undefined,
+    { contentType: "PullRequest" },
+    { contentType: "DraftIssue" },
+    { type: "Story" },
+    { repoOwner: "foreign" },
+    { repoName: "elsewhere" },
+    { itemId: "REPLACEMENT" },
+    { number: 9999 },
+  ];
+  const failures: unknown[] = [];
+  let freshRun = 0;
+  for (const snapshot of [tracked, untracked]) {
+    for (const mutation of mutations) {
+      for (const mode of snapshot === tracked
+        ? (["completed", "running", "launching"] as const)
+        : (["untracked"] as const)) {
+        const label = `${mode}: ${JSON.stringify(mutation) ?? "missing"}`;
+        state.runs.clear();
+        worktrees.clearExecution(tracked.itemId);
+        const run = makeRun(
+          `fresh-${++freshRun}`,
+          {
+            itemId: tracked.itemId,
+            issueNumber: tracked.number,
+            taskKey: record.taskKey,
+          },
+          mode === "completed" ? "completed" : "running",
+        );
+        run.result = [
+          {
+            taskKey: record.taskKey,
+            itemId: tracked.itemId,
+            status: "success",
+            branch: record.taskBranch,
+          },
+        ];
+        if (mode !== "untracked") {
+          state.runs.set(run.runId, run);
+          if (mode === "launching") worktrees.beginLaunch(tracked.itemId);
+          else worktrees.setActiveRun(tracked.itemId, run.runId);
+        }
+        board.cards.delete(tracked.itemId);
+        board.cards.delete(untracked.itemId);
+        if (mutation)
+          board.cards.set(snapshot.itemId, { ...snapshot, ...mutation });
+        board.comments.clear();
+        const releases = board.releases;
+        const before = board.all();
+        const result = await executor.reconcile([structuredClone(snapshot)]);
+        try {
+          assert.deepEqual(
+            board.all(),
+            before,
+            `no GitHub status/assignee writes: ${label}`,
+          );
+          assert.equal(board.comments.size, 0, `no stale comments: ${label}`);
+          assert.equal(board.releases, releases, `no stale release: ${label}`);
+          assert.equal(result.errors, 0, label);
+          assert.equal(result.needsHuman, 0, label);
+          if (mode !== "untracked") {
+            assert.equal(result.orphans, 1, label);
+            assert.equal(
+              recordFor(tracked.itemId).activeRunId,
+              undefined,
+              label,
+            );
+            assert.equal(
+              recordFor(tracked.itemId).launchingAt,
+              undefined,
+              label,
+            );
+            assert.equal(
+              run.status,
+              mode === "completed" ? "completed" : "aborted",
+              label,
+            );
+            assert.ok(existsSync(record.path), label);
+          }
+        } catch (error) {
+          console.error(`FAIL: fresh reconcile ${label}`, error);
+          failures.push(error);
+        }
+      }
+    }
+  }
+
+  // An unavailable read is not confirmed absence: retain the exact record/run.
+  for (const mode of ["active", "launching"] as const) {
+    worktrees.clearExecution(tracked.itemId);
+    if (mode === "launching") worktrees.beginLaunch(tracked.itemId);
+    else worktrees.setActiveRun(tracked.itemId, "unreadable-fresh");
+    const before = recordFor(tracked.itemId);
+    const stops = state.stops;
+    const releases = board.releases;
+    const fresh = board.getCard;
+    board.getCard = async () => {
+      throw new Error("fresh read failed");
+    };
+    try {
+      for (const snapshots of [[tracked], []]) {
+        const result = await executor.reconcile(snapshots);
+        assert.equal(result.errors, 1);
+        assert.deepEqual(recordFor(tracked.itemId), before);
+        assert.equal(state.stops, stops);
+        assert.equal(board.releases, releases);
+      }
+    } finally {
+      board.getCard = fresh;
+    }
+  }
+  worktrees.clearExecution(tracked.itemId);
+  board.cards.delete(tracked.itemId);
+  board.cards.delete(untracked.itemId);
+  board.comments.clear();
+  await executor.shutdown();
+  if (failures.length) throw new AggregateError(failures);
+  console.log(
+    "PASS: fresh missing/foreign/changed identity never mutates stale cards; active and launching orphans stop safely",
+  );
+  console.log(
+    "PASS: failed fresh reads preserve active and launch-window recovery evidence with or without a list snapshot",
+  );
+}
+
+// A terminal status is already settled remotely even if claim cleanup failed.
+{
+  const failures: unknown[] = [];
+  for (const mode of [
+    "success",
+    "failure",
+    "missing-run",
+    "launch-window",
+    "foreign-run",
+  ] as const) {
+    const card = board.add("SETTLEMENT", 3010);
+    let executor = makeExecutor();
+    assert.equal((await executor.launch(card, "demo")).status, "launched");
+    const record = recordFor(card.itemId);
+    const state = stateFor(record.path);
+    const starts = state.starts;
+    if (mode === "missing-run") state.runs.delete(record.activeRunId!);
+    else if (mode === "launch-window") {
+      worktrees.clearExecution(card.itemId);
+      worktrees.beginLaunch(card.itemId);
+      const extra = makeRun("ambiguous-launch", {
+        itemId: card.itemId,
+        issueNumber: card.number,
+        taskKey: record.taskKey,
+      });
+      state.runs.set(extra.runId, extra);
+    } else {
+      complete(card.itemId, [
+        {
+          taskKey: record.taskKey,
+          itemId: card.itemId,
+          status: mode === "failure" ? "failure" : "success",
+          branch: record.taskBranch,
+          error: "builder blocked",
+          summary: "done",
+        },
+      ]);
+    }
+    board.failReleaseOnce.add(card.itemId);
+    const before = recordFor(card.itemId);
+    const result = await executor.reconcile(board.all());
+    assert.equal(result.errors, 1, mode);
+    assert.equal(
+      board.cards.get(card.itemId)!.status,
+      mode === "success" || mode === "foreign-run"
+        ? cfg.columns.review
+        : cfg.columns.needs_human,
+      mode,
+    );
+    assert.deepEqual(
+      recordFor(card.itemId),
+      before,
+      `failed release retains association: ${mode}`,
+    );
+    assert.deepEqual(board.cards.get(card.itemId)!.assignees, ["bot"], mode);
+    const comments = [...(board.comments.get(card.itemId) ?? [])];
+    assert.equal(comments.length, 1, mode);
+
+    // Subsequent contract drift / manual Done must not reopen settlement or
+    // demand another comment read before the already-required release.
+    board.cards.get(card.itemId)!.plan = "maintainer-edited";
+    if (mode === "launch-window")
+      board.cards.get(card.itemId)!.status = cfg.columns.done;
+    const expectedStatus = board.cards.get(card.itemId)!.status;
+    if (mode === "foreign-run") {
+      const run = runFor(card.itemId);
+      run.args = { itemId: "FOREIGN", issueNumber: 9999, taskKey: "T9999" };
+      run.status = "paused";
+    }
+    const stops = state.stops;
+    await executor.shutdown();
+    executor = makeExecutor(true);
+    const listComments = board.listComments;
+    board.listComments = async (candidate) => {
+      if (candidate.itemId === card.itemId)
+        throw new Error("settlement must not replay comments");
+      return listComments.call(board, candidate);
+    };
+    try {
+      const retry = await executor.reconcile(board.all());
+      assert.equal(retry.errors, 0, `retry is cleanup only: ${mode}`);
+      assert.equal(board.cards.get(card.itemId)!.status, expectedStatus, mode);
+      assert.deepEqual(board.cards.get(card.itemId)!.assignees, [], mode);
+      assert.equal(recordFor(card.itemId).activeRunId, undefined, mode);
+      assert.equal(recordFor(card.itemId).launchingAt, undefined, mode);
+      assert.deepEqual(board.comments.get(card.itemId), comments, mode);
+      assert.equal(
+        (await executor.launch(card, "demo")).status,
+        "skipped",
+        mode,
+      );
+      assert.equal(state.starts, starts, `no extra builder launches: ${mode}`);
+      assert.equal(
+        state.resumes,
+        0,
+        `no builder resume during cleanup: ${mode}`,
+      );
+      if (mode === "foreign-run") {
+        assert.equal(
+          state.stops,
+          stops,
+          "cleanup must not stop a run with foreign arguments",
+        );
+        assert.equal(state.runs.get(record.activeRunId!)!.status, "paused");
+      } else {
+        assert.ok(
+          [...state.runs.values()].every(
+            (run) => run.status !== "running" && run.status !== "paused",
+          ),
+          mode,
+        );
+      }
+    } catch (error) {
+      console.error(`FAIL: partial settlement ${mode}`, error);
+      failures.push(error);
+    } finally {
+      board.listComments = listComments;
+      await executor.shutdown();
+      worktrees.clearExecution(card.itemId);
+      state.runs.clear();
+      board.cards.delete(card.itemId);
+      board.comments.delete(card.itemId);
+    }
+  }
+  if (failures.length) throw new AggregateError(failures);
+  console.log(
+    "PASS: status success then release failure retains evidence; restart only cleans up Review/Needs Human/manual Done without comments or builder replay",
+  );
+}
 
 // The default run retains every recovery check; this opt-in focuses the new
 // end-to-end finalization regressions during local iteration.
@@ -477,7 +745,10 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   const ticketOwnedDirtyTask = buildTasksForWave(cfg, "demo", [
     ticketOwnedDirty,
   ])[0];
-  const ticketOwnedDirtyRecord = worktrees.ensure(ticketOwnedDirtyTask, "demo");
+  const ticketOwnedDirtyRecord = await worktrees.ensure(
+    ticketOwnedDirtyTask,
+    "demo",
+  );
   writeFileSync(
     join(ticketOwnedDirtyRecord.path, "checkpoint.txt"),
     "ticket-owned\n",
@@ -849,7 +1120,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   const adopting = board.add("PVTI_90", 90);
   const adoptingTask = buildTasksForWave(cfg, "demo", [adopting])[0];
   const adoptingRecord = worktrees.beginLaunch(
-    worktrees.ensure(adoptingTask, "demo").itemId,
+    (await worktrees.ensure(adoptingTask, "demo")).itemId,
     Date.now() - 10,
   );
   await board.setStatus(adopting.itemId, cfg.columns.building);
@@ -869,9 +1140,12 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   } else fail("FAIL: persisted run adoption");
 
   const unstarted = board.add("PVTI_91", 91);
+  // A real launch claims before persisting its crash window. An unclaimed or
+  // transferred Issue cannot authorize recovery's Ready write.
+  await board.claim(unstarted);
   const unstartedTask = buildTasksForWave(cfg, "demo", [unstarted])[0];
   worktrees.beginLaunch(
-    worktrees.ensure(unstartedTask, "demo").itemId,
+    (await worktrees.ensure(unstartedTask, "demo")).itemId,
     Date.now(),
   );
   await board.setStatus(unstarted.itemId, cfg.columns.building);
@@ -887,7 +1161,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
 
   const incident = board.add("PVTI_911", 911, cfg.columns.building);
   const incidentTask = buildTasksForWave(cfg, "demo", [incident])[0];
-  const incidentRecord = worktrees.ensure(incidentTask, "demo");
+  const incidentRecord = await worktrees.ensure(incidentTask, "demo");
   worktrees.clearExecution(incidentRecord.itemId, "run-incident-a");
   await executor.reconcile(board.all());
   const firstIncidentComments =
@@ -984,7 +1258,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
         worktree: repo,
       };
     },
-    activeCount: () => 1,
+    activeCount: () => 1 + slotLaunches,
     shutdown: async () => undefined,
   };
   const loopDeps: LoopDeps = {
@@ -1012,6 +1286,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   let recoveryLaunches = 0;
   const recoveryExecutor: TicketExecutor = {
     ...slotExecutor,
+    activeCount: () => 1 + recoveryLaunches,
     launch: async () => {
       recoveryLaunches++;
       return { status: "launched", runId: "recovery-slot", worktree: repo };
@@ -1087,7 +1362,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
 // Real Git + real executor + real BoardLoop; only the remote board and builders
 // are offline adapters. Every repository/ref below belongs to this TMP_DIR.
 let finalSequence = 0;
-function finalFixture(
+async function finalFixture(
   strategy: Config["task_merge_strategy"] = "squash",
   aiReview = false,
 ) {
@@ -1120,7 +1395,7 @@ function finalFixture(
   finalBoard.cards.get(card.itemId)!.closed = true;
   card.closed = true;
   const store = new TicketWorktrees(checkout);
-  const record = store.ensure(
+  const record = await store.ensure(
     buildTasksForWave(finalCfg, "demo", [card])[0],
     "demo",
   );
@@ -1138,7 +1413,7 @@ function finalFixture(
   let ensures = 0;
   const make = () => {
     const finalStore = new TicketWorktrees(checkout);
-    finalStore.ensure = () => {
+    finalStore.ensure = async () => {
       ensures++;
       throw new Error("finalization must never ensure/recreate a worktree");
     };
@@ -1188,7 +1463,7 @@ function finalFixture(
 }
 
 {
-  const f = finalFixture("merge", true);
+  const f = await finalFixture("merge", true);
   f.card.plan = undefined;
   f.finalBoard.cards.get(f.card.itemId)!.plan = undefined;
   rmSync(
@@ -1239,7 +1514,7 @@ function finalFixture(
 }
 
 {
-  const f = finalFixture();
+  const f = await finalFixture();
   git(f.checkout, "worktree", "remove", f.record.path);
   git(
     f.checkout,
@@ -1297,7 +1572,7 @@ function finalFixture(
 }
 
 for (const strategy of ["squash", "merge"] as const) {
-  const f = finalFixture(strategy);
+  const f = await finalFixture(strategy);
   assert.equal(_DEFAULTS.review.enabled, false);
   assert.equal(f.store.read(f.card.itemId)!.reviewedTaskSha, undefined);
   const actual = f.make();
@@ -1380,7 +1655,7 @@ for (const strategy of ["squash", "merge"] as const) {
 }
 
 {
-  const f = finalFixture();
+  const f = await finalFixture();
   const expected = structuredClone(f.card);
   const mutations: Array<Partial<Card>> = [
     { closed: false },
@@ -1427,7 +1702,7 @@ for (const strategy of ["squash", "merge"] as const) {
   console.log("PASS: changing Plan does not prevent closed Done finalization");
 }
 {
-  const f = finalFixture("merge", true);
+  const f = await finalFixture("merge", true);
   f.store.setReviewedTaskSha(f.card.itemId, f.taskSha);
   writeFileSync(join(f.record.path, "local-only.txt"), "latest local work\n");
   git(f.record.path, "add", "local-only.txt");
@@ -1445,7 +1720,7 @@ for (const strategy of ["squash", "merge"] as const) {
   );
 }
 {
-  const f = finalFixture();
+  const f = await finalFixture();
   const journal = {
     targetBranch: "main",
     baseSha: f.baseSha,
@@ -1476,7 +1751,7 @@ for (const strategy of ["squash", "merge"] as const) {
 }
 
 {
-  const f = finalFixture();
+  const f = await finalFixture();
   const hook = join(f.remote, "hooks", "pre-receive");
   writeFileSync(
     hook,
@@ -1517,7 +1792,7 @@ for (const strategy of ["squash", "merge"] as const) {
   );
 }
 {
-  const f = finalFixture();
+  const f = await finalFixture();
   f.store.setActiveRun(f.card.itemId, "still-running");
   const outcome = await f.make().finalizeClosed(f.card);
   assert.equal(outcome.status, "blocked");
@@ -1530,7 +1805,7 @@ for (const strategy of ["squash", "merge"] as const) {
   );
 }
 {
-  const f = finalFixture();
+  const f = await finalFixture();
   const journal = {
     targetBranch: "main",
     baseSha: f.baseSha,

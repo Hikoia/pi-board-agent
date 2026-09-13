@@ -27,12 +27,20 @@ import {
   resolveIssueId,
   resolvePullRequestId,
   setStatus,
+  setSingleSelect,
+  setTextField,
   tryClaim,
+  validateProjectMetadata,
   type Card,
 } from "../src/gh.js";
 import { BoardLoop, createLoopState } from "../src/loop.js";
+import { createStoryCreationPlan, reconcileStoryCreation } from "../src/refine.js";
 import { Watchdog, WatchdogStateStore } from "../src/watchdog.js";
 import type { TicketExecutor } from "../src/ticket-executor.js";
+import {
+  GIT_GH_TIMEOUT_MS,
+  ProcessTimeoutError,
+} from "../src/process-runner.js";
 
 const previousCwd = process.cwd();
 const root = mkdtempSync(join(tmpdir(), "board-gh-boundaries-"));
@@ -68,12 +76,14 @@ const fs = require("node:fs");
 const state = JSON.parse(fs.readFileSync(process.env.MOCK_GH_STATE, "utf8"));
 const responses = JSON.parse(fs.readFileSync(process.env.MOCK_GH_RESPONSES, "utf8"));
 const args = process.platform === "win32" ? process.argv.slice(1) : process.argv.slice(2);
+if (process.platform === "win32") args[0] = require("node:path").basename(args[0]);
 const response = responses[state.calls.length];
 state.calls.push(args);
 fs.writeFileSync(process.env.MOCK_GH_STATE, JSON.stringify(state));
 if (response === undefined) throw Error("Unexpected gh call: " + args.join(" "));
 if (response.__error) { process.stderr.write("simulated failure"); process.exit(1); }
-process.stdout.write(JSON.stringify(response));
+if (response.__hang) setInterval(() => {}, 1000);
+else process.stdout.write(JSON.stringify(response));
 `;
 if (process.platform === "win32") {
   copyFileSync(process.execPath, join(bin, "gh.exe"));
@@ -167,7 +177,7 @@ reset([
     data: {
       node: {
         fields: connection(
-          [{ id: "S", name: "Status", options: [{ id: "R", name: "Ready" }] }],
+          [{ id: "S", name: "Status", dataType: "SINGLE_SELECT", options: [{ id: "R", name: "Ready" }] }],
           "FIELDS_2",
         ),
       },
@@ -177,8 +187,8 @@ reset([
     data: {
       node: {
         fields: connection([
-          { id: "K", name: "Kind", options: [{ id: "T", name: "Task" }] },
-          { id: "L", name: "Plan" },
+          { id: "K", name: "Kind", dataType: "SINGLE_SELECT", options: [{ id: "T", name: "Task" }] },
+          { id: "L", name: "Plan", dataType: "TEXT" },
         ]),
       },
     },
@@ -198,6 +208,88 @@ check(
     calls()[2].includes("after=FIELDS_2"),
   "Project metadata uses Project owner and resolves canonical fields through all pages",
 );
+assert.partialDeepStrictEqual(metadata, {
+  statusFieldType: "SINGLE_SELECT",
+  planFieldType: "TEXT",
+  typeFieldType: "SINGLE_SELECT",
+});
+console.log("PASS: Project metadata retains explicit GraphQL field types, not option-presence guesses");
+
+for (const dataType of ["TEXT", "SINGLE_SELECT"]) {
+  reset([
+    { data: { repositoryOwner: { projectV2: { id: "P" } } } },
+    { data: { node: { fields: connection([
+      { id: "S", name: "Status", dataType: "SINGLE_SELECT", options: Object.values(_DEFAULTS.columns).map((name) => ({ name, id: name })) },
+      { id: "K", name: "Kind", dataType: "SINGLE_SELECT", options: [{ name: "Task", id: "TASK" }, { name: "Story", id: "STORY" }] },
+      { id: "L", name: "Plan", dataType, ...(dataType === "SINGLE_SELECT" ? { options: [{ name: "Release", id: "PLAN_OPTION_ID" }] } : {}) },
+    ]) } } },
+    { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "CHILD" } } } },
+  ]);
+  const meta = await getProjectMetadata("project-org", 17, "Status", "Plan", "Kind");
+  assert.equal(meta.planFieldType, dataType);
+  const story: Card = {
+    itemId: "STORY", contentType: "Issue", number: 42, title: "Release", body: "Ship",
+    status: "Ready", plan: "Release", type: "Story", closed: false, assignees: [], repoOwner: "owner", repoName: "repo",
+  };
+  const creation = createStoryCreationPlan({
+    cfg: _DEFAULTS, meta, repoOwner: "owner", repoName: "repo", storyCard: story,
+    planSlug: "Release", existingTaskCount: 0, projectId: "P",
+    refine: { goal: "Ship", impactedAreas: [], decisions: [], risks: [], openQuestions: [], tasks: [{ title: "Task", acceptanceCriteria: ["Verified"] }] },
+  });
+  const childCard: Card = { ...story, itemId: "CHILD", number: 100, type: "Task", plan: undefined, title: creation.tasks[0].title, body: creation.tasks[0].body };
+  const created = await reconcileStoryCreation({
+    cfg: _DEFAULTS, meta, repoOwner: "owner", repoName: "repo", storyCard: story, projectId: "P", assertCurrent: async () => undefined,
+  }, creation, () => undefined, {
+    listChildren: async () => [], resolveParent: async () => "PARENT",
+    createChild: async () => ({ id: "ISSUE", number: 100, url: "https://example.test/100" }),
+    findProjectItem: async () => "CHILD", addProjectItem: async () => { throw new Error("unexpected add"); },
+    readCard: async () => ({ ...childCard }),
+    setText: async (...args) => { await setTextField(...args); childCard.plan = args[3]; },
+    setSingle: async (...args) => { await setSingleSelect(...args); childCard.plan = args[3]; },
+  });
+  assert.equal(created.length, 1);
+  assert.equal(calls().length, 3, "metadata reads and exactly one field mutation; no schema mutation");
+  const mutation = calls()[2];
+  assert.ok(mutation.includes("fieldId=L") && mutation.includes("itemId=CHILD"));
+  if (dataType === "TEXT") {
+    assert.ok(mutation.includes("text=Release"));
+    assert.ok(mutation.some((arg) => arg.includes("value: { text: $text }")));
+    assert.ok(!mutation.some((arg) => arg.startsWith("optionId=")));
+  } else {
+    assert.deepEqual(meta.planOptions, { Release: "PLAN_OPTION_ID" });
+    assert.ok(mutation.includes("optionId=PLAN_OPTION_ID"), "resolve Plan name to the actual option ID, never send its name as text/ID");
+    assert.ok(mutation.some((arg) => arg.includes("singleSelectOptionId: $optionId")));
+    assert.ok(!mutation.some((arg) => arg.startsWith("text=")));
+  }
+  assert.ok(mutation.some((arg) => arg.includes("updateProjectV2ItemFieldValue")));
+  console.log(`PASS: real Story reconciliation -> gh/process adapter uses the ${dataType} Plan mutation with the actual text/option ID (no schema mutation)`);
+}
+{
+  const status = { id: "S", name: "Status", dataType: "SINGLE_SELECT", options: Object.values(_DEFAULTS.columns).map((name) => ({ name, id: name })) };
+  const plan = { id: "L", name: "Plan", dataType: "TEXT" };
+  const type = { id: "K", name: "Kind", dataType: "SINGLE_SELECT", options: [{ id: "TASK", name: "Task" }, { id: "STORY", name: "Story" }] };
+  for (const [label, fields, error] of [
+    ["missing Status", [plan, type], /Status field/],
+    ["wrong Status despite options", [{ ...status, dataType: "TEXT" }, plan, type], /Status field/],
+    ["missing Plan", [status, type], /Plan.*TEXT.*SINGLE_SELECT/],
+    ["number Plan", [status, { ...plan, dataType: "NUMBER" }, type], /Plan.*TEXT.*SINGLE_SELECT/],
+    ["iteration Plan", [status, { ...plan, dataType: "ITERATION" }, type], /Plan.*TEXT.*SINGLE_SELECT/],
+    ["missing Type", [status, plan], /Type.*SINGLE_SELECT/],
+    ["text Type", [status, plan, { ...type, dataType: "TEXT", options: undefined }], /Type.*SINGLE_SELECT/],
+    ["missing Type option", [status, plan, { ...type, options: [{ id: "TASK", name: "Task" }] }], /Type.*Story/],
+  ] as const) {
+    reset([
+      { data: { repositoryOwner: { projectV2: { id: "P" } } } },
+      { data: { node: { fields: connection([...fields]) } } },
+    ]);
+    await assert.rejects(async () => validateProjectMetadata(
+      await getProjectMetadata("project-org", 17, "Status", "Plan", "Kind"), _DEFAULTS,
+    ), error, label);
+    assert.equal(calls().length, 2, `${label}: only metadata queries, no schema mutation`);
+    assert.ok(calls().every((args) => !args.some((arg) => /mutation\(/.test(arg))));
+  }
+  console.log("PASS: real metadata adapter + lane validation reject missing/wrong raw GraphQL fields and Type options using read-only queries");
+}
 reset([
   {
     data: { repositoryOwner: null },
@@ -330,6 +422,31 @@ check(
     ),
   "target identity is case-insensitive and requires a safe positive issue number",
 );
+// Exercise release -> runGh -> the real process supervisor, including its
+// production deadline. Never replace the adapter or disable Windows containment.
+const releaseFailures: unknown[] = [];
+for (const mode of ["exit1", "timeout"] as const) {
+  reset([mode === "exit1" ? { __error: true } : { __hang: true }]);
+  try {
+    await assert.rejects(
+      release(target, "bot"),
+      mode === "exit1"
+        ? { name: "GhError", exitCode: 1, stderr: "simulated failure" }
+        : (error: unknown) =>
+            error instanceof ProcessTimeoutError &&
+            error.timeoutMs === GIT_GH_TIMEOUT_MS,
+    );
+    assert.deepEqual(calls(), [
+      ["issue", "edit", "7", "--repo", "origin-owner/repo", "--remove-assignee", "bot"],
+    ]);
+    console.log(`PASS: production release rejects ${mode} without replay`);
+  } catch (error) {
+    console.error(`FAIL: production release must reject ${mode}`, error);
+    releaseFailures.push(error);
+  }
+}
+if (releaseFailures.length) throw new AggregateError(releaseFailures);
+
 for (const state of [
   { state: "OPEN" },
   { state: "OPEN", assignees: [{}] },

@@ -1,5 +1,7 @@
 # pi-board-agent 過度設計與優化稽核
 
+> Historical report at the baseline below, not current guidance. See [current architecture](architecture.md) and [operator runbook](runbook.md).
+
 > 稽核基準：`main@9d0b23d62ce61b4c8062b89a5015515f0ba26d33`  
 > 規模：47 個 tracked files、14,525 行；`src/` 6,865 行  
 > 驗證：型別檢查通過；offline suite 222/222 checks 通過  

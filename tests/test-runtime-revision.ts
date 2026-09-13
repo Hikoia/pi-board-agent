@@ -23,7 +23,8 @@ import {
   BOARD_AGENT_SOURCE,
   boardAgentRef,
   captureRuntimeIdentity,
-  checkRuntimeRevision,
+  checkRuntimeRevision as checkRuntimeRevisionSync,
+  checkRuntimeRevisionAsync,
   formatRevisionFailure,
   readRuntimeStatus,
   writeRuntimeStatus,
@@ -57,6 +58,17 @@ const git = (...args: string[]) =>
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
+async function revisionCheck(...args: Parameters<typeof checkRuntimeRevisionSync>) {
+  const sync = checkRuntimeRevisionSync(...args);
+  let timerRan = false;
+  const timer = setTimeout(() => { timerRan = true; }, 0);
+  try {
+    const asyncCheck = await checkRuntimeRevisionAsync(...args);
+    assert.deepEqual(asyncCheck, sync, "async and sync revision identities/reasons/repair policy agree exactly");
+    assert.ok(timerRan, "live revision Git yields to timers");
+    return asyncCheck;
+  } finally { clearTimeout(timer); }
+}
 const children: ChildProcessWithoutNullStreams[] = [];
 const loops: BoardLoop[] = [];
 
@@ -93,7 +105,7 @@ try {
 
   globalSettings(revisionA);
   const loaded = captureRuntimeIdentity(packageRoot, projectRoot, agentDir);
-  const valid = checkRuntimeRevision(projectRoot, loaded, agentDir);
+  const valid = await revisionCheck(projectRoot, loaded, agentDir);
   check(
     valid.ok &&
       valid.expectedRevision === revisionA &&
@@ -108,20 +120,20 @@ try {
   for (const ref of ["main", "v1.2.3", revisionA.slice(0, 8)]) {
     globalSettings(ref);
     assert.equal(
-      checkRuntimeRevision(projectRoot, loaded, agentDir).ok,
+      (await revisionCheck(projectRoot, loaded, agentDir)).ok,
       false,
       ref,
     );
   }
   globalSettings();
-  assert.equal(checkRuntimeRevision(projectRoot, loaded, agentDir).ok, false);
+  assert.equal((await revisionCheck(projectRoot, loaded, agentDir)).ok, false);
   check(
     true,
     "branches, tags, short SHAs and a missing package pin cannot admit work",
   );
   globalSettings(revisionA);
   projectSettings(`${BOARD_AGENT_SOURCE}@${revisionB}`);
-  const overridden = checkRuntimeRevision(projectRoot, loaded, agentDir);
+  const overridden = await revisionCheck(projectRoot, loaded, agentDir);
   check(
     !overridden.ok && overridden.expectedRevision === revisionB,
     "project-local override wins and rejects a different immutable SHA",
@@ -131,7 +143,7 @@ try {
     autoload: false,
   });
   check(
-    checkRuntimeRevision(projectRoot, loaded, agentDir).ok,
+    (await revisionCheck(projectRoot, loaded, agentDir)).ok,
     "autoload=false project delta preserves the effective global pin",
   );
   projectSettings();
@@ -177,13 +189,13 @@ try {
   ]) {
     writeFileSync(projectSettingsPath, JSON.stringify(value));
     assert.equal(
-      checkRuntimeRevision(projectRoot, loaded, agentDir).ok,
+      (await revisionCheck(projectRoot, loaded, agentDir)).ok,
       false,
       JSON.stringify(value),
     );
   }
   writeFileSync(projectSettingsPath, "{broken");
-  assert.equal(checkRuntimeRevision(projectRoot, loaded, agentDir).ok, false);
+  assert.equal((await revisionCheck(projectRoot, loaded, agentDir)).ok, false);
   projectSettings();
   check(
     true,
@@ -191,7 +203,7 @@ try {
   );
 
   writeFileSync(join(packageRoot, "untracked.txt"), "dirty\n");
-  assert.equal(checkRuntimeRevision(projectRoot, loaded, agentDir).ok, false);
+  assert.equal((await revisionCheck(projectRoot, loaded, agentDir)).ok, false);
   const loadedDirty = captureRuntimeIdentity(
     packageRoot,
     projectRoot,
@@ -199,14 +211,14 @@ try {
   );
   rmSync(join(packageRoot, "untracked.txt"));
   check(
-    !checkRuntimeRevision(projectRoot, loadedDirty, agentDir).ok,
+    !(await revisionCheck(projectRoot, loadedDirty, agentDir)).ok,
     "dirty-at-load remains rejected even after checkout cleanup",
   );
   const nested = join(packageRoot, "nested-package");
   mkdirSync(nested);
   const nestedLoaded = captureRuntimeIdentity(nested, projectRoot, agentDir);
   check(
-    !checkRuntimeRevision(projectRoot, nestedLoaded, agentDir).ok,
+    !(await revisionCheck(projectRoot, nestedLoaded, agentDir)).ok,
     "a nested non-checkout package cannot borrow its parent Git revision",
   );
   rmSync(nested, { recursive: true });
@@ -214,13 +226,13 @@ try {
   writeFileSync(join(packageRoot, "package.json"), '{"changed":true}\n');
   git("add", ".");
   git("commit", "-m", "changed fixture");
-  const changedOnDisk = checkRuntimeRevision(projectRoot, loaded, agentDir);
+  const changedOnDisk = await revisionCheck(projectRoot, loaded, agentDir);
   check(
     !changedOnDisk.ok && changedOnDisk.diskRevision !== revisionA,
     "moving disk HEAD blocks work loaded from the old SHA",
   );
   git("reset", "--hard", revisionA);
-  const restored = checkRuntimeRevision(projectRoot, loaded, agentDir, true);
+  const restored = await revisionCheck(projectRoot, loaded, agentDir, true);
   check(
     !restored.ok && restored.reason?.includes("restart is required") === true,
     "restoring disk HEAD cannot clear a process mismatch latch",
@@ -233,6 +245,24 @@ try {
       message.includes("pi install"),
     "mismatch guidance includes exact identities and an immutable repair command",
   );
+
+  const noCheckout = join(root, "not-a-checkout");
+  mkdirSync(noCheckout);
+  const unavailable = await revisionCheck(projectRoot, { ...loaded, packageRoot: noCheckout }, agentDir);
+  assert.equal(unavailable.ok, false);
+  assert.equal(unavailable.diskRevision, null);
+  assert.equal(unavailable.dirty, true);
+  console.log("PASS: failed Git inspections yield identical fail-closed sync/async decisions while timers remain responsive");
+
+  const changingSetting = checkRuntimeRevisionAsync(projectRoot, loaded, agentDir);
+  projectSettings(`${BOARD_AGENT_SOURCE}@${revisionB}`);
+  assert.deepEqual(await changingSetting, checkRuntimeRevisionSync(projectRoot, loaded, agentDir));
+  projectSettings();
+  let lateLatch = false;
+  const changingLatch = checkRuntimeRevisionAsync(projectRoot, loaded, agentDir, () => lateLatch);
+  lateLatch = true;
+  assert.deepEqual(await changingLatch, checkRuntimeRevisionSync(projectRoot, loaded, agentDir, true));
+  console.log("PASS: async revision decision rereads settings and a concurrently closed process latch after awaiting Git");
 
   const status = {
     expectedRevision: revisionA,

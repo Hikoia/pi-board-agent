@@ -19,7 +19,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { resolve } from "node:path";
-import { runWorkflow } from "@quintinshaw/pi-dynamic-workflows";
+import { runWorkflow, WorkflowAgent } from "@quintinshaw/pi-dynamic-workflows";
 import type { Config } from "./config.js";
 import type { Card, ProjectMetadata } from "./gh.js";
 import {
@@ -32,7 +32,23 @@ import {
   resolveIssueId,
   setSingleSelect,
   setTextField,
+  validateProjectMetadata,
+  validatePlanOption,
 } from "./gh.js";
+
+// Private definitions cannot be broadened by project/user agent Markdown.
+// DSL toolNames and prompt prohibitions are not permissions in workflow 3.10.0.
+const DESIGN_AGENTS = new Map(
+  ["board-agent-refine", "board-agent-design"].map((name) => [
+    name,
+    {
+      name,
+      prompt: "Design from the supplied context only.",
+      source: "project" as const,
+      tools: [],
+    },
+  ]),
+);
 
 export interface RefineTask {
   title: string;
@@ -52,10 +68,12 @@ export interface RefineRunInput {
   cwd: string;
   storyTitle: string;
   storyBody: string;
+  maxTasks: number;
   extraContext: string; // human answers from Needs Design re-runs
   contextDigest: string;
   model: string;
   timeoutMs: number;
+  signal?: AbortSignal;
 }
 
 /** Render a single-agent workflow that returns a schema-constrained RefineOutput. */
@@ -81,7 +99,7 @@ const result = await agent(
   [
     'You are a senior product+technical designer refining a story for implementation.',
     'Return the RefineOutput JSON ONLY (schema-enforced). Be concise; no prose.',
-    'MINIMALISM: Current acceptance criteria set the scope. Reuse existing modules and standard-library/native capabilities before proposing new code or dependencies. Produce the fewest dependency-ordered tasks that can be implemented and verified safely; defer hypothetical flexibility and infrastructure.',
+    'MINIMALISM: Current acceptance criteria set the scope. Reuse existing modules and standard-library/native capabilities before proposing new code or dependencies. Produce the fewest complete tasks; defer hypothetical flexibility and infrastructure.',
     '',
     'STORY TITLE: ' + PAYLOAD.storyTitle,
     '',
@@ -98,7 +116,10 @@ const result = await agent(
     '',
     'RULES:',
     ' - openQuestions: only real blockers/ambiguities that need a human decision. Empty if the story is clear.',
-    ' - tasks: a minimal, dependency-ordered breakdown (1-12 tasks). Each task needs a short title and 1-5 acceptance criteria.',
+    ' - tasks: a minimal, complete breakdown (1-${input.maxTasks} tasks when openQuestions is empty). Never omit requirements to fit this limit. Each task needs a short title and 1-5 acceptance criteria.',
+    ' - Each task must be independently implementable AND verifiable from the current base, without another task being built, reviewed, closed, or integrated first. There is no dependency scheduler; task order and a single worker do not make prerequisites available.',
+    ' - Merge tightly coupled work (such as a new API and its consumer) into one task, including its verification.',
+    ' - Put unresolved dependency design decisions in openQuestions so the Story waits in Needs Design. You may return tasks: [] with openQuestions; no tasks are published until all questions are resolved.',
     ' - impactedAreas: paths/domains in the repo (from REPO CONTEXT) that will change.',
     ' - decisions: design decisions you made, grounded in the existing code.',
     ' - risks: technical risks and how to mitigate.',
@@ -107,6 +128,7 @@ const result = await agent(
     model: ${JSON.stringify(input.model)},
     timeoutMs: ${input.timeoutMs},
     label: 'refine',
+    agentType: 'board-agent-refine',
     schema: {
       type: 'object',
       required: ['goal', 'impactedAreas', 'decisions', 'risks', 'openQuestions', 'tasks'],
@@ -118,6 +140,7 @@ const result = await agent(
         openQuestions: { type: 'array', items: { type: 'string' } },
         tasks: {
           type: 'array',
+          maxItems: ${input.maxTasks},
           items: {
             type: 'object',
             required: ['title', 'acceptanceCriteria'],
@@ -139,7 +162,10 @@ return result;
 }
 
 /** Fail closed: a malformed model result must never become a partial task plan. */
-export function parseRefineOutput(raw: unknown): RefineOutput | null {
+export function parseRefineOutput(
+  raw: unknown,
+  maxTasks = 12,
+): RefineOutput | null {
   if (
     !object(raw) ||
     !keys(raw, [
@@ -155,7 +181,13 @@ export function parseRefineOutput(raw: unknown): RefineOutput | null {
     return null;
   for (const key of ["impactedAreas", "decisions", "risks", "openQuestions"])
     if (!strings(raw[key])) return null;
-  if (!Array.isArray(raw.tasks) || raw.tasks.length > 12) return null;
+  if (
+    !positive(maxTasks) ||
+    maxTasks > 12 ||
+    !Array.isArray(raw.tasks) ||
+    raw.tasks.length > maxTasks
+  )
+    return null;
   if (!raw.tasks.length && !(raw.openQuestions as string[]).length) return null;
   if (
     raw.tasks.some(
@@ -195,14 +227,28 @@ function keys(value: Record<string, unknown>, allowed: string[]): boolean {
 /** Run the refine pass via pi-dynamic-workflows (single agent, cheap model). */
 export async function runRefine(input: RefineRunInput): Promise<RefineOutput> {
   const script = renderRefineWorkflowSource(input);
+  const agent = new WorkflowAgent({
+    cwd: input.cwd,
+    // 3.10.0 treats an empty definition allowlist as unfiltered; Pi also adds
+    // built-ins. Enforce permissions at the SDK, retaining only its schema tool.
+    session: { tools: ["structured_output"] },
+  });
   const res = await runWorkflow(script, {
     cwd: input.cwd,
     persistLogs: true,
+    signal: input.signal,
+    agentRegistry: DESIGN_AGENTS,
+    // v3.10.0 only exposes schema repair control on the agent runner, not
+    // workflow agent() options. Invalid output must fail, not ask for repair.
+    agent: {
+      run: (prompt, options) =>
+        agent.run(prompt, { ...options, maxSchemaRetries: 0 }),
+    },
   });
-  const parsed = parseRefineOutput(res.result);
+  const parsed = parseRefineOutput(res.result, input.maxTasks);
   if (!parsed)
     throw new Error(
-      `Refine returned an invalid result: ${JSON.stringify(res.result).slice(0, 300)}`,
+      `Refine returned an invalid result (refine.max_tasks=${input.maxTasks}): ${JSON.stringify(res.result).slice(0, 300)}`,
     );
   return parsed;
 }
@@ -221,6 +267,7 @@ export interface DesignRunInput {
   contextDigest: string;
   model: string;
   timeoutMs: number;
+  signal?: AbortSignal;
 }
 
 /** Render a designer pass that rewrites one existing task contract without touching code. */
@@ -276,6 +323,7 @@ const result = await agent(
     model: ${JSON.stringify(input.model)},
     timeoutMs: ${input.timeoutMs},
     label: 'task design',
+    agentType: 'board-agent-design',
     schema: {
       type: 'object',
       required: ['body', 'summary', 'openQuestions'],
@@ -314,6 +362,9 @@ export async function runDesign(input: DesignRunInput): Promise<DesignOutput> {
   const result = await runWorkflow(renderDesignWorkflowSource(input), {
     cwd: input.cwd,
     persistLogs: true,
+    signal: input.signal,
+    agentRegistry: DESIGN_AGENTS,
+    session: { tools: ["structured_output"] },
   });
   const parsed = parseDesignOutput(result.result);
   if (!parsed)
@@ -490,30 +541,31 @@ export function matchesStoryIdentity(
 export function createStoryCreationPlan(
   input: CreateTasksInput,
 ): StoryCreationPlan {
+  if (!parseRefineOutput(input.refine, input.cfg.refine.max_tasks))
+    throw new Error(
+      `Invalid Story refine output (refine.max_tasks=${input.cfg.refine.max_tasks}); no task intents were created.`,
+    );
   const identity = storyIdentity(input.storyCard, input.projectId);
   if (
     !isTargetIssue(input.storyCard, input.repoOwner, input.repoName, "Story") ||
     input.storyCard.closed ||
     input.planSlug !== identity.plan ||
-    !parseRefineOutput(input.refine) ||
     !Number.isSafeInteger(input.existingTaskCount) ||
     input.existingTaskCount < 0
   )
     throw new Error("Invalid Story creation input.");
   const tasks = input.refine.openQuestions.length
     ? []
-    : input.refine.tasks
-        .slice(0, input.cfg.refine.max_tasks)
-        .map((task, index) =>
-          creationTask(
-            identity.itemId,
-            identity.number,
-            identity.plan,
-            task,
-            index,
-            `T${String(input.existingTaskCount + index + 1).padStart(3, "0")}`,
-          ),
-        );
+    : input.refine.tasks.map((task, index) =>
+        creationTask(
+          identity.itemId,
+          identity.number,
+          identity.plan,
+          task,
+          index,
+          `T${String(input.existingTaskCount + index + 1).padStart(3, "0")}`,
+        ),
+      );
   const creation: StoryCreationPlan = {
     schemaVersion: 1,
     id: randomUUID(),
@@ -533,8 +585,26 @@ export function createStoryCreationPlan(
   return creation;
 }
 
-/** Validate both the shape and the relationships, not just the JSON root. */
+/** An actionable plan must cover the entire refinement, never a prefix. */
 export function validateStoryCreationPlan(
+  value: unknown,
+): asserts value is StoryCreationPlan {
+  validateStoryCreationEvidence(value);
+  if (hasTruncatedTasks(value))
+    throw new Error(
+      `Story #${value.storyNumber} has a truncated creation journal (${value.refine.tasks.length} refine tasks, ${value.tasks.length} task intents); new publication and completion are blocked. Preserve the journal and reconcile manually; no automatic repair.`,
+    );
+}
+
+function hasTruncatedTasks(creation: StoryCreationPlan): boolean {
+  return (
+    !creation.refine.openQuestions.length &&
+    creation.tasks.length < creation.refine.tasks.length
+  );
+}
+
+/** Read historical evidence without making truncated plans actionable. */
+function validateStoryCreationEvidence(
   value: unknown,
 ): asserts value is StoryCreationPlan {
   const invalid = () => {
@@ -584,8 +654,7 @@ export function validateStoryCreationPlan(
   if (
     creation.refine.openQuestions.length
       ? creation.tasks.length !== 0
-      : !creation.tasks.length ||
-        creation.tasks.length > creation.refine.tasks.length
+      : creation.tasks.length > creation.refine.tasks.length
   )
     invalid();
   const seen = {
@@ -704,19 +773,10 @@ export async function reconcileStoryCreation(
     throw new Error("Story creation journal does not match the current story.");
   if (creation.refine.openQuestions.length)
     throw new Error("Unanswered Story design questions.");
-  if (
-    !meta.planFieldId ||
-    !meta.typeFieldId ||
-    !meta.typeOptions ||
-    meta.projectId !== projectId ||
-    !Object.keys(meta.statusOptions).some(
-      (name) => name.toLowerCase() === cfg.columns.ready.toLowerCase(),
-    ) ||
-    !Object.keys(meta.typeOptions).some((name) => name.toLowerCase() === "task")
-  )
-    throw new Error(
-      "Project Status, Plan and Type fields are required before task creation.",
-    );
+  if (meta.projectId !== projectId)
+    throw new Error("Project metadata does not match the Story project.");
+  validateProjectMetadata(meta, cfg);
+  validatePlanOption(meta, creation.planSlug);
 
   for (const task of creation.tasks) {
     // Read again for every child: missing evidence cannot authorize another create.
@@ -890,13 +950,23 @@ export async function reconcileStoryCreation(
     };
     // Publish Ready LAST, so builders can never see a partially configured Task.
     await beforeField();
-    if (card.plan !== creation.planSlug)
-      await ops.setText(
-        meta,
-        task.itemId!,
-        meta.planFieldId,
-        creation.planSlug,
-      );
+    if (card.plan !== creation.planSlug) {
+      if (meta.planFieldType === "SINGLE_SELECT")
+        await ops.setSingle(
+          meta,
+          task.itemId!,
+          meta.planFieldId!,
+          creation.planSlug,
+          meta.planOptions!,
+        );
+      else
+        await ops.setText(
+          meta,
+          task.itemId!,
+          meta.planFieldId!,
+          creation.planSlug,
+        );
+    }
     task.planSet = true;
     persist();
     await beforeField();
@@ -906,9 +976,9 @@ export async function reconcileStoryCreation(
       await ops.setSingle(
         meta,
         task.itemId!,
-        meta.typeFieldId,
+        meta.typeFieldId!,
         "Task",
-        meta.typeOptions,
+        meta.typeOptions!,
       );
     task.typeSet = true;
     persist();
@@ -948,8 +1018,15 @@ export interface RefineState {
 
 export class RefineStateStore {
   private file: string;
+  private continuationFile: string;
   constructor(cwd: string) {
     this.file = resolve(cwd, ".pi", "board-agent", "refine-state.json");
+    this.continuationFile = resolve(
+      cwd,
+      ".pi",
+      "board-agent",
+      "refine-state-unblocked.json",
+    );
     this.assertPaths();
     mkdirSync(resolve(cwd, ".pi", "board-agent"), { recursive: true });
   }
@@ -958,6 +1035,7 @@ export class RefineStateStore {
       resolve(this.file, "../.."),
       resolve(this.file, ".."),
       this.file,
+      this.continuationFile,
     ]) {
       try {
         if (lstatSync(path).isSymbolicLink())
@@ -967,16 +1045,31 @@ export class RefineStateStore {
       }
     }
   }
-  load(): RefineState {
-    this.assertPaths();
-    if (!existsSync(this.file)) return {};
+  private read(file: string): RefineState {
+    if (!existsSync(file)) return {};
     try {
-      return this.validate(JSON.parse(readFileSync(this.file, "utf8")));
+      return this.validate(JSON.parse(readFileSync(file, "utf8")));
     } catch (error) {
       throw new Error(
-        `Invalid story journal ${this.file}: ${error instanceof Error ? error.message : String(error)}`,
+        `Invalid story journal ${file}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+  load(): RefineState {
+    this.assertPaths();
+    const original = this.read(this.file);
+    const continued = this.read(this.continuationFile);
+    if (existsSync(this.continuationFile) && !existsSync(this.file))
+      throw new Error(
+        `Missing preserved Story journal ${this.file}; reconcile manually.`,
+      );
+    for (const [number, entry] of Object.entries(continued)) {
+      // A companion may advance healthy Stories, never hide blocked evidence.
+      const before = original[Number(number)];
+      if (before?.creation) validateStoryCreationPlan(before.creation);
+      if (entry.creation) validateStoryCreationPlan(entry.creation);
+    }
+    return { ...original, ...continued };
   }
   private validate(parsed: unknown): RefineState {
     if (!object(parsed)) throw new Error("state root must be an object");
@@ -1016,7 +1109,9 @@ export class RefineStateStore {
       )
         throw new Error(`invalid identity for #${number}`);
       if (entry.creation !== undefined) {
-        validateStoryCreationPlan(entry.creation);
+        // A legacy truncated entry must not prevent reading unrelated Stories.
+        // get/update and publication use the stricter actionable-plan boundary.
+        validateStoryCreationEvidence(entry.creation);
         const creation = entry.creation;
         if (
           creation.storyItemId !== id.itemId ||
@@ -1041,29 +1136,75 @@ export class RefineStateStore {
   }
   save(state: RefineState): void {
     this.assertPaths();
+    let file = this.file;
     let serialized: string;
     try {
       serialized = JSON.stringify(state, null, 2);
-      this.validate(JSON.parse(serialized));
+      const next = this.validate(JSON.parse(serialized));
+      const previous = this.load();
+      let changed = false;
+      for (const key of new Set([
+        ...Object.keys(previous),
+        ...Object.keys(next),
+      ])) {
+        const before = previous[Number(key)];
+        const after = next[Number(key)];
+        if (JSON.stringify(before) === JSON.stringify(after)) continue;
+        // Unchanged legacy evidence may coexist with other Stories, but must
+        // never be erased, marked complete, or automatically repaired.
+        if (before?.creation) validateStoryCreationPlan(before.creation);
+        if (after?.creation) validateStoryCreationPlan(after.creation);
+        changed = true;
+      }
+      if (!changed) return; // Preserve the original bytes on a no-op save.
+      const original = this.read(this.file);
+      if (
+        existsSync(this.continuationFile) ||
+        Object.values(original).some(
+          (entry) => entry.creation && hasTruncatedTasks(entry.creation),
+        )
+      ) {
+        // Freeze the exact original file. Only unrelated updates go in the
+        // companion, in the SAME journal format; no entries are migrated/repaired.
+        for (const number of Object.keys(original))
+          if (!next[Number(number)])
+            throw new Error(
+              `Cannot remove Story #${number} from preserved journal ${this.file}.`,
+            );
+        file = this.continuationFile;
+        serialized = JSON.stringify(
+          Object.fromEntries(
+            Object.entries(next).filter(
+              ([number, entry]) =>
+                JSON.stringify(entry) !==
+                JSON.stringify(original[Number(number)]),
+            ),
+          ),
+          null,
+          2,
+        );
+      }
     } catch (error) {
       throw new Error(
         `Invalid story journal ${this.file}: ${error instanceof Error ? error.message : String(error)}`,
         { cause: error },
       );
     }
-    const temporary = `${this.file}.${process.pid}.${randomUUID()}.tmp`;
+    const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
     try {
       writeFileSync(temporary, serialized, {
         encoding: "utf8",
         flag: "wx",
       });
-      renameSync(temporary, this.file);
+      renameSync(temporary, file);
     } finally {
       if (existsSync(temporary)) unlinkSync(temporary);
     }
   }
   get(issueNumber: number): RefineState[number] | undefined {
-    return this.load()[issueNumber];
+    const entry = this.load()[issueNumber];
+    if (entry?.creation) validateStoryCreationPlan(entry.creation);
+    return entry;
   }
   update(issueNumber: number, patch: Partial<RefineState[number]>): void {
     const state = this.load();

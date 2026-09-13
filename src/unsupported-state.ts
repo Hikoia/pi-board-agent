@@ -3,7 +3,7 @@ import { join, relative, resolve } from "node:path";
 import { runProcessSync } from "./process-runner.js";
 import { isTicketExecutionRecord } from "./ticket-worktree.js";
 
-function repoRoot(cwd: string): string {
+export function resolveStateRepoRoot(cwd: string): string {
   const result = runProcessSync("git", ["rev-parse", "--show-toplevel"], {
     cwd,
   });
@@ -32,8 +32,10 @@ function stateFiles(path: string, unsupported: string[]): string[] {
 }
 
 /** Read-only inventory of state that 0.2.0 deliberately refuses to migrate. */
-export function findUnsupportedState(cwd: string): string[] {
-  const root = repoRoot(cwd);
+export function findUnsupportedState(
+  cwd: string,
+  root = resolveStateRepoRoot(cwd),
+): string[] {
   const dotpi = join(root, ".pi");
   const state = join(dotpi, "board-agent");
   const unsupported: string[] = [];
@@ -64,8 +66,8 @@ export function findUnsupportedState(cwd: string): string[] {
     .map((path) => relative(root, path).replaceAll("\\", "/"));
 }
 
-export function assertSupportedState(cwd: string): void {
-  const files = findUnsupportedState(cwd);
+export function assertSupportedState(cwd: string, root?: string): void {
+  const files = findUnsupportedState(cwd, root);
   if (!files.length) return;
   throw new Error(
     [

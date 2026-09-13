@@ -11,6 +11,8 @@ export interface WaveOutcome {
   limitations?: string;
   workaround?: string;
   humanAction?: string;
+  /** Repair-only; validated against the durable builder's tool history. */
+  testEvidence?: unknown;
 }
 
 /** Strictly normalize a persisted workflow result; malformed entries are not guessed. */
@@ -41,6 +43,7 @@ export function normalizeWaveResults(raw: unknown): WaveOutcome[] {
       limitations: typeof result.limitations === "string" ? result.limitations : undefined,
       workaround: typeof result.workaround === "string" ? result.workaround : undefined,
       humanAction: typeof result.humanAction === "string" ? result.humanAction : undefined,
+      ...(Object.hasOwn(result, "testEvidence") ? { testEvidence: result.testEvidence } : {}),
     });
   }
   return outcomes;

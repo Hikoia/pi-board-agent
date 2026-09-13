@@ -37,7 +37,7 @@ export class ProcessTimeoutError extends Error {
   }
 }
 
-export type ProcessCommand = "git" | "gh" | "node";
+export type ProcessCommand = "git" | "gh" | "node" | "windows-link-kind";
 
 export interface ProcessOptions {
   cwd?: string;
@@ -86,6 +86,29 @@ const invalidDeadline = () =>
 const windowsRoot = () =>
   process.env.SystemRoot || process.env.SYSTEMROOT || "C:\\Windows";
 const taskkill = () => join(windowsRoot(), "System32", "taskkill.exe");
+const powershell = () =>
+  join(
+    windowsRoot(),
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+
+// Fixed metadata query, not a general shell command. The path is data in an
+// environment variable; the same supervisor/Job Object contains this child.
+const WINDOWS_LINK_KIND = Buffer.from(
+  `
+$ErrorActionPreference = 'Stop'
+$item = Get-Item -Force -LiteralPath $env:BOARD_AGENT_CLEANUP_LINK
+if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Not a reparse point' }
+if ($item.LinkType -eq 'Junction') { 'junction' }
+elseif ($item.LinkType -eq 'SymbolicLink') {
+  if ($item.Attributes -band [IO.FileAttributes]::Directory) { 'dir' } else { 'file' }
+} else { throw 'Unsupported cleanup symlink/reparse state' }
+`,
+  "utf16le",
+).toString("base64");
 
 function killGroup(pid: number): string {
   try {
@@ -226,21 +249,38 @@ function execute(
 ): Promise<ProcessResult> {
   const timeoutMs = deadline(options);
   if (timeoutMs === undefined) return Promise.resolve(invalidDeadline());
-  if (command !== "git" && command !== "gh" && command !== "node")
+  const linkKind = command === "windows-link-kind";
+  if (command !== "git" && command !== "gh" && command !== "node" && !linkKind)
     return Promise.resolve(failure("Unsupported process command"));
+  if (
+    linkKind &&
+    (process.platform !== "win32" ||
+      args.length !== 1 ||
+      !args[0] ||
+      args[0].includes("\0"))
+  )
+    return Promise.resolve(
+      failure("Windows link metadata requires one valid path on Windows"),
+    );
   return new Promise((resolve) => {
     let child: ChildProcessWithoutNullStreams;
     try {
-      const file = command === "node" ? process.execPath : command;
+      const file = linkKind
+        ? powershell()
+        : command === "node"
+          ? process.execPath
+          : command;
+      const argv = linkKind
+        ? [
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            WINDOWS_LINK_KIND,
+          ]
+        : args;
       if (process.platform === "win32") {
         child = spawn(
-          join(
-            windowsRoot(),
-            "System32",
-            "WindowsPowerShell",
-            "v1.0",
-            "powershell.exe",
-          ),
+          powershell(),
           [
             "-NoLogo",
             "-NoProfile",
@@ -252,9 +292,10 @@ function execute(
             cwd: options.cwd,
             env: {
               ...nonInteractiveEnv(options.env),
+              ...(linkKind ? { BOARD_AGENT_CLEANUP_LINK: args[0] } : {}),
               BOARD_AGENT_PROCESS_COMMAND: JSON.stringify({
                 file,
-                line: [file, ...args].map(windowsArg).join(" "),
+                line: [file, ...argv].map(windowsArg).join(" "),
               }),
             },
             stdio: "pipe",
@@ -534,15 +575,50 @@ if (!isMainThread && workerData?.boardAgentProcessRunner === true) {
     });
 }
 
+const MAX_DIAGNOSTIC_BYTES = 8 * 1024;
+
+function truncateDiagnostic(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text);
+  if (bytes.length <= maxBytes) return text;
+  const marker = "\n[truncated]\n";
+  const half = Math.floor((maxBytes - Buffer.byteLength(marker)) / 2);
+  // Keep the final error detail as well as the initial context, without cutting
+  // UTF-8 characters at either boundary (continuation bytes start with 10).
+  let tail = bytes.length - half;
+  while ((bytes[tail] & 0xc0) === 0x80) tail++;
+  return (
+    new TextDecoder().decode(bytes.subarray(0, half), { stream: true }) +
+    marker +
+    bytes.subarray(tail).toString("utf8")
+  );
+}
+
 export function processFailure(
   command: ProcessCommand,
   args: string[],
   result: ProcessResult,
   timeoutMs = GIT_GH_TIMEOUT_MS,
 ): Error {
-  if (result.timedOut)
-    return new ProcessTimeoutError(`${command} ${args.join(" ")}`, timeoutMs);
-  return new Error(
-    `${command} ${args.join(" ")} failed: ${result.stderr.trim() || `exit ${result.status ?? "unknown"}`}`,
-  );
+  const label = `${command} ${args.join(" ")}`;
+  const error = result.timedOut
+    ? new ProcessTimeoutError(label, timeoutMs)
+    : new Error(`${label} failed`);
+  // Bound the whole message, reserving room for BOTH streams even with long argv.
+  const heading = truncateDiagnostic(error.message, MAX_DIAGNOSTIC_BYTES / 4);
+  const stdout = result.stdout.trim();
+  const stderr = result.stderr.trim();
+  if (!stdout && !stderr) {
+    error.message = result.timedOut
+      ? heading
+      : `${heading}: exit ${result.status ?? "unknown"}`;
+    return error;
+  }
+  const separator = stderr && stdout ? "\nstdout: " : "";
+  const available =
+    MAX_DIAGNOSTIC_BYTES - Buffer.byteLength(`${heading}: ${separator}`);
+  const stderrLimit =
+    available - Math.min(Buffer.byteLength(stdout), Math.floor(available / 2));
+  const detail = truncateDiagnostic(stderr, stderrLimit);
+  error.message = `${heading}: ${detail}${separator}${truncateDiagnostic(stdout, available - Buffer.byteLength(detail))}`;
+  return error;
 }

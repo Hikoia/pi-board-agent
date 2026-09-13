@@ -30,15 +30,19 @@ type_field: "Kind"
 # ── Plan grouping ───────────────────────────────────────────────────────────
 # Cards are grouped into "plans" by the value of `plan_field` on the project.
 # Add one stable slug per Story/task group (for example, release-0.2.0).
+# TEXT or SINGLE_SELECT; select options must exist before Story publication.
+# After field/option edits, stop successfully, lint, then run a new loop.
 plan_field: "Plan"
 
 # ── Concurrency ─────────────────────────────────────────────────────────────
-# Global cap shared by active ticket builders and foreground refinement/review.
-# Capped at 16.
+# Total model budget: builders + one foreground (design/refine/review/watchdog).
+# Paused, pending, launching, missing/unreadable runs conservatively occupy slots.
+# Reserve one primary slot, pre-fill builders, run one primary model, back-fill;
+# watchdog models use only remaining capacity. Capped at 16.
 max_workers: 2
 
-# Polling interval (seconds) of the autonomous loop. 60-120 is recommended
-# to stay well within the GitHub GraphQL rate-limit budget.
+# Polling interval (seconds) of the autonomous loop. Requests depend on board
+# size, pagination and active work; this interval is not a rate-limit guarantee.
 tick_seconds: 90
 
 # ── Branch strategy ─────────────────────────────────────────────────────────
@@ -70,9 +74,9 @@ models:
   watch: "deepseek-v4-flash-0731"
 
 # ── Builder context (repo digest) ───────────────────────────────────────────
-# Deterministic markdown digest injected into every builder mission so the
-# agent starts oriented without exploring the repo (saves tokens).
-# Regenerated automatically when the git HEAD changes.
+# Navigation digest rendered from the prepared ticket worktree on new launches,
+# not the host checkout cache. Read relevant code; the worktree is authoritative.
+# No digest file is written into the ticket worktree; resumed runs keep their mission.
 context:
   enabled: true
   max_chars: 20000 # ~5K tokens
@@ -82,10 +86,12 @@ context:
 # `enabled` controls both Story refinement and Needs Design Task contract
 # refinement. Stories produce sub-issues; Tasks wait for a fresh trusted
 # design decision before their existing issue contract is rewritten.
+# Each child must be implementable AND verifiable independently from base.
+# Keep real dependencies in Backlog manually until prerequisites are integrated.
 refine:
   enabled: true
   timeout_ms: 240000 # per-refine agent timeout
-  max_tasks: 12 # safety cap on tasks created per story
+  max_tasks: 12 # reject over-limit output; never slice requirements or auto-repair
 
 # ── AI review gate ──────────────────────────────────────────────────────────
 # Review cards are independently checked against their acceptance criteria.
@@ -134,8 +140,7 @@ safety:
   # Existing managed runs are still reconciled;
   # one ticket cannot block the board.
   require_clean_worktree: true
-  # Skip cards whose linked issue is already closed.
-  skip_closed_issues: true
+# Closed Issues never start builders/design, regardless of legacy preferences.
 
 # ── Bot identity (optional) ─────────────────────────────────────────────────
 # When set, board-agent uses this login for the assignee claim + refetch guard.

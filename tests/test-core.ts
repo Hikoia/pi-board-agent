@@ -125,7 +125,7 @@ check(builder.prompt.includes("gh issue view 42 --json comments") && builder.pro
 check(["attempted", "limitations", "workaround", "humanAction"].every((key) => builder.prompt.includes(key) && schemaHas(builder, key)), "builder prompt and schema preserve actionable failure guidance");
 const agentPrompt = readFileSync(new URL("../agents/board-agent-builder.md", import.meta.url), "utf8");
 const skill = readFileSync(new URL("../skills/board-agent/SKILL.md", import.meta.url), "utf8");
-check(agentPrompt.includes("minimal implementation ladder") && skill.includes("## Minimal implementation"), "packaged builder agent and skill retain minimal implementation policy");
+check(agentPrompt.includes("NON-production compatibility pointer") && agentPrompt.includes("../skills/board-agent/SKILL.md") && agentPrompt.includes("../src/workflow-prompt.ts") && !agentPrompt.includes("## Rules") && !agentPrompt.includes("## System prompt") && skill.includes("## Minimal implementation"), "packaged compatibility pointer links the builder skill and actual workflow mission without a second rule body");
 const smoke = await runWorkflow(`export const meta = { name: 'smoke', description: 'no agents' }; return [{ taskKey: 'T001', itemId: 'PVTI_1', status: 'success', branch: 'task/issue-1' }];`, { cwd: root, persistLogs: false, agentRegistry: new Map() });
 check(normalizeWaveResults(smoke.result)[0]?.taskKey === "T001", "programmatic no-agent dispatch still runs and normalizes its result");
 
@@ -176,9 +176,9 @@ check(parseRefineOutput(null) === null && parseRefineOutput({ ...good, goal: 42 
 check(parseRefineOutput({ ...good, tasks: "nope" }) === null, "refine parser rejects malformed tasks instead of creating a partial plan");
 const many = Array.from({ length: 12 }, (_, index) => ({ title: `Task ${index}`, acceptanceCriteria: ["verified"] }));
 check(parseRefineOutput({ ...good, tasks: many })?.tasks.length === 12 && parseRefineOutput({ ...good, tasks: [...many, many[0]] }) === null, "refine accepts 12 tasks but fails closed above the cap (no silent truncation)");
-const refine = await execute(renderRefineWorkflowSource({ cwd: repo, storyTitle: "Add password reset", storyBody: "Users need password reset", extraContext: "Use email links", contextDigest: tricky, model: "refine-model", timeoutMs: 240000 }), good);
+const refine = await execute(renderRefineWorkflowSource({ cwd: repo, storyTitle: "Add password reset", storyBody: "Users need password reset", maxTasks: cfg.refine.max_tasks, extraContext: "Use email links", contextDigest: tricky, model: "refine-model", timeoutMs: 240000 }), good);
 check(refine.prompt.includes("Add password reset") && refine.prompt.includes(tricky) && refine.prompt.includes("Use email links") && refine.options?.model === "refine-model" && schemaHas(refine, "openQuestions"), "executed refinement receives story, context, human answers, model, and schema");
-check(refine.prompt.includes("MINIMALISM:") && refine.prompt.includes("fewest dependency-ordered tasks"), "refinement retains minimal design policy");
+check(refine.prompt.includes("MINIMALISM:") && refine.prompt.includes("fewest complete tasks"), "refinement retains minimal design policy");
 const questions = renderQuestionsComment("001-auth", { ...good, openQuestions: ["q1?", "q2?"] });
 check(questions.includes("Needs Design") && questions.includes("1. q1?") && questions.includes("2. q2?"), "Needs Design comment numbers every open question");
 const refined = renderRefineComment("001-auth", good, [{ number: 12, url: "https://example.invalid/12", taskKey: "T001" }]);
@@ -223,7 +223,7 @@ check(await makeNotifier(enabled)("needs_human", "missing credentials") === fals
 // Shared slot matrix and real loop orchestration, not source-order substring tests.
 for (const [max, active, pending, builders, reviewers] of [[2, 0, true, 1, 1], [2, 1, true, 0, 1], [2, 2, true, 0, 0], [2, 0, false, 2, 0], [2, 3, true, 0, 0], [1, 0, true, 0, 1]] as const) {
   const slots = allocateWorkerSlots(max, active, pending);
-  check(slots.builderSlots === builders && slots.reviewSlots === reviewers, `shared slots max=${max}, active=${active}, review=${pending}`);
+  check(slots.builderSlots === builders && slots.foregroundSlots === reviewers, `shared slots max=${max}, active=${active}, review=${pending}`);
 }
 let shutdowns = 0;
 let tickUpdates = 0;
@@ -249,7 +249,7 @@ check(!state.running && shutdowns === 1, "awaited loop.stop settles the executor
 
 const live = [card(1), card(2), card(3), card(42, { status: "Review" }), card(43, { status: "Review" })];
 const worktrees = new TicketWorktrees(repo);
-for (const c of live.slice(3)) worktrees.ensure(buildTasksForWave(cfg, "001-auth", [c])[0], "001-auth");
+for (const c of live.slice(3)) await worktrees.ensure(buildTasksForWave(cfg, "001-auth", [c])[0], "001-auth");
 let active = 0;
 let reviewCalls = 0;
 const events: string[] = [];
@@ -296,7 +296,7 @@ active = 0;
 await schedulingLoop.tickNow();
 check(Number(reviewCalls) === 2 && live[4].status === "Ready" && events.indexOf("comment:43") < events.indexOf("status:Ready") && events.includes("release:43"), "failed review posts findings before returning the card to Ready and releasing its claim");
 await schedulingLoop.stop();
-// The UI formatter has no public seam; retain the baseline guard for its wiring.
+// Wiring guard complements the rendered entry-point checks in test-capacity-widget.
 const indexSource = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
-check(indexSource.includes("active.length + (reviewing ? 1 : 0)") && indexSource.includes("${totalActive}/${cfg.max_workers} active") && indexSource.includes("${reviewing} [reviewing]"), "persistent widget includes the reviewer in its worker total and task rows");
+check(indexSource.includes("executor.observation") && indexSource.includes("builderSlots + (foreground ? 1 : 0)") && indexSource.includes("slots occupied · ${runningModels} models running") && indexSource.includes("${foreground.label} [${foreground.kind}]"), "persistent widget separates occupied slots from running models and includes every foreground lane");
 assert.equal(process.exitCode ?? 0, 0, "core regressions failed");

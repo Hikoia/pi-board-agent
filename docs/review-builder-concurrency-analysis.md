@@ -1,5 +1,7 @@
 # Reviewer 與 Builder 併行分析
 
+> Historical report at the baseline below, not current guidance. See [current architecture](architecture.md) and [operator runbook](runbook.md).
+
 > 分析基準：`b3857519f1eac1c239ee70698d7d35653252ca08`。本文假設「agent 上限 2」指 `.pi/board-agent.yml` 的 `max_workers: 2`。
 
 ## 結論

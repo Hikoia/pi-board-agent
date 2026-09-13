@@ -21,7 +21,7 @@ const git = (cwd: string, ...args: string[]) =>
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
 let sequence = 0;
-function fixture() {
+async function fixture() {
   const dir = join(root, `case-${++sequence}`);
   const origin = join(dir, "origin.git");
   const repo = join(dir, "repo");
@@ -47,7 +47,7 @@ function fixture() {
     baseBranch: "main",
   };
   const store = new TicketWorktrees(repo);
-  const record = store.ensure(task, "demo");
+  const record = await store.ensure(task, "demo");
   writeFileSync(join(record.path, "feature.txt"), "feature\n");
   git(record.path, "add", ".");
   git(record.path, "commit", "-m", "feature");
@@ -77,13 +77,13 @@ function fixture() {
 }
 
 {
-  const f = fixture();
+  const f = await fixture();
   writeFileSync(join(f.record.path, "dirty.txt"), "keep me\n");
-  assert.throws(() => f.finish(), /Dirty worktree/);
+  await assert.rejects(() => f.finish(), /Dirty worktree/);
   f.kept();
   rmSync(join(f.record.path, "dirty.txt"));
   git(f.repo, "worktree", "lock", f.record.path);
-  assert.throws(() => f.finish(), /Locked worktree/);
+  await assert.rejects(() => f.finish(), /Locked worktree/);
   f.kept();
   git(f.repo, "worktree", "unlock", f.record.path);
   const index = git(
@@ -96,11 +96,11 @@ function fixture() {
   const healthy = readFileSync(index);
   writeFileSync(index, "corrupt index");
   assert.equal(f.store.check(f.record, false).ok, false);
-  assert.throws(() => f.finish(), /status/);
+  await assert.rejects(() => f.finish(), /status/);
   f.kept();
   writeFileSync(index, healthy);
   writeFileSync(join(f.repo, "main-dirty.txt"), "leave main alone\n");
-  const result = f.finish();
+  const result = await f.finish();
   assert.equal(f.tip(), result);
   assert.equal(git(f.repo, "rev-parse", "HEAD"), f.baseSha);
   assert.equal(
@@ -116,7 +116,7 @@ function fixture() {
   );
 }
 {
-  const f = fixture();
+  const f = await fixture();
   writeFileSync(join(f.repo, "shared.txt"), "base conflict\n");
   git(f.repo, "add", ".");
   git(f.repo, "commit", "-m", "base conflict");
@@ -126,7 +126,7 @@ function fixture() {
   git(f.record.path, "commit", "-m", "task conflict");
   const base = f.tip();
   const local = f.store.localBranchSha(f.task.taskBranch);
-  assert.throws(() => f.finish(), /merge-tree/);
+  await assert.rejects(() => f.finish(), /merge-tree/);
   assert.equal(f.tip(), base);
   assert.equal(f.store.localBranchSha(f.task.taskBranch), local);
   assert.ok(existsSync(f.record.path));
@@ -135,11 +135,11 @@ function fixture() {
   );
 }
 {
-  const f = fixture();
+  const f = await fixture();
   const hook = join(f.origin, "hooks", "pre-receive");
   writeFileSync(hook, "#!/bin/sh\nexit 1\n");
   chmodSync(hook, 0o755);
-  assert.throws(() => f.finish(), /push/);
+  await assert.rejects(() => f.finish(), /push/);
   f.kept();
   assert.equal(f.store.read(f.task.itemId)!.finalization, undefined);
   rmSync(hook);
@@ -147,7 +147,7 @@ function fixture() {
   git(f.repo, "add", ".");
   git(f.repo, "commit", "-m", "base advances");
   git(f.repo, "push", "origin", "main");
-  const result = f.finish();
+  const result = await f.finish();
   assert.equal(f.tip(), result);
   assert.equal(git(f.repo, "show", "origin/main:later.txt"), "later base work");
   assert.equal(git(f.repo, "show", "origin/main:feature.txt"), "feature");
@@ -156,7 +156,7 @@ function fixture() {
   );
 }
 {
-  const f = fixture();
+  const f = await fixture();
   const newer = git(
     f.repo,
     "commit-tree",
@@ -167,12 +167,12 @@ function fixture() {
     "remote-only work",
   );
   git(f.repo, "push", "origin", `${newer}:refs/heads/${f.task.taskBranch}`);
-  assert.throws(() => f.finish(), /unmerged work/);
+  await assert.rejects(() => f.finish(), /unmerged work/);
   assert.equal(f.tip(f.task.taskBranch), newer);
   assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
   assert.ok(existsSync(f.record.path));
   git(f.record.path, "merge", "--ff-only", newer);
-  f.finish("merge");
+  await f.finish("merge");
   git(f.repo, "merge-base", "--is-ancestor", newer, "origin/main");
   assert.equal(f.tip(f.task.taskBranch), "");
   console.log(
@@ -180,7 +180,7 @@ function fixture() {
   );
 }
 {
-  const f = fixture();
+  const f = await fixture();
   const newer = git(
     f.repo,
     "commit-tree",
@@ -196,7 +196,7 @@ function fixture() {
     `#!/bin/sh\nwhile read local_ref local_sha remote_ref remote_sha; do\n if [ "$remote_ref" = refs/heads/main ]; then git update-ref refs/heads/${f.task.taskBranch} ${newer} ${f.taskSha}; fi\ndone\n`,
   );
   chmodSync(hook, 0o755);
-  assert.throws(() => f.finish(), /Local .* moved/);
+  await assert.rejects(() => f.finish(), /Local .* moved/);
   assert.equal(f.store.localBranchSha(f.task.taskBranch), newer);
   assert.equal(f.tip(f.task.taskBranch), f.taskSha);
   assert.ok(existsSync(f.record.path));
@@ -205,7 +205,7 @@ function fixture() {
   );
 }
 {
-  const f = fixture();
+  const f = await fixture();
   const newer = git(
     f.repo,
     "commit-tree",
@@ -222,7 +222,7 @@ function fixture() {
     `#!/bin/sh\nwhile read local_ref local_sha remote_ref remote_sha; do\n if [ "$remote_ref" = refs/heads/${f.task.taskBranch} ]; then git --git-dir="$2" update-ref "$remote_ref" ${newer} ${f.taskSha}; fi\ndone\n`,
   );
   chmodSync(hook, 0o755);
-  assert.throws(() => f.finish(), /push/);
+  await assert.rejects(() => f.finish(), /push/);
   assert.equal(f.tip(f.task.taskBranch), newer);
   assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
   assert.ok(existsSync(f.record.path));
@@ -231,30 +231,30 @@ function fixture() {
   );
 }
 {
-  const f = fixture();
+  const f = await fixture();
   const hook = join(f.origin, "hooks", "post-receive");
   writeFileSync(
     hook,
     `#!/bin/sh\nwhile read old new ref; do\n if [ "$ref" = refs/heads/main ]; then git update-ref refs/heads/main ${f.baseSha}; fi\ndone\n`,
   );
   chmodSync(hook, 0o755);
-  assert.throws(() => f.finish(), /is not on origin/);
+  await assert.rejects(() => f.finish(), /is not on origin/);
   f.kept();
   rmSync(hook);
-  assert.ok(f.finish());
+  assert.ok(await f.finish());
   console.log(
     "PASS: a successful push response without verified integration never triggers cleanup",
   );
 }
 {
-  const f = fixture();
+  const f = await fixture();
   const outside = join(root, `outside-${sequence}`);
   git(f.repo, "worktree", "move", f.record.path, outside);
   symlinkSync(outside, f.record.path, "junction");
-  assert.throws(() => f.finish(), /unmanaged/);
+  await assert.rejects(() => f.finish(), /unmanaged/);
   assert.equal(git(outside, "rev-parse", "HEAD"), f.taskSha);
   assert.equal(f.tip(), f.baseSha);
-  assert.throws(
+  await assert.rejects(
     () => f.store.finalizeAccepted({ ...f.task, taskBranch: "main" }, "merge"),
     /must differ/,
   );
@@ -263,14 +263,14 @@ function fixture() {
   );
 }
 {
-  const f = fixture();
+  const f = await fixture();
   git(
     f.repo,
     "symbolic-ref",
     `refs/heads/${f.task.taskBranch}`,
     "refs/heads/main",
   );
-  assert.throws(() => f.finish(), /symbolic/);
+  await assert.rejects(() => f.finish(), /symbolic/);
   assert.equal(f.tip(), f.baseSha);
   assert.throws(() => f.store.localBranchSha("-invalid"), /Invalid branch/);
   console.log(
@@ -278,10 +278,10 @@ function fixture() {
   );
 }
 {
-  const f = fixture();
+  const f = await fixture();
   const collision = { ...f.task, itemId: f.task.itemId.toLowerCase() };
   assert.equal(f.store.read(collision.itemId), undefined);
-  assert.throws(
+  await assert.rejects(
     () => f.store.ensure(collision, "demo"),
     /corrupt or unsupported/,
   );
@@ -300,7 +300,7 @@ function fixture() {
   );
   assert.equal(JSON.stringify(f.store.read(f.task.itemId)), before);
   // Legacy execution state remains protected for builders, but does not gate human-approved completion.
-  assert.ok(f.finish());
+  assert.ok(await f.finish());
   assert.equal(f.store.has(f.task.itemId), false);
   console.log(
     "PASS: builder identity and legacy-journal protections remain; closed-ticket finalization needs neither",

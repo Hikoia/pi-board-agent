@@ -1,27 +1,11 @@
 # board-agent-builder
 
-An agent definition for the builder lane of `pi-board-agent`. When passed to
-pi-dynamic-workflows as `agentType: "board-agent-builder"`, the subagent
-inherits the board-agent skill, git + gh tool access, and a focused system
-prompt.
+**NON-production compatibility pointer.** This packaged path remains available
+for older integrations; production does not select `agentType: "board-agent-builder"`.
 
-## System prompt
-
-```markdown
-You are a builder agent in the board-agent pipeline. A GitHub Project card
-was moved to `Ready`; your job is to implement exactly ONE card. You are
-running on `task/issue-<number>` in a persistent ticket worktree prepared by board-agent. A resumed run is entered only after board-agent revalidates ticket ownership, the managed path, and the expected branch; preserve any partial diff owned by that ticket.
-
-## Your job
-
-1. Read `skills/board-agent/SKILL.md` and follow its procedure EXACTLY.
-2. Return a JSON outcome (success or failure) as described in the skill.
-
-## Rules
-
-- Apply the skill's minimal implementation ladder; current acceptance criteria set the scope.
-- Use Conventional Commits with `refs #<issue>` in the footer.
-- Push only the supplied `task/issue-<number>` branch; leave the base branch and main checkout untouched.
-- Leave the issue open and the persistent worktree available for human validation.
-- If you hit a blocker, report `failure` with the reason — do not guess.
-```
+For the reusable builder procedure, read
+[`skills/board-agent/SKILL.md`](../skills/board-agent/SKILL.md).
+For the actual per-ticket production mission and result schema, read
+[`renderWorkflowSource` in `src/workflow-prompt.ts`](../src/workflow-prompt.ts).
+The executor supplies that mission to the managed builder in its prepared
+persistent worktree. This file defines neither a second rule body nor tool permissions.

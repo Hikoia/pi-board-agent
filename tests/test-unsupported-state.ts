@@ -12,6 +12,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { _DEFAULTS } from "../src/config.js";
+import * as gh from "../src/gh.js";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -65,9 +67,8 @@ const putLegacy = () => {
 };
 // Byte/mtime inventory detects writes, renames, migration, deletion AND new paths.
 const inventory = (dir: string): unknown =>
-  !existsSync(dir)
-    ? undefined
-    : readdirSync(dir)
+  existsSync(dir)
+    ? readdirSync(dir)
         .sort()
         .map((name) => {
           const path = join(dir, name);
@@ -77,7 +78,8 @@ const inventory = (dir: string): unknown =>
             stat.mtimeMs,
             stat.isDirectory() ? inventory(path) : readFileSync(path, "utf8"),
           ];
-        });
+        })
+    : undefined;
 let hooks: ReturnType<typeof registerHooks> | undefined;
 const globals = globalThis as any;
 
@@ -219,6 +221,9 @@ try {
     "owner-lock.ts",
     "unsupported-state.ts",
     "ticket-worktree.ts",
+    "cleanup-snapshot.ts",
+    "repair.ts",
+    "dispatch.ts",
     "process-runner.ts",
   ]) {
     cpSync(new URL(`../src/${name}`, import.meta.url), join(pkg, "src", name));
@@ -261,6 +266,21 @@ try {
   writeFileSync(configFile, configText);
 
   const ghCalls: unknown[][] = [];
+  const validMetadata: gh.ProjectMetadata = {
+    projectId: "P",
+    statusFieldId: "S",
+    statusFieldType: "SINGLE_SELECT",
+    statusOptions: Object.fromEntries(
+      Object.values(_DEFAULTS.columns).map((name) => [name, name]),
+    ),
+    planFieldId: "PLAN",
+    planFieldType: "TEXT",
+    typeFieldId: "TYPE",
+    typeFieldType: "SINGLE_SELECT",
+    typeOptions: { Task: "TASK", Story: "STORY" },
+  };
+  let metadata = structuredClone(validMetadata);
+  let executors = 0;
   const loops: any[] = [];
   let stopWait = Promise.resolve();
   let failStart = false;
@@ -287,6 +307,12 @@ try {
     isRunning() {
       return this.running;
     }
+    isStopping() {
+      return this.stops > 0 && this.running;
+    }
+    isStopped() {
+      return this.stops > 0 && !this.running;
+    }
     isAdmittingNewWork() {
       return this.admissions;
     }
@@ -311,6 +337,7 @@ try {
       tickCount: 0,
       wavesLaunched: 0,
       reviewingTask: null,
+      foreground: null,
     }),
     whoami: async () => {
       ghCalls.push(["whoami"]);
@@ -319,10 +346,14 @@ try {
     getProjectMetadata: async (...args: unknown[]) => {
       ghCalls.push(["metadata", ...args]);
       await metadataWait;
-      return { projectId: "P", statusFieldId: "S", statusOptions: {} };
+      return structuredClone(metadata);
     },
-    validateStatusOptions: () => undefined,
-    createProductionTicketExecutor: () => ({}),
+    validateStatusOptions: gh.validateStatusOptions,
+    validateProjectMetadata: gh.validateProjectMetadata,
+    createProductionTicketExecutor: () => {
+      executors++;
+      return {};
+    },
     inspectTicketExecutions: () => ({ active: [], orphans: 0, needsHuman: 0 }),
   };
   const data = (names: string[]) =>
@@ -331,7 +362,12 @@ try {
     "@earendil-works/pi-coding-agent":
       'data:text/javascript,export const CONFIG_DIR_NAME = ".pi";',
     "./loop.js": data(["BoardLoop", "createLoopState"]),
-    "./gh.js": data(["whoami", "getProjectMetadata", "validateStatusOptions"]),
+    "./gh.js": data([
+      "whoami",
+      "getProjectMetadata",
+      "validateStatusOptions",
+      "validateProjectMetadata",
+    ]),
     "./ticket-executor.js": data([
       "createProductionTicketExecutor",
       "inspectTicketExecutions",
@@ -398,6 +434,64 @@ try {
     );
   }
   rmSync(join(state, "inflight"), { recursive: true });
+  for (const [label, patch, error] of [
+    ["missing Plan", { planFieldId: undefined }, /Plan.*TEXT.*SINGLE_SELECT/],
+    ["wrong Plan", { planFieldType: "NUMBER" }, /Plan.*TEXT.*SINGLE_SELECT/],
+    [
+      "unknown Plan type",
+      { planFieldType: undefined },
+      /Plan.*TEXT.*SINGLE_SELECT/,
+    ],
+    [
+      "missing Plan options",
+      { planFieldType: "SINGLE_SELECT", planOptions: undefined },
+      /Plan.*option/,
+    ],
+    ["missing Type", { typeFieldId: undefined }, /Type.*SINGLE_SELECT/],
+    ["wrong Type", { typeFieldType: "TEXT" }, /Type.*SINGLE_SELECT/],
+    ["missing Task", { typeOptions: { Story: "STORY" } }, /Type.*Task/],
+    ["missing Story", { typeOptions: { Task: "TASK" } }, /Type.*Story/],
+    ["missing Status", { statusFieldId: "" }, /Status.*SINGLE_SELECT/],
+    ["wrong Status", { statusFieldType: "TEXT" }, /Status.*SINGLE_SELECT/],
+    [
+      "missing Status option",
+      { statusOptions: { Ready: "R" } },
+      /Status option/,
+    ],
+  ] as Array<[string, Partial<gh.ProjectMetadata>, RegExp]>) {
+    metadata = { ...validMetadata, ...patch };
+    for (const action of ["lint", "run", "session_start"]) {
+      writeFileSync(
+        configFile,
+        configText.replace(
+          "auto_start: false",
+          `auto_start: ${action === "session_start"}`,
+        ),
+      );
+      const start = messages.length;
+      const callsBefore = ghCalls.length;
+      if (action === "session_start") await event(action);
+      else await command(action);
+      assert.ok(
+        messages.slice(start).some((message) => error.test(message)),
+        `${action}/${label}: ${messages.slice(start).join("\n")}`,
+      );
+      assert.equal(loops.length, 0, `${action}/${label}: no loop`);
+      assert.equal(executors, 0, `${action}/${label}: no executor/models`);
+      assert.equal(existsSync(join(state, "owner.lock")), false);
+      assert.ok(
+        ghCalls
+          .slice(callsBefore)
+          .every((call) => ["whoami", "metadata"].includes(String(call[0]))),
+        "preflight is read-only; no schema repair",
+      );
+    }
+  }
+  console.log(
+    "PASS: lint, explicit run, and auto-start fail closed on missing/wrong fields or required options, before owner/executor/model creation and without schema repair",
+  );
+  metadata = structuredClone(validMetadata);
+  writeFileSync(configFile, configText);
   mkdirSync(records, { recursive: true });
   writeFileSync(
     join(records, "pvti_3.json"),
@@ -445,6 +539,26 @@ try {
     "cached promotion must still reject removed configuration",
   );
   writeFileSync(configFile, configText);
+  metadata = { ...validMetadata, planFieldId: undefined };
+  const promotionStart = messages.length;
+  await command("run");
+  assert.equal(
+    recovery.promotions,
+    0,
+    "cached promotion cannot bypass metadata validation",
+  );
+  assert.equal(recovery.ticks, 0);
+  assert.ok(
+    messages.slice(promotionStart).some((message) => /Plan/.test(message)),
+  );
+  assert.ok(
+    existsSync(recovery.lock.path),
+    "failed admission preserves active recovery ownership",
+  );
+  console.log(
+    "PASS: cached recovery promotion checks current metadata before admitting work and retains recovery on failure",
+  );
+  metadata = structuredClone(validMetadata);
   await command("run");
   check(
     recovery.promotions === 1 && recovery.ticks >= 1,
@@ -512,6 +626,47 @@ try {
       `${stopAction} cancels startup still awaiting metadata instead of allowing a later unattended loop`,
     );
   }
+
+  metadataWait = Promise.resolve();
+  for (const refine of [true, false]) {
+    for (const planFieldType of ["TEXT", "SINGLE_SELECT"]) {
+      metadata = {
+        ...validMetadata,
+        planFieldType,
+        planOptions:
+          planFieldType === "SINGLE_SELECT"
+            ? { Release: "RELEASE_ID" }
+            : undefined,
+        typeOptions: refine
+          ? { Task: "TASK", Story: "STORY" }
+          : { task: "TASK" },
+        statusOptions: Object.fromEntries(
+          Object.entries(validMetadata.statusOptions).filter(
+            ([name]) => refine || !["Backlog", "Needs Design"].includes(name),
+          ),
+        ),
+      };
+      writeFileSync(
+        configFile,
+        `${configText}refine:\n  enabled: ${refine}\nreview:\n  enabled: true\nwatchdog:\n  enabled: false\n`,
+      );
+      const start = messages.length;
+      await command("lint");
+      assert.ok(
+        messages.slice(start).includes("All checks passed."),
+        messages.slice(start).join("\n"),
+      );
+      const count: number = loops.length;
+      await command("run");
+      assert.equal(loops.length, count + 1);
+      await command("stop");
+      console.log(
+        `PASS: lint/run accept ${planFieldType} Plan with refine=${refine}; disabled design does not require Story/Needs Design/Backlog`,
+      );
+    }
+  }
+  metadata = structuredClone(validMetadata);
+  writeFileSync(configFile, configText);
 
   const unconfigured = join(root, "unconfigured");
   mkdirSync(unconfigured);

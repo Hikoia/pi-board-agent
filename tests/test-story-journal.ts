@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import {
   mkdtempSync,
   existsSync,
+  readFileSync,
   symlinkSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { WorkflowAgent } from "@quintinshaw/pi-dynamic-workflows";
 import { _DEFAULTS, type Config } from "../src/config.js";
 import type { Card, ProjectMetadata } from "../src/gh.js";
 import {
@@ -16,6 +18,8 @@ import {
   RefineStateStore,
   storyIdentity,
   parseRefineOutput,
+  runRefine,
+  validateStoryCreationPlan,
   type RefineOutput,
   type StoryCreationOps,
   type StoryCreationPlan,
@@ -29,9 +33,12 @@ const cfg: Config = { ..._DEFAULTS };
 const meta: ProjectMetadata = {
   projectId: "P",
   statusFieldId: "STATUS",
-  statusOptions: { Ready: "READY" },
+  statusFieldType: "SINGLE_SELECT",
+  statusOptions: Object.fromEntries(Object.values(cfg.columns).map((name) => [name, name])),
   planFieldId: "PLAN",
+  planFieldType: "TEXT",
   typeFieldId: "TYPE",
+  typeFieldType: "SINGLE_SELECT",
   typeOptions: { Task: "TASK", Story: "STORY" },
 };
 const storyCard: Card = {
@@ -179,6 +186,141 @@ function harness(failure?: { operation: Operation; timing: Timing }) {
     },
   };
   return { children, itemByIssue, fields, calls, ops };
+}
+
+for (const [label, patch, error] of [
+  ["missing this Plan option", { planFieldType: "SINGLE_SELECT", planOptions: { Other: "OTHER" } }, /Plan.*release-0.2.0/],
+  ["missing Plan", { planFieldId: undefined }, /Plan/],
+  ["wrong Plan type", { planFieldType: "NUMBER" }, /Plan.*TEXT.*SINGLE_SELECT/],
+  ["unknown Plan type", { planFieldType: undefined }, /Plan.*TEXT.*SINGLE_SELECT/],
+  ["missing Type", { typeFieldId: undefined }, /Type/],
+  ["wrong Type type", { typeFieldType: "TEXT" }, /Type.*SINGLE_SELECT/],
+  ["missing Task", { typeOptions: { Story: "STORY" } }, /Type.*Task/],
+  ["missing Story", { typeOptions: { Task: "TASK" } }, /Type.*Story/],
+  ["wrong Status type", { statusFieldType: "TEXT" }, /Status.*SINGLE_SELECT/],
+  ["missing Status", { statusFieldId: "" }, /Status/],
+  ["missing Status options", { statusOptions: {} }, /Status option/],
+] as Array<[string, Partial<ProjectMetadata>, RegExp]>) {
+  let calls = 0;
+  let persists = 0;
+  const ops = new Proxy(harness().ops, { get: () => async () => { calls++; throw new Error("unexpected child I/O"); } });
+  await assert.rejects(reconcileStoryCreation(
+    { ...context, meta: { ...meta, ...patch } }, makePlan(), () => { persists++; }, ops,
+  ), error, label);
+  assert.equal(calls, 0, `${label}: no child API calls`);
+  assert.equal(persists, 0, `${label}: no journal progress writes`);
+}
+console.log("PASS: Story creation independently rejects missing metadata/options and wrong field types before any child I/O or journal progress");
+
+// Execute runRefine and its generated workflow, replacing only the external
+// model adapter. The fake deliberately bypasses schema enforcement to exercise
+// the host output validator too; this does NOT test model design judgement.
+{
+  const cwd = mkdtempSync(join(tmpdir(), "story-refine-limit-"));
+  const run = WorkflowAgent.prototype.run;
+  const calls: Array<{
+    prompt: string;
+    options: Parameters<WorkflowAgent["run"]>[1];
+  }> = [];
+  let result: RefineOutput = refined;
+  WorkflowAgent.prototype.run = async (prompt, options) => {
+    calls.push({ prompt, options });
+    return structuredClone(result) as never;
+  };
+  try {
+    const input = {
+      cwd,
+      storyTitle: "Add API and consumer",
+      storyBody: "The UI needs an endpoint that is not on the current base.",
+      extraContext: "Keep all requirements",
+      contextDigest: "src/api.ts and src/ui.ts exist; no new endpoint yet",
+      maxTasks: 2,
+      model: "offline-refine-model",
+      timeoutMs: 60_000,
+    };
+    assert.deepEqual(await runRefine(input), refined);
+    assert.equal(calls.length, 1);
+    const call = calls[0];
+    assert.equal(call.options?.maxSchemaRetries, 0, "disable the SDK's automatic schema repair turns too");
+    assert.partialDeepStrictEqual(call.options?.schema, {
+      properties: { tasks: { maxItems: 2 } },
+    });
+    assert.match(call.prompt, /1-2 tasks/);
+    assert.match(call.prompt, /independently implementable AND verifiable from the current base/);
+    assert.match(call.prompt, /[Mm]erge tightly coupled/);
+    assert.match(call.prompt, /unresolved dependency.*openQuestions.*Needs Design/);
+    assert.match(call.prompt, /no dependency scheduler/);
+    assert.doesNotMatch(call.prompt, /dependency-ordered|1-12 tasks/);
+    result = {
+      ...refined,
+      tasks: [...refined.tasks, { title: "Third", acceptanceCriteria: ["three"] }],
+    };
+    await assert.rejects(runRefine(input), /refine.max_tasks=2/);
+    assert.equal(calls.length, 2, "over-limit output is rejected, not sent back to the model");
+    assert.equal(parseRefineOutput(result, 2), null);
+    assert.deepEqual(parseRefineOutput(result, 3), result);
+    console.log("PASS: actual refine workflow carries max_tasks into prompt/schema and rejects over-limit output without a model repair call");
+    console.log("PASS: prompt requires base-independent implementation AND verification, merged tight dependencies, or Needs Design (not semantic proof)");
+  } finally {
+    WorkflowAgent.prototype.run = run;
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+for (const intentCount of [0, 1]) {
+  const cwd = mkdtempSync(join(tmpdir(), "story-truncated-evidence-"));
+  try {
+    const store = new RefineStateStore(cwd);
+    const file = join(cwd, ".pi", "board-agent", "refine-state.json");
+    const creation = makePlan();
+    creation.tasks.length = intentCount;
+    const state = {
+      42: { identity: storyIdentity(storyCard, "P"), refined: false, creation },
+    };
+    assert.throws(() => validateStoryCreationPlan(creation), /truncated/);
+    assert.throws(() => store.save(state), /truncated/, "new journals must cover the full refine output");
+    assert.equal(existsSync(file), false, "invalid intents are never persisted");
+    const original = JSON.stringify(state, null, "\t") + "\r\n";
+    writeFileSync(file, original);
+    assert.deepEqual(store.load(), state, "legacy evidence remains readable without migration");
+    assert.throws(() => store.get(42), /truncated/, "legacy evidence is not actionable");
+    for (const patch of [{ refined: true }, { creation: undefined }, { creation: makePlan() }]) {
+      assert.throws(() => store.update(42, patch), /truncated/);
+      assert.equal(readFileSync(file, "utf8"), original);
+    }
+    assert.throws(() => store.save({}), /truncated/, "cannot erase old truncated evidence");
+    store.save(store.load());
+    assert.equal(readFileSync(file, "utf8"), original, "no-op saves preserve exact original formatting");
+    const h = harness();
+    let persists = 0;
+    await assert.rejects(
+      reconcileStoryCreation(context, creation, () => { persists++; }, h.ops),
+      /truncated/,
+    );
+    assert.equal(persists, 0);
+    assert.deepEqual(h.calls, { create: 0, add: 0, status: 0, plan: 0, type: 0 });
+    const healthy = {
+      identity: storyIdentity({ ...storyCard, itemId: "STORY_43", number: 43 }, "P"),
+      refined: false,
+    };
+    store.update(43, healthy);
+    assert.deepEqual(new RefineStateStore(cwd).get(43), healthy);
+    assert.equal(readFileSync(file, "utf8"), original);
+    const companion = join(cwd, ".pi", "board-agent", "refine-state-unblocked.json");
+    const continued = readFileSync(companion, "utf8");
+    assert.deepEqual(JSON.parse(continued), { 43: healthy }, "same format, only unrelated updates; no migration of old entries");
+    writeFileSync(companion, JSON.stringify({
+      42: { identity: state[42].identity, refined: false },
+    }));
+    assert.throws(() => store.load(), /truncated creation journal/, "a companion must never mask blocked evidence");
+    writeFileSync(companion, continued);
+    store.save(store.load());
+    assert.equal(readFileSync(file, "utf8"), original);
+    assert.equal(readFileSync(companion, "utf8"), continued);
+    console.log(`PASS: ${intentCount} intents for 2 refine tasks cannot be published, completed, erased, repaired, or masked; healthy updates preserve exact original bytes`);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 }
 
 for (const operation of ["create", "add", "status", "plan", "type"] as const) {
@@ -573,6 +715,21 @@ console.log(
   console.log(
     "PASS: Plan drift after its write prevents the next Type/Ready mutations",
   );
+}
+
+{
+  const cwd = mkdtempSync(join(tmpdir(), "story-companion-link-"));
+  const target = mkdtempSync(join(tmpdir(), "story-companion-target-"));
+  try {
+    const store = new RefineStateStore(cwd);
+    symlinkSync(target, join(cwd, ".pi", "board-agent", "refine-state-unblocked.json"), "junction");
+    assert.throws(() => store.load(), /symlinked Story journal/);
+    assert.throws(() => store.save({}), /symlinked Story journal/);
+    console.log("PASS: companion journal retains the existing symlink/junction refusal on reads and writes");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true });
+  }
 }
 
 {

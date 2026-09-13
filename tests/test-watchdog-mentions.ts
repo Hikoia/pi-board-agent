@@ -349,12 +349,12 @@ const ciOps: NonNullable<WatchdogDeps["ciOps"]> = {
   checks: async () => [
     { name: "tests", status: "completed", conclusion: "failure" },
   ],
-  fix: async () => {
+  fix: async (input) => input.runModel!("offline CI fix", async () => {
     fixCalls++;
     enter();
     await finishing;
     return { result: { status: "success" } };
-  },
+  }),
 };
 let settled = false;
 const firstTick = new Watchdog({ ...deps(ciRoot), cfg: ciCfg, ciOps })
@@ -487,6 +487,7 @@ const fixed = await runCiFix(input, async (_source, options) => {
   git(isolatedPath, "commit", "-m", "fix");
   return { result: { status: "success" } };
 });
+assert.ok(fixed);
 check(
   (fixed.result as { status: string }).status === "success" &&
     git(repository, "rev-parse", "HEAD") === original &&

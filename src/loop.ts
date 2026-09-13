@@ -1,4 +1,7 @@
 /** Core polling loop: reconcile durable ticket runs, then fill global worker slots. */
+import { createRunPersistence } from "@quintinshaw/pi-dynamic-workflows";
+import { repairReviewInput } from "./repair.js";
+import type { RepairBlocker } from "./conflict-recovery.js";
 import type { Config } from "./config.js";
 import { planSlug, taskBranch } from "./config.js";
 import {
@@ -14,6 +17,8 @@ import {
   setStatus,
   tryClaim,
   updateIssueBody,
+  validateProjectMetadata,
+  validatePlanOption,
 } from "./gh.js";
 import { isClean } from "./git-helpers.js";
 import { makeNotifier } from "./notify.js";
@@ -34,7 +39,10 @@ import {
 } from "./refine.js";
 import { renderReviewComment, runReview } from "./review.js";
 import type { TicketExecutor } from "./ticket-executor.js";
-import { TicketWorktrees } from "./ticket-worktree.js";
+import {
+  TicketWorktrees,
+  type TicketExecutionRecord,
+} from "./ticket-worktree.js";
 import { buildTasksForWave } from "./workflow-prompt.js";
 import type { OwnerLock } from "./owner-lock.js";
 import { assertSupportedState } from "./unsupported-state.js";
@@ -49,21 +57,31 @@ export interface LoopState {
   tickCount: number;
   wavesLaunched: number;
   lastTickMs: number;
-  reviewingTask: string | null;
+  /** One loop-owned model invocation; never persisted or used as recovery evidence. */
+  foreground: {
+    kind: "design" | "refine" | "review" | "watchdog";
+    label: string;
+  } | null;
+  /** Existing review observation, derived from the one foreground state. */
+  readonly reviewingTask: string | null;
 }
 
 export interface LoopDeps {
   cwd: string;
+  repoRoot?: string;
   cfg: Config;
   repoOwner: string;
   repoName: string;
   botLogin: string;
   meta: ProjectMetadata;
   callback: StatusCallback;
-  onTick?: () => void;
+  onTick?: () => void | Promise<void>;
   revisionCheck?: () =>
     | { ok: boolean; reason?: string }
     | Promise<{ ok: boolean; reason?: string }>;
+  /** Synchronous local settings/latch check after the last awaited observation.
+   * Must not initiate async Git or reuse a display/capacity observation. */
+  revisionCheckNow?: () => { ok: boolean; reason?: string };
   /** Offline adapters; production uses gh.ts and runDesign. */
   listCards?: () => Promise<Card[]>;
   taskDesignOps?: TaskDesignOps;
@@ -89,18 +107,21 @@ export function createLoopState(): LoopState {
     tickCount: 0,
     wavesLaunched: 0,
     lastTickMs: 0,
-    reviewingTask: null,
+    foreground: null,
+    get reviewingTask() {
+      return this.foreground?.kind === "review" ? this.foreground.label : null;
+    },
   };
 }
 
 export function allocateWorkerSlots(
   maxWorkers: number,
-  activeBuilders: number,
-  reviewPending: boolean,
-): { builderSlots: number; reviewSlots: number } {
-  const available = Math.max(0, maxWorkers - activeBuilders);
-  const reviewSlots = reviewPending && available > 0 ? 1 : 0;
-  return { builderSlots: available - reviewSlots, reviewSlots };
+  occupiedSlots: number,
+  foregroundPending: boolean,
+): { builderSlots: number; foregroundSlots: number } {
+  const available = Math.max(0, maxWorkers - occupiedSlots);
+  const foregroundSlots = foregroundPending && available > 0 ? 1 : 0;
+  return { builderSlots: available - foregroundSlots, foregroundSlots };
 }
 
 const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
@@ -431,10 +452,16 @@ export async function processNeedsDesignTask(
   }
 }
 
+type BlockerNotice = { fingerprint: string; message: string };
+
 export class BoardLoop {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private currentTick: Promise<void> | null = null;
-  private stopped = false;
+  private heartbeat: Promise<void> | null = null;
+  private stopPromise: Promise<void> | null = null;
+  private readonly foreground = new AbortController();
+  private readonly finalizationBlockers = new Map<string, string>();
+  private stopped = false; // Cleanup complete, not merely cancellation requested.
 
   constructor(
     private readonly deps: LoopDeps,
@@ -446,16 +473,23 @@ export class BoardLoop {
   ) {}
 
   async start(): Promise<void> {
-    if (this.state.running) return;
+    if (this.state.running || this.foreground.signal.aborted) return;
     this.state.running = true;
     this.deps.callback(`Loop started (tick=${this.deps.cfg.tick_seconds}s)`);
     this.intervalId = setInterval(() => {
-      const update = this.currentTick
-        ? this.revisionAllowsNewWork()
-        : this.tickNow();
-      void update.catch((error: Error) =>
-        this.deps.callback(`tick failed: ${error.message}`, "error"),
-      );
+      const failed = (error: Error) =>
+        this.deps.callback(`tick failed: ${error.message}`, "error");
+      if (this.currentTick) {
+        if (this.heartbeat) return;
+        this.heartbeat = this.revisionAllowsNewWork()
+          .then(() => undefined)
+          .catch(failed)
+          .finally(() => {
+            this.heartbeat = null;
+          });
+      } else {
+        void this.tickNow().catch(failed);
+      }
     }, this.deps.cfg.tick_seconds * 1000);
     await this.tickNow().catch((error: Error) =>
       this.deps.callback(`start tick failed: ${error.message}`, "error"),
@@ -470,12 +504,35 @@ export class BoardLoop {
     return this.admitNewWork;
   }
 
+  isStopping(): boolean {
+    return this.foreground.signal.aborted && !this.stopped;
+  }
+
+  isStopped(): boolean {
+    return this.stopped;
+  }
+
   enableAdmissions(): void {
-    this.admitNewWork = true;
+    if (!this.foreground.signal.aborted) this.admitNewWork = true;
   }
 
   private async revisionAllowsNewWork(): Promise<boolean> {
-    const revision = await this.deps.revisionCheck?.();
+    if (this.foreground.signal.aborted) return false;
+    return this.applyRevisionCheck(await this.deps.revisionCheck?.());
+  }
+
+  private admissionStillAllowed(): boolean {
+    return (
+      this.applyRevisionCheck(this.deps.revisionCheckNow?.()) &&
+      this.admitNewWork
+    );
+  }
+
+  private applyRevisionCheck(revision?: {
+    ok: boolean;
+    reason?: string;
+  }): boolean {
+    if (this.foreground.signal.aborted) return false;
     if (!revision || revision.ok) return true;
     const wasAdmitting = this.admitNewWork;
     this.admitNewWork = false;
@@ -490,6 +547,7 @@ export class BoardLoop {
 
   async tickNow(): Promise<void> {
     if (this.currentTick) return this.currentTick;
+    if (this.foreground.signal.aborted) return;
     const running = this.tick().finally(() => {
       if (this.currentTick === running) this.currentTick = null;
     });
@@ -497,21 +555,37 @@ export class BoardLoop {
     return running;
   }
 
-  async stop(): Promise<void> {
-    if (this.stopped) return;
-    this.stopped = true;
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
     this.admitNewWork = false;
     if (this.intervalId) clearInterval(this.intervalId);
     this.intervalId = null;
     this.state.running = false;
-    try {
-      await this.currentTick;
-    } finally {
-      // A failed tick must still drain builders. Keep ownership if draining fails.
-      await this.executor.shutdown();
-      this.ownerLock?.release();
-    }
-    this.deps.callback("Loop stopped.", "info");
+    const tick = this.currentTick;
+    const heartbeat = this.heartbeat;
+    // Publish the barrier before abort listeners can re-enter stop(). A failed
+    // tick still propagates, but only an incomplete drain is retryable.
+    this.stopPromise = Promise.resolve()
+      .then(async () => {
+        try {
+          try {
+            await tick;
+          } finally {
+            await heartbeat;
+          }
+        } finally {
+          await this.executor.shutdown();
+          this.ownerLock?.release();
+          this.stopped = true;
+          this.deps.callback("Loop stopped.", "info");
+        }
+      })
+      .finally(() => {
+        if (!this.stopped) this.stopPromise = null;
+      });
+    this.executor.stopScheduling?.();
+    this.foreground.abort();
+    return this.stopPromise;
   }
 
   private boardOps(): LoopBoardOps {
@@ -572,15 +646,79 @@ export class BoardLoop {
     );
   }
 
+  private hasModelSlot(reserved = 0): boolean {
+    return (
+      this.executor.activeCount() + (this.state.foreground ? 1 : 0) + reserved <
+      this.deps.cfg.max_workers
+    );
+  }
+
+  /** Check at invocation, not candidate selection. Paused builders keep their
+   * slots so automatic resume cannot add uncounted work during this await. */
+  private async runForeground<T>(
+    foreground: NonNullable<LoopState["foreground"]>,
+    run: () => Promise<T>,
+  ): Promise<T | undefined> {
+    if (
+      !(await this.revisionAllowsNewWork()) ||
+      !this.admitNewWork ||
+      this.state.foreground ||
+      !this.hasModelSlot()
+    )
+      return undefined;
+    this.state.foreground = foreground;
+    try {
+      const pending = run();
+      // onTick can now await Git: handle an early model rejection immediately,
+      // but still propagate it through the awaited drain below.
+      void pending.catch(() => undefined);
+      let result: T;
+      // Even a failed UI update must drain the invocation before freeing its slot.
+      try {
+        await this.deps.onTick?.();
+      } finally {
+        result = await pending;
+      }
+      return result;
+    } finally {
+      this.state.foreground = null;
+      await this.deps.onTick?.();
+    }
+  }
+
   private async tick(): Promise<void> {
     // Keep unsupported state read-only, including when introduced after startup.
-    assertSupportedState(this.deps.cwd);
+    assertSupportedState(
+      this.deps.cwd,
+      this.deps.repoRoot ?? this.ticketWorktrees.repoRoot,
+    );
+    const blockers = new Map<string, BlockerNotice>();
     try {
       const { cfg, callback, repoOwner, repoName, meta } = this.deps;
       const cards = await this.fetchCards();
-      await this.executor.reconcile(cards);
+      if (this.foreground.signal.aborted) return;
+      const summary = await this.executor.reconcile(
+        cards,
+        async () => (await this.revisionAllowsNewWork()) && this.admitNewWork,
+        () => this.admissionStillAllowed(),
+      );
+      for (const blocker of summary.repairBlockers ?? []) {
+        if (
+          cards.some(
+            (card) =>
+              card.itemId === blocker.itemId &&
+              isTargetIssue(card, repoOwner, repoName, "Task") &&
+              (card.status?.toLowerCase() === cfg.columns.ready.toLowerCase() ||
+                (card.closed &&
+                  card.status?.toLowerCase() ===
+                    cfg.columns.done.toLowerCase())),
+          )
+        )
+          this.recordRepairBlocker(blockers, blocker.itemId, blocker);
+      }
+      if (this.foreground.signal.aborted) return;
       // Closed/Done is durable recovery, not a new admission (also on dirty/revision latch).
-      await this.processClosedDoneCards(cards);
+      await this.processClosedDoneCards(cards, blockers);
       if (!(await this.revisionAllowsNewWork()) || !this.admitNewWork) return;
       if (cards.length === 0) {
         callback("No cards on the board yet.");
@@ -596,33 +734,6 @@ export class BoardLoop {
         return;
       }
 
-      if (cfg.refine.enabled) {
-        await this.processTaskDesignCards(cards);
-        await this.processStories(cards);
-      }
-
-      if (cfg.watchdog.enabled) {
-        try {
-          const { Watchdog } = await import("./watchdog.js");
-          await new Watchdog({
-            cwd: this.deps.cwd,
-            cfg,
-            repoOwner,
-            repoName,
-            botLogin: this.deps.botLogin,
-            meta,
-            callback,
-            canStartWork: async () =>
-              (await this.revisionAllowsNewWork()) &&
-              !this.stopped &&
-              this.admitNewWork,
-          }).tick();
-        } catch (error: any) {
-          callback(`Watchdog tick failed: ${error.message}`, "warn");
-        }
-      }
-
-      if (!this.admitNewWork) return;
       const reviewCandidates = cards.filter(
         (card) =>
           (card.status ?? "").toLowerCase() ===
@@ -640,49 +751,139 @@ export class BoardLoop {
           card.closed === false,
       );
       const attemptedItemIds = new Set<string>();
-      const launchReady = async (limit: number): Promise<void> => {
+      const launchReady = async (
+        limit: number,
+        reserved = 0,
+      ): Promise<void> => {
         let launched = 0;
         for (const card of readyCandidates) {
-          if (!this.admitNewWork || launched >= limit) break;
+          if (
+            launched >= limit ||
+            !(await this.revisionAllowsNewWork()) ||
+            !this.admitNewWork
+          )
+            break;
+          if (!this.hasModelSlot(reserved)) break;
           if (attemptedItemIds.has(card.itemId)) continue;
           attemptedItemIds.add(card.itemId);
           if (!card.plan) continue;
-          const result = await this.executor.launch(card, planSlug(card.plan));
+          let repair;
+          try {
+            repair = await this.executor.repairFor?.(card);
+          } catch (error) {
+            repair = {
+              status: "blocked" as const,
+              reason: error instanceof Error ? error.message : String(error),
+            };
+          }
+          if (repair && "status" in repair) {
+            this.recordRepairBlocker(blockers, card.itemId, repair);
+            continue;
+          }
+          const result = await this.executor.launch(
+            card,
+            planSlug(card.plan),
+            async () =>
+              (await this.revisionAllowsNewWork()) && this.admitNewWork,
+            () => this.admissionStillAllowed(),
+            repair,
+          );
           if (result.status !== "launched") continue;
+          blockers.delete(card.itemId);
           launched++;
           this.state.wavesLaunched++;
         }
       };
 
+      const primaryPending =
+        (cfg.refine.enabled &&
+          cards.some(
+            (card) =>
+              (isTargetIssue(card, repoOwner, repoName, "Task") &&
+                isNeedsDesignTask(card, cfg)) ||
+              (isTargetIssue(card, repoOwner, repoName, "Story") &&
+                card.closed === false &&
+                !!card.plan &&
+                [
+                  cfg.columns.ready,
+                  cfg.columns.needs_design,
+                  cfg.columns.building,
+                ].some(
+                  (status) =>
+                    status.toLowerCase() === card.status?.toLowerCase(),
+                ) &&
+                !card.assignees.some(
+                  (login) =>
+                    login.toLowerCase() !== this.deps.botLogin.toLowerCase(),
+                )),
+          )) ||
+        (cfg.review.enabled && reviewCandidates.length > 0);
       const initialSlots = allocateWorkerSlots(
         cfg.max_workers,
         this.executor.activeCount(),
-        cfg.review.enabled && reviewCandidates.length > 0,
+        primaryPending,
       );
-      await launchReady(initialSlots.builderSlots);
+      // Reserve only for primary foreground work, and fill other slots FIRST.
+      await launchReady(
+        initialSlots.builderSlots,
+        initialSlots.foregroundSlots,
+      );
 
-      if (initialSlots.reviewSlots > 0 && this.admitNewWork) {
-        await this.processReviewCards(reviewCandidates);
-        if (!this.admitNewWork) return;
-        const refillSlots = allocateWorkerSlots(
-          cfg.max_workers,
-          this.executor.activeCount(),
-          false,
-        );
-        await launchReady(refillSlots.builderSlots);
+      if (initialSlots.foregroundSlots > 0 && this.admitNewWork) {
+        const ranPrimary =
+          cfg.refine.enabled &&
+          ((await this.processTaskDesignCards(cards)) ||
+            (await this.processStories(cards)));
+        if (!ranPrimary && cfg.review.enabled)
+          await this.processReviewCards(reviewCandidates);
+      }
+      await launchReady(
+        Math.max(0, cfg.max_workers - this.executor.activeCount()),
+      );
+
+      // Maintenance never reserves capacity ahead of Ready builders.
+      if (cfg.watchdog.enabled) {
+        try {
+          const { Watchdog } = await import("./watchdog.js");
+          await new Watchdog({
+            cwd: this.deps.cwd,
+            cfg,
+            repoOwner,
+            repoName,
+            botLogin: this.deps.botLogin,
+            meta,
+            callback,
+            signal: this.foreground.signal,
+            canStartWork: async () =>
+              (await this.revisionAllowsNewWork()) && this.admitNewWork,
+            runModel: (label, run) =>
+              this.runForeground({ kind: "watchdog", label }, run),
+          }).tick();
+        } catch (error: any) {
+          callback(`Watchdog tick failed: ${error.message}`, "warn");
+        }
       }
     } finally {
+      // One incident per ticket across reconcile, closed-Done and Ready wrappers.
+      // The tick-local notices never authorize or suppress any fresh check/retry.
+      for (const [itemId, notice] of blockers) {
+        if (this.finalizationBlockers.get(itemId) === notice.fingerprint)
+          continue;
+        this.finalizationBlockers.set(itemId, notice.fingerprint);
+        this.deps.callback(notice.message, "warn");
+      }
+      for (const itemId of this.finalizationBlockers.keys())
+        if (!blockers.has(itemId)) this.finalizationBlockers.delete(itemId);
       this.state.tickCount++;
       this.state.lastTickMs = Date.now();
-      this.deps.onTick?.();
+      await this.deps.onTick?.();
     }
   }
 
   /** One actionable Story per tick; waiting/read-only candidates do not consume the turn. */
-  private async processStories(cards: Card[]): Promise<void> {
+  private async processStories(cards: Card[]): Promise<boolean> {
     const { cfg, meta, botLogin, callback, repoOwner, repoName } = this.deps;
-    if (!this.admitNewWork || this.executor.activeCount() >= cfg.max_workers)
-      return;
+    if (!this.admitNewWork || !this.hasModelSlot()) return false;
     const stories = cards.filter(
       (card) =>
         isTargetIssue(card, repoOwner, repoName, "Story") &&
@@ -692,7 +893,7 @@ export class BoardLoop {
           (assignee) => assignee.toLowerCase() !== botLogin.toLowerCase(),
         ),
     );
-    if (!stories.length) return;
+    if (!stories.length) return false;
     const store = new RefineStateStore(this.deps.cwd);
     const board = this.boardOps();
     const ready = cfg.columns.ready.toLowerCase();
@@ -703,6 +904,7 @@ export class BoardLoop {
 
     for (const snapshot of ordered) {
       let attempted = false;
+      let ranRefine = false;
       let claimed = false;
       try {
         const status = snapshot.status?.toLowerCase();
@@ -714,7 +916,7 @@ export class BoardLoop {
             await this.currentCard(snapshot);
             attempted = true;
             await board.release(snapshot);
-            return;
+            return false;
           }
           continue;
         }
@@ -727,6 +929,10 @@ export class BoardLoop {
           throw new StaleCardError(
             `Story #${identity.number} journal identity changed.`,
           );
+        if (!state?.refined) {
+          validateProjectMetadata(meta, cfg);
+          validatePlanOption(meta, identity.plan);
+        }
         let comments: IssueComment[] = [];
         let extraContext = "";
         let completed = false;
@@ -742,7 +948,7 @@ export class BoardLoop {
           completed = await this.storyTasksFinalized(story, state.creation!);
           if (!completed && status === building) {
             // A crash after the completion write may leave only the old bot claim.
-            if (await releaseWaitingClaim()) return;
+            if (await releaseWaitingClaim()) return false;
             continue;
           }
         } else if (!state?.creation && status === needsDesign) {
@@ -761,7 +967,7 @@ export class BoardLoop {
               identity,
               lastSeenCommentId: latest,
             });
-            if (await releaseWaitingClaim()) return;
+            if (await releaseWaitingClaim()) return false;
             continue;
           }
           const replies = trustedMaintainerComments(
@@ -774,7 +980,7 @@ export class BoardLoop {
                 identity,
                 lastSeenCommentId: latest,
               });
-            if (await releaseWaitingClaim()) return;
+            if (await releaseWaitingClaim()) return false;
             continue;
           }
           extraContext = replies
@@ -786,7 +992,7 @@ export class BoardLoop {
         await this.currentCard(story, false);
         attempted = true;
         claimed = true;
-        if (!(await board.claim(story))) return;
+        if (!(await board.claim(story))) return false;
         const fresh = await this.currentCard(story);
         if (state?.refined) {
           // Re-read children after claiming too; an old board snapshot cannot close a Story.
@@ -812,7 +1018,12 @@ export class BoardLoop {
             throw new StaleCardError(
               "Story design replies changed while claiming.",
             );
-          await this.refineStory(fresh, extraContext, store, latestComments);
+          ranRefine = await this.refineStory(
+            fresh,
+            extraContext,
+            store,
+            latestComments,
+          );
         }
       } catch (error) {
         callback(
@@ -830,8 +1041,9 @@ export class BoardLoop {
               ),
             );
       }
-      if (attempted) return;
+      if (attempted) return ranRefine;
     }
+    return false;
   }
 
   private async storyTasksFinalized(
@@ -866,9 +1078,9 @@ export class BoardLoop {
     );
   }
 
-  private async processTaskDesignCards(cards: Card[]): Promise<void> {
+  private async processTaskDesignCards(cards: Card[]): Promise<boolean> {
     const { cfg, meta, botLogin, callback } = this.deps;
-    if (this.executor.activeCount() >= cfg.max_workers) return;
+    if (!this.hasModelSlot()) return false;
 
     const candidates = cards.filter(
       (card) =>
@@ -877,7 +1089,7 @@ export class BoardLoop {
           cfg.columns.needs_design.toLowerCase() &&
         !card.closed,
     );
-    if (candidates.length === 0) return;
+    if (candidates.length === 0) return false;
 
     const start = this.state.tickCount % candidates.length;
     const ordered = [...candidates.slice(start), ...candidates.slice(0, start)];
@@ -948,19 +1160,26 @@ export class BoardLoop {
             return baseOps.refresh(candidate);
           },
           design: async (designInput) => {
-            if (
-              !(await this.revisionAllowsNewWork()) ||
-              !this.admitNewWork ||
-              this.executor.activeCount() >= cfg.max_workers
-            )
+            const result = await this.runForeground(
+              { kind: "design", label: `Task #${card.number}` },
+              () => {
+                ranDesign = true;
+                return baseOps.design({
+                  ...designInput,
+                  signal: this.foreground.signal,
+                });
+              },
+            );
+            if (!result)
               throw new StaleCardError("Task design admissions stopped.");
-            ranDesign = true;
-            return baseOps.design(designInput);
+            return result;
           },
         },
       );
-      if (ranDesign || (result !== "waiting" && result !== "skipped")) return;
+      if (ranDesign || (result !== "waiting" && result !== "skipped"))
+        return ranDesign;
     }
+    return false;
   }
 
   private async refineStory(
@@ -968,12 +1187,13 @@ export class BoardLoop {
     extraContext: string,
     store: RefineStateStore,
     comments: IssueComment[],
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { cfg, meta, repoOwner, repoName, botLogin, callback } = this.deps;
     const board = this.boardOps();
     const identity = storyIdentity(story, meta.projectId);
     const number = identity.number;
     let creation = store.get(number)?.creation;
+    let ranRefine = false;
     const trusted = JSON.stringify(
       trustedMaintainerComments(comments, botLogin),
     );
@@ -1000,16 +1220,24 @@ export class BoardLoop {
       if (!creation) {
         const contextDigest = await this.getContextDigest();
         await assertCurrent();
-        if (this.executor.activeCount() >= cfg.max_workers) return;
-        const refine = await (this.deps.refine ?? runRefine)({
-          cwd: this.deps.cwd,
-          storyTitle: story.title,
-          storyBody: story.body,
-          extraContext,
-          contextDigest,
-          model: cfg.models.refine,
-          timeoutMs: cfg.refine.timeout_ms,
-        });
+        const refine = await this.runForeground(
+          { kind: "refine", label: `Story #${number}` },
+          () => {
+            ranRefine = true;
+            return (this.deps.refine ?? runRefine)({
+              cwd: this.deps.cwd,
+              storyTitle: story.title,
+              storyBody: story.body,
+              signal: this.foreground.signal,
+              maxTasks: cfg.refine.max_tasks,
+              extraContext,
+              contextDigest,
+              model: cfg.models.refine,
+              timeoutMs: cfg.refine.timeout_ms,
+            });
+          },
+        );
+        if (!refine) return false;
         await assertCurrent();
         const existingTaskCount = await this.countPlanTasks(identity.plan);
         await assertCurrent();
@@ -1108,6 +1336,7 @@ export class BoardLoop {
       }
       callback(`Refine of story "${story.title}" failed: ${reason}`, "error");
     }
+    return ranRefine;
   }
 
   private async commentOnce(
@@ -1206,13 +1435,15 @@ export class BoardLoop {
       )
         continue;
       let claimed = false;
+      let record: TicketExecutionRecord | undefined;
+      let evidenceBlocker: RepairBlocker | undefined;
       try {
         await this.currentCard(card, false);
         claimed = true;
         if (!(await board.claim(card))) continue;
         const fresh = await this.currentCard(card);
         const task = buildTasksForWave(cfg, planSlug(card.plan), [fresh])[0];
-        const record = this.ticketWorktrees.read(card.itemId);
+        record = this.ticketWorktrees.read(card.itemId);
         if (
           !record ||
           record.issueNumber !== fresh.number ||
@@ -1220,22 +1451,59 @@ export class BoardLoop {
           record.taskBranch !== task.taskBranch ||
           record.activeRunId ||
           record.launchingAt !== undefined ||
-          record.finalization
+          record.finalization ||
+          this.ticketWorktrees.hasCleanupReceipt(card.itemId)
         )
           throw new Error("Missing matching idle v3 record before review.");
-        this.state.reviewingTask = task.taskKey;
+        const readRepair = async (current: Card) => {
+          if (this.executor.repairForReview) {
+            const repair = await this.executor.repairForReview(
+              record!,
+              current,
+            );
+            if (repair && "status" in repair) {
+              evidenceBlocker = repair;
+              throw new Error(repair.reason);
+            }
+            return repair;
+          }
+          const run = record!.lastRunId
+            ? createRunPersistence(record!.path).load(record!.lastRunId)
+            : null;
+          const repair = run ? repairReviewInput(run) : undefined;
+          if (
+            repair &&
+            ((run!.args as any).itemId !== record!.itemId ||
+              (run!.args as any).issueNumber !== record!.issueNumber ||
+              (run!.args as any).taskKey !== record!.taskKey)
+          )
+            throw new Error(
+              "Repair review run does not match the ticket record.",
+            );
+          return repair;
+        };
+        const repair = await readRepair(fresh);
         callback(`AI reviewing task "${fresh.title}" on ${task.taskBranch}…`);
-        const review = await (this.deps.review ?? runReview)({
-          cwd: this.deps.cwd,
-          taskKey: task.taskKey,
-          title: fresh.title,
-          body: fresh.body,
-          issueNumber: task.issueNumber,
-          baseBranch: record.baseBranch,
-          taskBranch: task.taskBranch,
-          model: cfg.models.review,
-          timeoutMs: cfg.review.timeout_ms,
-        });
+        const review = await this.runForeground(
+          { kind: "review", label: task.taskKey },
+          () =>
+            (this.deps.review ?? runReview)({
+              cwd: this.deps.cwd,
+              taskKey: task.taskKey,
+              title: fresh.title,
+              body: fresh.body,
+              issueNumber: task.issueNumber,
+              baseBranch: record!.baseBranch,
+              taskBranch: task.taskBranch,
+              model: cfg.models.review,
+              timeoutMs: cfg.review.timeout_ms,
+              ...(repair ? { repair } : {}),
+              signal: this.foreground.signal,
+              canStartWork: () => this.revisionAllowsNewWork(),
+              canStartWorkNow: () => this.admissionStillAllowed(),
+            }),
+        );
+        if (!review) return;
         const latest = await this.currentCard(fresh);
         const current = this.ticketWorktrees.read(latest.itemId);
         if (
@@ -1250,9 +1518,14 @@ export class BoardLoop {
           current.reviewedTaskSha !== record.reviewedTaskSha ||
           current.activeRunId ||
           current.launchingAt !== undefined ||
-          current.finalization
+          current.finalization ||
+          this.ticketWorktrees.hasCleanupReceipt(latest.itemId)
         )
           throw new Error("Execution record changed during review.");
+        if (JSON.stringify(await readRepair(latest)) !== JSON.stringify(repair))
+          throw new Error("Repair evidence changed during review.");
+        if (!this.admissionStillAllowed())
+          throw new StaleCardError("Review admissions stopped.");
         if (review.verdict === "pass") {
           // Preserve the FIRST fresh origin task SHA returned by the isolated reviewer.
           // Never fetch/re-pin here: a newer commit was not reviewed.
@@ -1267,21 +1540,57 @@ export class BoardLoop {
           );
           return;
         }
-        const id = await board.comment(latest, renderReviewComment(review));
+        const retryStatus = repair
+          ? cfg.columns.needs_human
+          : cfg.columns.ready;
+        const id = await board.comment(
+          latest,
+          renderReviewComment(review, !!repair),
+        );
         if (!id) throw new Error("Failed to post AI review findings.");
         await this.currentCard(latest);
-        await board.setStatus(latest, cfg.columns.ready);
+        await board.setStatus(latest, retryStatus);
         callback(
-          `AI review found ${review.findings.length} blocking issue(s) in "${latest.title}". → ${cfg.columns.ready}`,
+          `AI review found ${review.findings.length} blocking issue(s) in "${latest.title}". → ${retryStatus}`,
           "warn",
         );
       } catch (error) {
+        let disposition = "Leaving status unchanged.";
+        if (evidenceBlocker && record && this.executor.repairForReview) {
+          try {
+            const confirm = async () => {
+              const fresh = await this.currentCard(card);
+              const blocker = await this.executor.repairForReview!(
+                record!,
+                fresh,
+              );
+              if (
+                !blocker ||
+                !("status" in blocker) ||
+                !this.admissionStillAllowed()
+              )
+                throw new Error("Repair Review quarantine authority changed.");
+              return fresh;
+            };
+            const fresh = await confirm();
+            const id = await board.comment(
+              fresh,
+              `## ⚠️ Needs human input\n\n${evidenceBlocker.reason}\n\nPreserve the repair run and worktree. Restore/inspect its evidence before retrying. Only an explicit maintainer move to Ready starts an ordinary retry.`,
+            );
+            if (!id)
+              throw new Error("Failed to post repair Review evidence blocker.");
+            await confirm();
+            await board.setStatus(fresh, cfg.columns.needs_human);
+            disposition = `→ ${cfg.columns.needs_human}.`;
+          } catch {
+            /* Unknown/changed authority never permits fallback writeback. */
+          }
+        }
         callback(
-          `AI review failed for "${card.title}": ${error instanceof Error ? error.message : String(error)}. Leaving status unchanged.`,
+          `AI review failed for "${card.title}": ${error instanceof Error ? error.message : String(error)}. ${disposition}`,
           "warn",
         );
       } finally {
-        this.state.reviewingTask = null;
         if (claimed)
           await board
             .release(card)
@@ -1293,7 +1602,29 @@ export class BoardLoop {
     }
   }
 
-  private async processClosedDoneCards(cards: Card[]): Promise<void> {
+  private recordRepairBlocker(
+    blockers: Map<string, BlockerNotice>,
+    itemId: string,
+    blocker: RepairBlocker,
+  ): void {
+    // Reconciliation has the actual pending-step failure; Ready may only know
+    // that the handoff is not queued. Keep the former, not the wrapper wording.
+    if (blockers.has(itemId)) return;
+    blockers.set(itemId, {
+      fingerprint: JSON.stringify([
+        "repair",
+        blocker.repair?.baseSha ?? null,
+        blocker.repair?.taskSha ?? null,
+        blocker.reason,
+      ]),
+      message: `Repair handoff ${itemId} blocked: ${blocker.reason}`,
+    });
+  }
+
+  private async processClosedDoneCards(
+    cards: Card[],
+    blockers: Map<string, BlockerNotice>,
+  ): Promise<void> {
     const { cfg, callback, repoOwner, repoName } = this.deps;
     const candidates = cards.filter(
       (card) =>
@@ -1301,13 +1632,59 @@ export class BoardLoop {
         (card.status ?? "").toLowerCase() === cfg.columns.done.toLowerCase() &&
         isTargetIssue(card, repoOwner, repoName, "Task"),
     );
+    if (!candidates.length || this.foreground.signal.aborted) return;
+    let refs: Set<string>;
+    try {
+      refs = await this.ticketWorktrees.localTaskRefs(cfg.branches.task_prefix);
+    } catch (error) {
+      callback(
+        `Closed-Done finalization blocked: local task refs query failed: ${error instanceof Error ? error.message : String(error)}`,
+        "warn",
+      );
+      return;
+    }
     for (const card of candidates) {
-      const outcome = await this.executor.finalizeClosed(card);
-      if (outcome.status === "blocked")
-        callback(
-          `Finalization blocked for "${card.title}": ${outcome.reason}`,
-          "warn",
-        );
+      if (this.foreground.signal.aborted) return;
+      // Absence only defers this tick. Presence still requires all fresh checks.
+      if (
+        !refs.has(
+          `refs/heads/${taskBranch(cfg.branches.task_prefix, card.number!)}`,
+        ) &&
+        !this.ticketWorktrees.hasCleanupReceipt(card.itemId)
+      ) {
+        continue;
+      }
+      const outcome = await this.executor.finalizeClosed(
+        card,
+        async () => (await this.revisionAllowsNewWork()) && this.admitNewWork,
+        () => this.admissionStillAllowed(),
+      );
+      if (
+        outcome.status === "finalized" ||
+        (outcome.status === "skipped" && outcome.repair)
+      )
+        blockers.delete(card.itemId);
+      if (outcome.status !== "conflict" && outcome.status !== "blocked")
+        continue;
+      if (outcome.status === "blocked" && outcome.repair) {
+        this.recordRepairBlocker(blockers, card.itemId, outcome);
+        continue;
+      }
+      if (blockers.has(card.itemId)) continue;
+      // Suppress only the notification, never the fresh check/retry above.
+      const fingerprint = JSON.stringify([
+        outcome.status,
+        outcome.status === "conflict" ? outcome.baseSha : null,
+        outcome.status === "conflict" ? outcome.taskSha : null,
+        outcome.reason,
+      ]);
+      blockers.set(card.itemId, {
+        fingerprint,
+        message:
+          outcome.status === "conflict"
+            ? `Finalization conflict for #${card.number} "${card.title}": ${taskBranch(cfg.branches.task_prefix, card.number!)} at ${outcome.taskSha} conflicts with ${cfg.branches.base} at ${outcome.baseSha}. Ticket status, branches and worktree preserved; no integration commit or push. Resolve the conflict before retrying.\n${outcome.reason}`
+            : `Finalization blocked for "${card.title}": ${outcome.reason}`,
+      });
     }
   }
 }

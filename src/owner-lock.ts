@@ -1,4 +1,3 @@
-import { runProcessSync } from "./process-runner.js";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -10,8 +9,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { hostname } from "node:os";
-import { join, resolve } from "node:path";
-import { assertSupportedState } from "./unsupported-state.js";
+import { join } from "node:path";
+import { assertSupportedState, resolveStateRepoRoot } from "./unsupported-state.js";
 
 export interface OwnerLockRecord {
   pid: number;
@@ -25,13 +24,6 @@ export interface OwnerLock {
   path: string;
   record: OwnerLockRecord;
   release(): void;
-}
-
-function repoRoot(cwd: string): string {
-  const result = runProcessSync("git", ["rev-parse", "--show-toplevel"], {
-    cwd,
-  });
-  return result.ok ? result.stdout.trim() : resolve(cwd);
 }
 
 function processIsAlive(pid: number): boolean {
@@ -82,8 +74,11 @@ function releaseToken(path: string, token: string): void {
 }
 
 /** Keep non-owner Pi processes from overwriting the active owner's runtime heartbeat. */
-export function ownerLockHeldByOther(cwd: string): boolean {
-  const path = join(repoRoot(cwd), ".pi", "board-agent", "owner.lock");
+export function ownerLockHeldByOther(
+  cwd: string,
+  root = resolveStateRepoRoot(cwd),
+): boolean {
+  const path = join(root, ".pi", "board-agent", "owner.lock");
   try {
     const record = readOwnerLock(path);
     if (record.hostname.toLowerCase() !== hostname().toLowerCase()) return true;
@@ -93,9 +88,13 @@ export function ownerLockHeldByOther(cwd: string): boolean {
   }
 }
 
-export function acquireOwnerLock(cwd: string, botLogin: string): OwnerLock {
-  assertSupportedState(cwd);
-  const dir = join(repoRoot(cwd), ".pi", "board-agent");
+export function acquireOwnerLock(
+  cwd: string,
+  botLogin: string,
+  root = resolveStateRepoRoot(cwd),
+): OwnerLock {
+  assertSupportedState(cwd, root);
+  const dir = join(root, ".pi", "board-agent");
   const path = join(dir, "owner.lock");
   mkdirSync(dir, { recursive: true });
 

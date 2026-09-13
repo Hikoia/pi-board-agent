@@ -207,7 +207,8 @@ function rejectRemovedKeys(
     );
 }
 
-export function loadConfig(cwd: string): Config {
+/** Warn only for explicit deprecated keys, not merged defaults. */
+export function loadConfig(cwd: string, warn?: (message: string) => void): Config {
   const projectPath = resolve(cwd, ".pi", "board-agent.yml");
   const globalPath = resolve(homedir(), ".pi", "board-agent.yml");
   let cfg = structuredClone(DEFAULTS);
@@ -216,6 +217,10 @@ export function loadConfig(cwd: string): Config {
     const overlay = configObject(path);
     rejectRemovedKeys(overlay, path);
     validateShape(overlay, { ...DEFAULTS, builder_timeout_ms: 0 }, path, true);
+    if (overlay.safety && Object.hasOwn(overlay.safety, "skip_closed_issues"))
+      warn?.(
+        `${path}: safety.skip_closed_issues is deprecated and has no effect (true or false). Remove this key from the file. Closed Issues never start builders or design; only closed Done Tasks can be finalized.`,
+      );
     cfg = deepMerge(cfg, overlay as Partial<Config>);
   }
   return cfg;

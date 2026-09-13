@@ -10,6 +10,7 @@
  * not cover v2) and `gh pr` for pull requests. We never call git remotes
  * directly — `gh` handles auth.
  */
+import type { Config } from "./config.js";
 import {
   GIT_GH_TIMEOUT_MS,
   ProcessTimeoutError,
@@ -47,10 +48,13 @@ export interface Card {
 export interface ProjectMetadata {
   projectId: string;
   statusFieldId: string;
+  statusFieldType?: string;
   statusOptions: Record<string, string>; // name -> optionId
   planFieldId?: string;
+  planFieldType?: string;
   planOptions?: Record<string, string>; // name -> optionId
   typeFieldId?: string;
+  typeFieldType?: string;
   typeOptions?: Record<string, string>; // name -> optionId
 }
 
@@ -187,6 +191,7 @@ interface RawProject {
   fields: Array<{
     id: string;
     name: string;
+    dataType?: string;
     options?: Array<{ id: string; name: string }>;
   }>;
 }
@@ -201,7 +206,7 @@ function resolveFields(
   const status = fields.find(
     (f) => f.name.toLowerCase() === statusFieldName.toLowerCase(),
   );
-  if (!status || !status.options) {
+  if (status?.dataType !== "SINGLE_SELECT" || !status.options) {
     throw new Error(
       `Status field '${statusFieldName}' not found on project, or it is not single-select.`,
     );
@@ -209,6 +214,7 @@ function resolveFields(
   const meta: ProjectMetadata = {
     projectId,
     statusFieldId: status.id,
+    statusFieldType: status.dataType,
     statusOptions: Object.fromEntries(
       status.options.map((o) => [o.name, o.id]),
     ),
@@ -219,6 +225,7 @@ function resolveFields(
     );
     if (plan) {
       meta.planFieldId = plan.id;
+      meta.planFieldType = plan.dataType;
       if (plan.options) {
         meta.planOptions = Object.fromEntries(
           plan.options.map((o) => [o.name, o.id]),
@@ -230,11 +237,13 @@ function resolveFields(
     const type = fields.find(
       (f) => f.name.toLowerCase() === typeFieldName.toLowerCase(),
     );
-    if (type?.options) {
+    if (type) {
       meta.typeFieldId = type.id;
-      meta.typeOptions = Object.fromEntries(
-        type.options.map((o) => [o.name, o.id]),
-      );
+      meta.typeFieldType = type.dataType;
+      if (type.options)
+        meta.typeOptions = Object.fromEntries(
+          type.options.map((o) => [o.name, o.id]),
+        );
     }
   }
   return meta;
@@ -252,6 +261,60 @@ export function validateStatusOptions(
       `Status option(s) missing from project: ${missing.join(", ")}`,
     );
   }
+}
+
+/** Read-only preflight for the enabled lanes. Builders always need Plan + Task;
+ * Story/Needs Design requirements apply only when refinement is enabled. */
+export function validateProjectMetadata(
+  meta: ProjectMetadata,
+  cfg: Config,
+): void {
+  if (!meta.statusFieldId || meta.statusFieldType !== "SINGLE_SELECT")
+    throw new Error(
+      `Project Status field '${cfg.status_field}' is required and must be SINGLE_SELECT.`,
+    );
+  validateStatusOptions(meta, [
+    cfg.columns.ready,
+    cfg.columns.building,
+    cfg.columns.review,
+    cfg.columns.done,
+    cfg.columns.needs_human,
+    ...(cfg.refine.enabled ? [cfg.columns.needs_design] : []),
+  ]);
+  if (
+    !meta.planFieldId ||
+    !["TEXT", "SINGLE_SELECT"].includes(meta.planFieldType ?? "")
+  )
+    throw new Error(
+      `Project Plan field '${cfg.plan_field}' is required and must be TEXT or SINGLE_SELECT.`,
+    );
+  if (meta.planFieldType === "SINGLE_SELECT" && !meta.planOptions)
+    throw new Error(
+      `Project Plan field '${cfg.plan_field}' is missing option metadata.`,
+    );
+  if (!meta.typeFieldId || meta.typeFieldType !== "SINGLE_SELECT")
+    throw new Error(
+      `Project Type field '${cfg.type_field}' is required and must be SINGLE_SELECT.`,
+    );
+  const missing = ["Task", ...(cfg.refine.enabled ? ["Story"] : [])].filter(
+    (name) => !findCaseInsensitive(meta.typeOptions ?? {}, name),
+  );
+  if (missing.length)
+    throw new Error(
+      `Project Type field '${cfg.type_field}' is missing option(s): ${missing.join(", ")}.`,
+    );
+}
+
+/** Resolve before model/child creation; never add options to the Project. */
+export function validatePlanOption(meta: ProjectMetadata, plan: string): void {
+  if (!plan.trim()) throw new Error("A Story Plan value is required.");
+  if (
+    meta.planFieldType === "SINGLE_SELECT" &&
+    !findCaseInsensitive(meta.planOptions ?? {}, plan)
+  )
+    throw new Error(
+      `Project Plan option '${plan}' is missing. Check the Project options manually and restart Board Agent to refresh metadata; no schema changes were made.`,
+    );
 }
 
 const CARD_FIELDS = `
@@ -618,6 +681,7 @@ export async function tryClaim(card: Card, botLogin: string): Promise<boolean> {
   return won;
 }
 
+/** Failures propagate; callers choosing best-effort cleanup must catch and warn. */
 export async function release(card: Card, botLogin: string): Promise<void> {
   if (!isTargetIssue(card, card.repoOwner ?? "", card.repoName ?? "")) return;
   requiredString(botLogin, "release login");
@@ -629,7 +693,7 @@ export async function release(card: Card, botLogin: string): Promise<void> {
     `${card.repoOwner}/${card.repoName}`,
     "--remove-assignee",
     botLogin,
-  ]).catch(() => undefined);
+  ]);
 }
 
 export async function updateIssueBody(
@@ -738,9 +802,9 @@ async function listProjectFields(
           fields(first: 100, after: $after) {
             pageInfo { hasNextPage endCursor }
             nodes {
-              ... on ProjectV2SingleSelectField { id name options { id name } }
-              ... on ProjectV2Field { id name }
-              ... on ProjectV2IterationField { id name }
+              ... on ProjectV2SingleSelectField { id name dataType options { id name } }
+              ... on ProjectV2Field { id name dataType }
+              ... on ProjectV2IterationField { id name dataType }
             }
           }
         } }
@@ -1090,6 +1154,24 @@ export async function createComment(
     data?.addComment?.commentEdge?.node?.id,
     "created comment id",
   );
+}
+
+/** Edit only a known issue comment; callers must verify actual author and data. */
+export async function updateIssueComment(id: string, body: string): Promise<void> {
+  requiredString(id, "comment id"); requiredString(body, "comment body");
+  const data = await graphql<any>(`mutation($id: ID!, $body: String!) {
+    updateIssueComment(input: { id: $id, body: $body }) { issueComment { id } }
+  }`, { id, body });
+  if (data?.updateIssueComment?.issueComment?.id !== id) throw new Error("GitHub returned mismatched updated comment id.");
+}
+
+/** Reopening is a handoff write, never approval or a builder launch. */
+export async function reopenIssue(issueId: string): Promise<void> {
+  requiredString(issueId, "issue id");
+  const data = await graphql<any>(`mutation($id: ID!) {
+    reopenIssue(input: { issueId: $id }) { issue { id closed } }
+  }`, { id: issueId });
+  if (data?.reopenIssue?.issue?.id !== issueId || data.reopenIssue.issue.closed !== false) throw new Error("GitHub returned unconfirmed issue reopen.");
 }
 
 export interface IssueComment {
