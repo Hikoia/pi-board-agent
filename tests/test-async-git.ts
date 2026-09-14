@@ -357,6 +357,8 @@ try {
 
   from = observations.length;
   const resultSha = await store.finalizeAccepted(task, "merge");
+  assert.equal(store.has(task.itemId), true, "Git cleanup retains record for Project settlement");
+  await store.completeFinalization(task, async () => {});
   assert.equal(
     resultSha,
     published,

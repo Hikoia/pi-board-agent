@@ -3,11 +3,12 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createRunPersistence, type PersistedRunState } from "@quintinshaw/pi-dynamic-workflows";
-import { exactKeys, verifySnapshot, verifyBackupSnapshots } from "./cleanup-snapshot.js";
+import { exactKeys, verifySnapshot, verifyBackupSnapshots, directoryStamps, isCleanupSnapshot, readRegular, verifyParents, removeSnapshot, type CleanupSnapshot } from "./cleanup-snapshot.js";
 import { planSlug } from "./config.js";
 import { isTargetIssue, type Card } from "./gh.js";
 
-import { isTicketExecutionRecord, type TicketExecutionRecord, type TicketIntegrationState } from "./ticket-worktree.js";
+import { isTicketExecutionRecord, type TicketExecutionRecord, type TicketIntegrationState, type TicketWorktrees } from "./ticket-worktree.js";
+import type { BuilderTask } from "./workflow-prompt.js";
 import type { TicketExecutorDeps } from "./ticket-executor.js";
 import { GIT_GH_TIMEOUT_MS, processFailure, runProcess } from "./process-runner.js";
 
@@ -230,7 +231,21 @@ export class LegacyTicketAdapter {
     const recordFile = join(this.state, "ticket-worktrees", `${name}.json`);
     if (lstatSync(recordFile, { throwIfNoEntry: false })) {
       const saved = JSON.parse(legacyRegular(recordFile).toString("utf8"));
-      if (isTicketExecutionRecord(saved) && stateName(saved.itemId) === name && saved.schemaVersion === 4) return;
+      if (isTicketExecutionRecord(saved) && stateName(saved.itemId) === name && saved.schemaVersion === 4) {
+        if (saved.finalization) {
+          const provenance = legacyRegular(recordFile + ".v3.bak");
+          const original = JSON.parse(provenance.toString("utf8"));
+          if (!isTicketExecutionRecord(original) || original.schemaVersion !== 3 || !equal(original.finalization, saved.finalization) ||
+              (["itemId", "issueNumber", "taskKey", "plan", "path", "taskBranch", "baseBranch", "createdAt"] as const)
+                .some((key) => original[key] !== saved[key]))
+            throw new Error("Converted intent has no matching original provenance.");
+          await this.verifyPreResult(saved);
+          if (!legacyRegular(recordFile + ".v3.bak").equals(provenance)) throw new Error("Legacy intent provenance changed.");
+          this.assertOwner();
+          worktrees.clearLegacyIntent(saved);
+        }
+        return;
+      }
     }
     const raw = JSON.parse(legacyRegular(file).toString("utf8"));
     const itemId = raw?.itemId;
@@ -255,14 +270,14 @@ export class LegacyTicketAdapter {
       } else throw new Error("Unsupported/corrupt legacy ticket record; preserved.");
     }
     if (record.itemId !== itemId) throw new Error("Legacy receipt/record identity mismatch.");
-    const ownership = worktrees.checkLegacyOwnership(record);
+    const ownership = worktrees.checkOwnership(record);
     if (record.activeRunId || record.launchingAt !== undefined) {
       const check = worktrees.check(record, false);
       if (!check.ok) throw new Error(check.reason);
     }
     const next: TicketExecutionRecord = { ...record, schemaVersion: 4 };
     const receipt = worktrees.hasCleanupReceipt(itemId)
-      ? await worktrees.readReceipt({ ...record, title: "", body: "" }, true) : undefined;
+      ? await readLegacyReceipt(worktrees, { ...record, title: "", body: "" }) : undefined;
     if (receipt) {
       if (original && (!equal(receipt.record, record) || hash(original) !== receipt.recordHash))
         throw new Error("Legacy receipt's original record changed.");
@@ -295,22 +310,24 @@ export class LegacyTicketAdapter {
           throw new Error("Ambiguous legacy merge/squash tree.");
       }
       next.retry = { stage: receipt || integrated ? "cleanup" : "integrate",
-        reason: integrated ? "Legacy result observed on origin/base; cleanup only (T004)."
-          : receipt ? "Legacy receipt result is not on today's remote base; remain cleanup-only until freshly confirmed (T004)."
-          : "Legacy prepared result retained; observe remote before any push or cleanup (T004)." };
+        reason: integrated ? "Legacy result observed on origin/base; cleanup only."
+          : receipt ? "Legacy receipt result is not on today's remote base; remain cleanup-only until freshly confirmed."
+          : "Legacy prepared result retained; observe remote before any push or cleanup." };
       const local = worktrees.localBranchSha(record.taskBranch);
       if (local && local !== next.integration.taskSha) throw new Error("Legacy task ref moved.");
       // Old snapshots are evidence ONLY for positively owned, unregistered
       // leftovers. Registered worktrees use native Git in T004, never snapshots.
       if (receipt && !ownership.registered && lstatSync(record.path, { throwIfNoEntry: false })) {
         if (!receipt.record) throw new Error("Unowned legacy residual.");
-        if (receipt.backup) await verifyBackupSnapshots(receipt.backup, receipt.snapshots);
+        await verifyReceiptBackup(receipt);
         for (const snapshot of receipt.snapshots) await verifySnapshot(snapshot);
       }
     } else if (record.finalization) {
       if (record.finalization.targetBranch !== record.baseBranch)
         throw new Error("Legacy pre-result target changed.");
-      next.retry = { stage: "integrate", reason: "Legacy pre-result intent retained for T004; no successful push inferred." };
+      await this.verifyPreResult(record);
+      delete next.finalization;
+      next.retry = { stage: "integrate", reason: "Verified legacy pre-push intent; integrate the original task." };
     } else {
       const pending = this.repairs.filter((h) => h.card.itemId === itemId &&
         (h.step !== "consumed" || !h.runId || h.runId !== record.lastRunId || h.runId === record.activeRunId));
@@ -338,10 +355,69 @@ export class LegacyTicketAdapter {
         }
       }
     }
+    if (!original && receipt && next.integration && await this.completedReceipt(next, cards)) return;
     this.assertOwner();
     if (!this.canContinue()) throw new Error("Stopped during legacy conversion.");
     worktrees.publishLegacy(next, original);
     this.deps.callback(`Migrated legacy ticket ${itemId} to v4; original evidence retained.`);
+  }
+
+  private async verifyPreResult(record: TicketExecutionRecord): Promise<void> {
+    const old = record.finalization!;
+    if (old.resultSha || old.targetBranch !== record.baseBranch ||
+        (record.reviewedTaskSha && record.reviewedTaskSha !== old.taskSha) ||
+        this.deps.worktrees.localBranchSha(record.taskBranch) !== old.taskSha)
+      throw new Error("Legacy intent is not provably pre-push.");
+    await this.git("fetch", "--no-auto-maintenance", "--no-tags", "origin",
+      `+refs/heads/${record.baseBranch}:refs/remotes/origin/${record.baseBranch}`);
+    await this.git("cat-file", "-e", `${old.baseSha}^{commit}`);
+    await this.git("merge-base", "--is-ancestor", old.baseSha, `refs/remotes/origin/${record.baseBranch}`);
+  }
+
+  private async completedReceipt(record: TicketExecutionRecord, cards: Card[]): Promise<boolean> {
+    const { worktrees, board, cfg } = this.deps;
+    if (worktrees.localBranchSha(record.taskBranch) || lstatSync(record.path, { throwIfNoEntry: false }) ||
+        worktrees.checkOwnership(record).registered || await worktrees.remoteSha(record.taskBranch)) return false;
+    const receipt = await readLegacyReceipt(worktrees, { ...record, title: "", body: "" });
+    if (receipt.snapshots.some((s) => lstatSync(s.path, { throwIfNoEntry: false }))) return false;
+    const snapshot = cards.find((c) => c.itemId === record.itemId);
+    if (!snapshot) return false; // missing Project evidence is not success
+    const card = await board.getCard(record.itemId);
+    return !!card && isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task") &&
+      card.number === record.issueNumber && card.closed && card.status?.toLowerCase() === cfg.columns.done.toLowerCase() &&
+      await this.observeResult(record, record.integration!);
+  }
+
+  /** Only an existing receipt can own registration-less leftovers. No new
+   * snapshots/backups, and no comparison of a v4 record to the old record hash. */
+  async residualPaths(record: TicketExecutionRecord): Promise<Set<string>> {
+    this.assertOwner();
+    const receipt = await readLegacyReceipt(this.deps.worktrees, { ...record, title: "", body: "" });
+    if (!record.integration || receipt.resultSha !== record.integration.resultSha ||
+        receipt.taskSha !== record.integration.taskSha || (receipt.record && receipt.record.createdAt !== record.createdAt))
+      throw new Error("Legacy residual identity changed.");
+    if (!receipt.record && receipt.snapshots.some((s) => lstatSync(s.path, { throwIfNoEntry: false })))
+      throw new Error("Unowned legacy residual.");
+    await verifyReceiptBackup(receipt);
+    for (const snapshot of receipt.snapshots) await verifySnapshot(snapshot);
+    return new Set(receipt.snapshots.filter((s) => lstatSync(s.path, { throwIfNoEntry: false })).map((s) => resolve(s.path)));
+  }
+
+  async removeResidual(record: TicketExecutionRecord, guard: () => Promise<void>): Promise<void> {
+    this.assertOwner();
+    const { worktrees } = this.deps;
+    if (!record.integration || record.retry?.stage !== "cleanup" || !worktrees.hasCleanupReceipt(record.itemId))
+      throw new Error("Unregistered residual has no positive legacy cleanup evidence.");
+    const receipt = await readLegacyReceipt(worktrees, { ...record, title: "", body: "" });
+    if (!receipt.record || receipt.taskSha !== record.integration.taskSha || receipt.resultSha !== record.integration.resultSha ||
+        receipt.record.createdAt !== record.createdAt || worktrees.checkOwnership(record).registered)
+      throw new Error("Legacy residual ownership changed.");
+    await verifyReceiptBackup(receipt);
+    for (const snapshot of receipt.snapshots) await verifySnapshot(snapshot);
+    for (const snapshot of receipt.snapshots) await removeSnapshot(snapshot, async () => {
+      this.assertOwner(); await guard();
+      await verifyParents(receipt.parents); await verifyParents(receipt.gitParents);
+    });
   }
 
   private canContinue: () => boolean = () => true;
@@ -481,4 +557,126 @@ export function isRepairRequest(value: unknown): value is RepairRequest {
     typeof r.requestKey === "string" && /^[a-zA-Z0-9._:-]{1,200}$/.test(r.requestKey) &&
     typeof r.baseSha === "string" && /^[0-9a-f]{40}$/.test(r.baseSha) &&
     typeof r.taskSha === "string" && /^[0-9a-f]{40}$/.test(r.taskSha);
+}
+
+/** Read-only old cleanup receipt, never emitted by v4. */
+export interface CleanupReceipt {
+  schemaVersion: 1; itemId: string; issueNumber: number; taskBranch: string; baseBranch: string;
+  taskSha: string; resultSha: string; record: TicketExecutionRecord | null; recordHash: string | null;
+  snapshots: CleanupSnapshot[]; parents: Awaited<ReturnType<typeof directoryStamps>>;
+  gitParents: Awaited<ReturnType<typeof directoryStamps>>; backup: string | null;
+}
+const SHA = /^[0-9a-f]{40}$/i;
+const singleLine = (v: unknown): v is string => typeof v === "string" && !!v.trim() && !/[\x00-\x1f\x7f]/.test(v);
+export async function readLegacyReceipt(worktrees: TicketWorktrees, task: BuilderTask): Promise<CleanupReceipt> {
+    const backupsDir = join(worktrees.repoRoot, ".pi", "board-agent", "cleanup-backups");
+    const path = worktrees.receiptPath(task.itemId);
+    let r: any;
+    try {
+      r = JSON.parse((await readRegular(path)).toString("utf8"));
+    } catch (error) {
+      throw new Error(`Corrupt cleanup receipt: ${path}`, { cause: error });
+    }
+    if (
+      !exactKeys(r, [
+        "schemaVersion",
+        "itemId",
+        "issueNumber",
+        "taskBranch",
+        "baseBranch",
+        "taskSha",
+        "resultSha",
+        "record",
+        "recordHash",
+        "snapshots",
+        "parents",
+        "gitParents",
+        "backup",
+      ]) ||
+      r.schemaVersion !== 1 ||
+      r.itemId !== task.itemId ||
+      r.issueNumber !== task.issueNumber ||
+      r.taskBranch !== task.taskBranch ||
+      r.baseBranch !== task.baseBranch ||
+      typeof r.taskSha !== "string" ||
+      !SHA.test(r.taskSha) ||
+      typeof r.resultSha !== "string" ||
+      !SHA.test(r.resultSha) ||
+      !(r.record === null
+        ? r.recordHash === null
+        : isTicketExecutionRecord(r.record) &&
+          typeof r.recordHash === "string" &&
+          /^[0-9a-f]{64}$/.test(r.recordHash)) ||
+      !Array.isArray(r.snapshots) ||
+      r.snapshots.length < 1 ||
+      r.snapshots.length > 2 ||
+      !r.snapshots.every(isCleanupSnapshot) ||
+      !isCleanupSnapshot({ path, parents: r.parents, entries: [] }) ||
+      r.parents.length !== (await directoryStamps(path)).length ||
+      !worktrees.gitCommonDir ||
+      !isCleanupSnapshot({
+        path: join(worktrees.gitCommonDir, "probe"),
+        parents: r.gitParents,
+        entries: [],
+      }) ||
+      r.gitParents.length !==
+        (await directoryStamps(join(worktrees.gitCommonDir, "probe"))).length ||
+      !(
+        r.backup === null ||
+        (singleLine(r.backup) && samePath(dirname(r.backup), backupsDir))
+      )
+    )
+      throw new Error(`Corrupt or unsupported cleanup receipt: ${path}`);
+    const receipt = r as CleanupReceipt;
+    if (
+      !samePath(
+        receipt.snapshots[0].path,
+        worktrees.pathFor(task.itemId, task.issueNumber),
+      ) ||
+      (receipt.snapshots[1] &&
+        (!worktrees.gitCommonDir ||
+          !samePath(
+            dirname(receipt.snapshots[1].path),
+            join(worktrees.gitCommonDir, "worktrees"),
+          ))) ||
+      (receipt.record &&
+        (receipt.record.itemId !== task.itemId ||
+          receipt.record.issueNumber !== task.issueNumber ||
+          receipt.record.taskBranch !== task.taskBranch ||
+          receipt.record.baseBranch !== task.baseBranch ||
+          !samePath(receipt.record.path, receipt.snapshots[0].path) ||
+          receipt.record.activeRunId ||
+          receipt.record.launchingAt !== undefined ||
+          receipt.record.retry ||
+          receipt.record.integration)) ||
+      (!receipt.record && receipt.snapshots.some((s) => s.entries.length))
+    )
+      throw new Error("Cleanup receipt identity/path mismatch.");
+    await verifyParents(receipt.gitParents);
+    worktrees.checkOwnership(receipt.record ?? { ...task, schemaVersion: 4, createdAt: 0, path: receipt.snapshots[0].path });
+    if (receipt.taskBranch === receipt.baseBranch)
+      throw new Error("Task branch must differ from the base branch.");
+    await verifyParents(receipt.parents);
+    const admin = receipt.snapshots[1];
+    if (admin) {
+      // Even half-removed metadata must be positively tied to THIS path, never
+      // another registered worktree merely inside the same Git common dir.
+      const pointer = admin.entries.find((e) => e.path === "gitdir");
+      const target = join(receipt.snapshots[0].path, ".git");
+      const spellings = [target, target.replaceAll("\\", "/")].flatMap((p) => [p + "\n", p + "\r\n"]);
+      if (!pointer || pointer.type !== "file" || !spellings.some((p) => hash(p) === pointer.sha256))
+        throw new Error("Legacy Git administration lacks original worktree ownership evidence.");
+      if (lstatSync(join(admin.path, "gitdir"), { throwIfNoEntry: false }) &&
+          !samePath((await readRegular(join(admin.path, "gitdir"))).toString("utf8").trim(), target))
+        throw new Error("Other Git cleanup ownership.");
+    }
+    return receipt;
+  }
+
+
+async function verifyReceiptBackup(receipt: CleanupReceipt): Promise<void> {
+  if (!receipt.backup) return;
+  await verifyBackupSnapshots(receipt.backup, receipt.snapshots);
+  if (hash(await readRegular(join(receipt.backup, "record.json"))) !== receipt.recordHash)
+    throw new Error("Legacy cleanup backup record changed.");
 }

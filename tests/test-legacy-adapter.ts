@@ -10,6 +10,7 @@ import type { LegacyRepair } from "../src/legacy-adapter.js";
 import type { TicketExecutionRecord } from "../src/ticket-worktree.js";
 import { fixture, git, faults, dispose } from "./cleanup-fixture.js";
 
+const { legacyReceipt } = await import("./legacy-cleanup-fixture.js");
 const { ManagedTicketExecutor } = await import("../src/ticket-executor.js");
 const { acquireOwnerLock } = await import("../src/owner-lock.js");
 const { conflictRequestKey } = await import("../src/legacy-adapter.js");
@@ -236,7 +237,6 @@ try {
       assert.equal(f.store.read(f.card.itemId)?.retry?.stage, pushed ? "cleanup" : "integrate");
       assert.equal(f.store.read(f.card.itemId)?.finalization, undefined);
       assert.deepEqual(bytes(f.recordFile + ".v3.bak"), original);
-      assert.equal((await executor.finalizeClosed(f.card)).status, "blocked");
       f.card.closed = false; f.card.status = cfg.columns.ready; f.card.assignees = [];
       assert.equal((await executor.launch(f.card, "demo")).status, "skipped");
       if (strategy === "merge" && pushed) {
@@ -252,25 +252,22 @@ try {
         await loop.tickNow(); assert.equal(reviews, 0); await loop.stop();
       }
       f.card.closed = true; f.card.status = cfg.columns.done;
-      await assert.rejects(() => f.store.finalizeAccepted(f.task, "merge"), /resumable finalization/);
       await f.make().reconcile(f.all());
       assert.equal(f.tip(), tip); assert.ok(existsSync(f.record.path)); assert.equal(f.counts.starts, 0);
       assert.deepEqual(f.writes, []); f.ownerLock.release();
-      console.log(`PASS: recorded ${strategy} result (${pushed ? "pushed" : "not on remote"}) adopted exactly, never remerged/rebuilt/cleaned by pre-T004 paths`);
+      console.log(`PASS: recorded ${strategy} result (${pushed ? "pushed" : "not on remote"}) adopted exactly, never remerged/rebuilt/cleaned during conversion`);
     }
   }
 
   for (const missing of ["remote-ref", "local-ref", "worktree", "record", "rewritten-base"] as const) {
     const f = await setup(); f.card.closed = true; f.card.status = cfg.columns.done;
-    // Generate a real old receipt, cutting before the first remote deletion.
-    faults.beforeGit = (args) => { if (args[0] === "push" && args.some((a) => a.startsWith(":refs/heads/task/"))) throw new Error("old cleanup cut"); };
-    await assert.rejects(f.finish, /old cleanup cut/); faults.beforeGit = undefined;
+    await legacyReceipt(f);
     const receipt = bytes(f.receipt), oldReceipt = JSON.parse(receipt.toString("utf8"));
     if (missing === "remote-ref" || missing === "record") git(f.repo, "push", "origin", `:refs/heads/${f.task.taskBranch}`);
     if (missing === "rewritten-base") git(f.origin, "update-ref", "refs/heads/main", f.base, f.tip());
     if (missing === "local-ref") git(f.repo, "update-ref", "-d", `refs/heads/${f.task.taskBranch}`, f.taskSha);
     if (missing === "worktree" || missing === "record") git(f.repo, "worktree", "remove", f.record.path);
-    if (missing === "record") { git(f.repo, "update-ref", "-d", `refs/heads/${f.task.taskBranch}`, f.taskSha); rmSync(f.recordFile); }
+    if (missing === "record") { git(f.repo, "update-ref", "-d", `refs/heads/${f.task.taskBranch}`, f.taskSha); rmSync(f.recordFile); f.card.status = cfg.columns.ready; }
     const tip = f.tip(), executor = f.make();
     const outcome = await executor.reconcile(f.all());
     assert.equal(outcome.errors, 0, f.notices.join("\n"));
@@ -279,7 +276,6 @@ try {
     assert.deepEqual(bytes(f.receipt), receipt);
     const migrated = bytes(f.recordFile);
     await f.make().reconcile(f.all()); assert.deepEqual(bytes(f.recordFile), migrated);
-    assert.equal((await executor.finalizeClosed(f.card)).status, "blocked");
     assert.equal(f.tip(), tip); assert.deepEqual(bytes(f.receipt), receipt);
     f.ownerLock.release();
     console.log(`PASS: old receipt survives missing ${missing}; exact result becomes cleanup-only even without record/ref/path; receipt remains read-only`);
@@ -288,8 +284,7 @@ try {
   {
     const f = await setup(); f.card.closed = true; f.card.status = cfg.columns.done;
     git(f.repo, "worktree", "remove", f.record.path); rmSync(f.recordFile);
-    faults.beforeGit = (args) => { if (args[0] === "push" && args.some((a) => a.startsWith(":refs/heads/task/"))) throw new Error("unrecorded old cut"); };
-    await assert.rejects(f.finish, /unrecorded old cut/); faults.beforeGit = undefined;
+    await legacyReceipt(f, { nullRecord: true });
     const receipt = bytes(f.receipt); assert.equal(JSON.parse(receipt.toString("utf8")).record, null);
     const executor = f.make(); const result = await executor.reconcile(f.all());
     assert.equal(result.errors, 0, f.notices.join("\n"));
@@ -302,8 +297,7 @@ try {
 
   for (const changed of [false, true]) {
     const f = await setup(); f.card.closed = true; f.card.status = cfg.columns.done;
-    faults.beforeGit = (args) => { if (args[0] === "push" && args.some((a) => a.startsWith(":refs/heads/task/"))) throw new Error("old cut"); };
-    await assert.rejects(f.finish, /old cut/); faults.beforeGit = undefined;
+    await legacyReceipt(f);
     const receipt = bytes(f.receipt), original = bytes(f.recordFile);
     f.vanish(); // a half-removed unregistered worktree: receipt still owns exact survivors
     if (changed) writeFileSync(join(f.record.path, "unknown.txt"), "unowned replacement");
@@ -313,7 +307,7 @@ try {
       assert.equal(readFileSync(join(f.record.path, "unknown.txt"), "utf8"), "unowned replacement");
     } else assert.equal(f.store.read(f.card.itemId)?.retry?.stage, "cleanup", f.notices.join("\n"));
     assert.deepEqual(bytes(f.receipt), receipt); assert.ok(existsSync(f.record.path));
-    assert.equal((await executor.finalizeClosed(f.card)).status, "blocked");
+    if (changed) assert.equal((await executor.finalizeClosed(f.card)).status, "blocked");
     await f.make().reconcile(f.all()); assert.deepEqual(bytes(f.receipt), receipt);
     f.ownerLock.release();
     console.log(`PASS: unregistered receipt survivors ${changed ? "changed/unknown: conversion retained" : "unchanged: cleanup-only handoff"}; no snapshot creation or deletion during migration`);
@@ -324,11 +318,11 @@ try {
     const finalization = { targetBranch: "main", baseSha: f.base, taskSha: f.taskSha };
     json(f.recordFile, { ...f.original, finalization });
     const executor = f.make(); await executor.reconcile(f.all());
-    assert.deepEqual(f.store.read(f.card.itemId)?.finalization, finalization);
+    assert.equal(f.store.read(f.card.itemId)?.finalization, undefined);
     assert.equal(f.store.read(f.card.itemId)?.integration, undefined);
     assert.equal(f.store.read(f.card.itemId)?.retry?.stage, "integrate");
-    assert.equal((await executor.finalizeClosed(f.card)).status, "blocked"); f.ownerLock.release();
-    console.log("PASS: pre-result intent retains original base/task without inventing success or entering the old finalizer");
+    f.ownerLock.release();
+    console.log("PASS: pre-result intent uses exact v3 backup, becomes ordinary integrate retry without inventing success");
   }
 
   {

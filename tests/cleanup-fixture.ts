@@ -36,10 +36,19 @@ export const calls: string[][] = [];
 
 export const faults: {
   beforeGit?: (args: string[], options: ProcessOptions) => void | Promise<void>;
+  afterGit?: (args: string[], result: Awaited<ReturnType<typeof runProcess>>) => void | Promise<void>;
   beforeFs?: (operation: string, path: string) => void | Promise<void>;
   afterFs?: (operation: string, path: string) => void | Promise<void>;
+  beforeSync?: (operation: string, path: string) => void;
+  afterSync?: (operation: string, path: string) => void;
 } = {};
 const globals = globalThis as any;
+globals.__cleanupSync = (operation: "write" | "rename", path: string, ...args: any[]) => {
+  faults.beforeSync?.(operation, path);
+  const result = operation === "write" ? (writeFileSync as any)(path, ...args) : (renameSync as any)(path, ...args);
+  faults.afterSync?.(operation, path);
+  return result;
+};
 globals.__cleanupFs = async (
   operation: "unlink" | "link" | "open" | "readdir" | "readlink",
   path: string,
@@ -72,13 +81,20 @@ globals.__cleanupGit = (
   if (mode === "sync") return runProcessSync(command, args, options);
   return (async () => {
     await faults.beforeGit?.(args, options);
-    return runProcess(command, args, options);
+    const result = await runProcess(command, args, options);
+    await faults.afterGit?.(args, result);
+    return result;
   })();
 };
 const worktreeUrl = new URL("../src/ticket-worktree.ts", import.meta.url).href;
 const runnerUrl = new URL("../src/process-runner.ts", import.meta.url).href;
 const hooks = registerHooks({
   resolve(specifier, context, next) {
+    if (context.parentURL === worktreeUrl && specifier === "node:fs") return {
+      url: `data:text/javascript,${encodeURIComponent(`export * from 'node:fs';
+        export const writeFileSync = (...args) => globalThis.__cleanupSync('write', ...args);
+        export const renameSync = (...args) => globalThis.__cleanupSync('rename', ...args);`)}`, shortCircuit: true,
+    };
     if (
       context.parentURL === worktreeUrl &&
       specifier === "./process-runner.js"
@@ -175,8 +191,12 @@ export async function fixture(lockfiles = false) {
     `item_${sequence}.json`,
   );
   const tip = () => git(origin, "rev-parse", "refs/heads/main");
-  const finish = (strategy: "merge" | "squash" = "merge") =>
-    new TicketWorktrees(repo).finalizeAccepted(task, strategy);
+  const finish = async (strategy: "merge" | "squash" = "merge") => {
+    const store = new TicketWorktrees(repo);
+    const result = await store.finalizeAccepted(task, strategy);
+    if (result) await store.completeFinalization(task, async () => {});
+    return result;
+  };
   const vanish = () => {
     unlinkSync(join(record.path, ".git"));
     rmSync(admin, { recursive: true });
@@ -229,8 +249,9 @@ export function legacy(
 }
 
 export function dispose() {
-  faults.beforeGit = faults.beforeFs = faults.afterFs = undefined;
+  faults.beforeGit = faults.afterGit = faults.beforeFs = faults.afterFs = faults.beforeSync = faults.afterSync = undefined;
   hooks.deregister();
+  delete globals.__cleanupSync;
   delete globals.__cleanupGit;
   delete globals.__cleanupFs;
 }

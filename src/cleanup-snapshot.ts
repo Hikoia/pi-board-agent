@@ -1,14 +1,11 @@
-// Filesystem evidence for cleanup, deliberately independent of Git and v3 records.
-import { createHash, randomUUID } from "node:crypto";
+// Read-only legacy snapshot verification and narrowly checked old residual removal.
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import {
   lstat,
   open,
   readdir,
   readlink,
-  symlink,
-  mkdir,
-  link,
   unlink,
   rmdir,
 } from "node:fs/promises";
@@ -326,96 +323,42 @@ export async function verifySnapshot(
       );
 }
 
-/** Atomic, create-only publication. A failed publish never overwrites retry evidence. */
-export async function writeCleanupEvidence(
-  path: string,
-  bytes: string | Buffer,
-): Promise<void> {
-  const parents = await directoryStamps(path);
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  const handle = await open(temporary, "wx");
-  try {
-    await handle.writeFile(bytes);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await verifyParents(parents);
-  await link(temporary, path);
-  await unlink(temporary);
-  // Windows cannot fsync directory handles; the published file itself is flushed.
-  if (process.platform !== "win32") {
-    const dir = await open(dirname(path), "r");
-    try {
-      await dir.sync();
-    } finally {
-      await dir.close();
-    }
-  }
-}
-
 /** No recursive removal: every surviving entry and every ancestor is checked again. */
 export async function removeSnapshot(
   snapshot: CleanupSnapshot,
   guard: () => Promise<void>,
 ): Promise<void> {
   await guard();
+  await verifySnapshot(snapshot);
+  const directories = new Map(snapshot.entries.filter((e) => e.type === "directory").map((e) => [e.path, e.identity]));
   for (const entry of [...snapshot.entries].reverse()) {
     const path = join(snapshot.path, entry.path);
     if (!(await statAt(path))) continue;
     await guard();
-    // ponytail: full rechecks are O(n²); favor conservative cleanup over a second mutable journal.
-    await verifySnapshot(snapshot);
+    await verifyParents(snapshot.parents);
+    // Check only this entry and its ancestry, not the whole tree per unlink.
+    // New/changed siblings are never deleted; nonempty rmdir retains them.
+    for (let parent = entry.path; parent; ) {
+      parent = parent.includes("/") ? parent.slice(0, parent.lastIndexOf("/")) : "";
+      const stat = await statAt(join(snapshot.path, parent));
+      if (!stat?.isDirectory() || stat.isSymbolicLink() || !equal(identity(stat), directories.get(parent)))
+        throw new Error(`Legacy cleanup parent changed: ${path}`);
+    }
+    const stat = await statAt(path);
+    if (!stat || !equal(identity(stat), entry.identity)) throw new Error(`Legacy cleanup entry replaced: ${path}`);
+    if (entry.type === "file") {
+      const bytes = await readRegular(path);
+      if (!stat.isFile() || String(bytes.length) !== entry.size || digest(bytes) !== entry.sha256)
+        throw new Error(`Legacy cleanup file changed: ${path}`);
+    } else if (entry.type === "symlink") {
+      if (!equal(await readSymlink(path), { target: entry.target, linkType: entry.linkType }))
+        throw new Error(`Legacy cleanup link changed: ${path}`);
+    } else if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Legacy cleanup directory changed: ${path}`);
     if (entry.type === "directory") await rmdir(path);
     else await unlink(path);
   }
   if (await statAt(snapshot.path))
     throw new Error(`Cleanup directory remains: ${snapshot.path}`);
-}
-
-/** Copy everything, verify the copy, then prove the entire source is unchanged. Never GC. */
-export async function backupSnapshots(
-  path: string,
-  snapshots: CleanupSnapshot[],
-): Promise<void> {
-  await mkdir(path); // unique destination; failures/incomplete copies are retained, never reused
-  for (const [i, snapshot] of snapshots.entries()) {
-    for (const entry of snapshot.entries) {
-      await verifyParents(snapshot.parents);
-      const destination = join(path, String(i), entry.path);
-      await directoryStamps(destination);
-      if (entry.type === "directory") await mkdir(destination);
-      else if (entry.type === "symlink") {
-        const source = await readSymlink(join(snapshot.path, entry.path));
-        if (
-          source.target !== entry.target ||
-          source.linkType !== entry.linkType
-        )
-          throw new Error("Backup source symlink changed");
-        await symlink(entry.target, destination, entry.linkType);
-      } else {
-        const bytes = await readRegular(join(snapshot.path, entry.path));
-        if (
-          digest(bytes) !== entry.sha256 ||
-          String(bytes.length) !== entry.size
-        )
-          throw new Error("Backup source changed");
-        await writeCleanupEvidence(destination, bytes);
-      }
-    }
-    if (snapshot.entries.length) {
-      const copy = await cleanupSnapshot(join(path, String(i)));
-      const contents = (s: CleanupSnapshot) =>
-        s.entries.map(({ identity: _identity, ...entry }) => entry);
-      if (!equal(contents(copy), contents(snapshot)))
-        throw new Error("Cleanup backup verification failed");
-    }
-  }
-  for (const snapshot of snapshots) await verifySnapshot(snapshot, false);
-  await writeCleanupEvidence(
-    join(path, "verified.json"),
-    JSON.stringify({ schemaVersion: 1, snapshots }),
-  );
 }
 
 export async function verifyBackupSnapshots(

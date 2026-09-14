@@ -32,8 +32,8 @@ try {
       if (args[0] !== "worktree" || args[1] !== "remove") return;
       faults.beforeGit = undefined;
       assert.ok(
-        existsSync(f.receipt),
-        "lock is acquired only after receipt publication and all pre-removal checks",
+        !!f.store.read(f.task.itemId)?.integration,
+        "lock is acquired only after result publication and fresh remote confirmation",
       );
       const script = `$ErrorActionPreference='Stop'; $f=[IO.File]::Open(${quote(path)}, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None); try { [Console]::WriteLine('LOCKED'); $end=[DateTime]::UtcNow.AddSeconds(180); while (!(Test-Path -LiteralPath ${quote(release)})) { if ([DateTime]::UtcNow -gt $end) { throw 'exclusive lock release deadline exceeded' }; Start-Sleep -Milliseconds 50 } } finally { $f.Dispose() }`;
       child = spawn(
@@ -85,12 +85,12 @@ try {
       });
       assert.ok(child, "real exclusive lock was acquired");
       const integrated = f.tip(),
-        receipt = readFileSync(f.receipt);
+        integration = f.store.read(f.task.itemId)!.integration;
       assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
       assert.ok(existsSync(path));
       assert.ok(existsSync(f.recordFile));
       await assert.rejects(f.finish(), /EBUSY|EACCES|EPERM|worktree|cleanup/i);
-      assert.deepEqual(readFileSync(f.receipt), receipt);
+      assert.deepEqual(f.store.read(f.task.itemId)!.integration, integration);
       assert.equal(f.tip(), integrated);
       writeFileSync(release, "release");
       await closed;
@@ -106,7 +106,7 @@ try {
       assert.equal(existsSync(f.recordFile), false);
       assert.equal(existsSync(f.receipt), false);
       console.log(
-        "PASS: real Windows FileShare.None lock makes real Git removal fail; locked retry preserves evidence; release/restart completes exact cleanup without reintegration",
+        "PASS: real Windows FileShare.None lock makes real Git removal fail; locked retry preserves evidence; release/restart completes native cleanup without reintegration",
       );
     } finally {
       writeFileSync(release, "release");

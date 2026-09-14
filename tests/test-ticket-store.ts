@@ -192,13 +192,14 @@ try {
     assert.throws(() => f.store.setActiveRun("ITEM", "another-run"), /pending finalization/);
     assert.throws(() => f.store.setReviewedTaskSha("ITEM", "d".repeat(40)), /pending finalization/);
     await assert.rejects(() => f.store.ensure(f.task), /pending finalization/);
-    await assert.rejects(() => f.store.finalizeAccepted(f.task, "merge"), /Pending ticket progress/);
+    await assert.rejects(() => f.store.finalizeAccepted(f.task, "merge"), /not a git repository/);
     assert.deepEqual(readFileSync(f.file), before, "a result SHA is not successful integration or cleanup authority");
     f.store.clearExecution("ITEM");
     assert.deepEqual(f.store.read("ITEM")?.integration, integration);
     assert.deepEqual(f.store.read("ITEM")?.retry, { stage: "cleanup", reason: "Project write failed" });
-    f.store.update("ITEM", (r) => ({ ...r, retry: undefined }));
-    assert.equal(f.store.read("ITEM")?.retry, undefined, "only explicit settlement clears retry");
+    assert.throws(() => f.store.update("ITEM", (r) => ({ ...r, retry: undefined })), /cleanup-only/);
+    assert.throws(() => f.store.update("ITEM", (r) => ({ ...r, retry: { stage: "integrate", reason: "must not replay" } })), /cleanup-only/);
+    assert.equal(f.store.read("ITEM")?.retry?.stage, "cleanup", "known integration cannot regain push/merge authority; final record deletion acknowledges completion");
     assert.deepEqual(f.store.read("ITEM")?.integration, integration);
     assert.equal(f.store.read("ITEM")?.lastRunId, "original-run");
     console.log("PASS: execution clearing retains retry/identity/run/review evidence; integration is immutable and cannot authorize legacy finalization or a second builder");
@@ -327,7 +328,7 @@ try {
     writeFileSync(receipt, "{corrupt receipt");
     const before = readFileSync(f.file);
     assert.throws(() => f.store.clearExecution("ITEM"), /pending cleanup receipt/);
-    await assert.rejects(() => f.store.finalizeAccepted(f.task, "merge"), /Corrupt cleanup receipt/);
+    await assert.rejects(() => f.store.finalizeAccepted(f.task, "merge"), /Legacy cleanup receipt requires conversion/);
     assert.deepEqual(readFileSync(f.file), before);
     assert.equal(readFileSync(receipt, "utf8"), "{corrupt receipt");
     assert.ok(existsSync(join(f.dir, "healthy.json")));

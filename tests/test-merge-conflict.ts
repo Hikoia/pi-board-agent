@@ -135,61 +135,29 @@ try {
   }
 
   const { ManagedTicketExecutor } = await import("../src/ticket-executor.js");
-  const { BoardLoop, createLoopState } = await import("../src/loop.js");
-  const notices: Array<{ message: string; level: string }> = [];
-  const callback = (message: string, level = "info") => { notices.push({ message, level }); };
-  const noBoardWrite = async (): Promise<never> => { assert.fail("T11 must not mutate the ticket or launch repair"); };
+  const comments: string[] = [];
   const board: TicketBoardAdapter = {
-    getCard: async (id) => { assert.equal(id, card.itemId); return structuredClone(card); },
-    claim: noBoardWrite, release: noBoardWrite, comment: noBoardWrite,
-    setStatus: noBoardWrite, listComments: noBoardWrite,
+    getCard: async () => structuredClone(card),
+    claim: async () => { card.assignees = ["bot"]; return true; },
+    release: async () => { card.assignees = []; },
+    comment: async (_c, body) => { comments.push(body); },
+    listComments: async () => comments,
+    setStatus: async (_id, status) => { card.status = status; },
+    reopen: async () => { card.closed = false; },
   };
-  const makeExecutor = () => new ManagedTicketExecutor({
-    cwd: repo, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback, board, worktrees: store,
-    createManager: () => { assert.fail("T11 must not launch a model or repair workflow"); },
-  });
-  const beforeCard = structuredClone(card);
+  const executor = new ManagedTicketExecutor({ cwd: repo, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo",
+    callback: () => {}, board, worktrees: store, createManager: () => assert.fail("No model during conflict settlement") });
   calls.length = 0;
-  const outcome = await makeExecutor().finalizeClosed(card);
+  const outcome = await executor.finalizeClosed(card);
   assert.equal(outcome.status, "conflict");
-  if (outcome.status !== "conflict") assert.fail("expected explicit conflict outcome");
-  assert.equal(outcome.baseSha, baseSha);
-  assert.equal(outcome.taskSha, taskSha);
-  assert.match(outcome.reason, /CONFLICT \(content\): Merge conflict in shared\.txt/);
-  assert.equal(notices.length, 0, "loop owns the blocking notification; executor must not announce success");
-  kept();
-  console.log("PASS: ManagedTicketExecutor exposes exact conflict SHAs and diagnostics without ticket mutation or success");
-
-  for (const reviewEnabled of [false, true]) {
-    cfg.review.enabled = reviewEnabled;
-    const state = createLoopState();
-    const loop = new BoardLoop({
-      cwd: repo, cfg, repoOwner: "owner", repoName: "repo", botLogin: "bot",
-      meta: { projectId: "P", statusFieldId: "S", statusOptions: {} }, callback,
-      listCards: async () => [structuredClone(card)],
-      boardOps: { claim: noBoardWrite, refresh: noBoardWrite, release: noBoardWrite, listComments: noBoardWrite, comment: noBoardWrite, setStatus: noBoardWrite },
-      review: noBoardWrite,
-    }, state, makeExecutor(), store);
-    calls.length = 0;
-    notices.length = 0;
-    try {
-      await loop.tickNow();
-      assert.equal(state.tickCount, 1);
-      assert.equal(state.wavesLaunched, 0);
-      assert.equal(cfg.review.enabled, reviewEnabled);
-      assert.equal(notices.length, 1, "one explicit warning, no false success");
-      assert.equal(notices[0].level, "warn");
-      assert.match(notices[0].message, /Finalization conflict.*#11/);
-      assert.ok(notices[0].message.includes(task.taskBranch));
-      assert.ok(notices[0].message.includes(baseSha));
-      assert.ok(notices[0].message.includes(taskSha));
-      assert.match(notices[0].message, /CONFLICT \(content\): Merge conflict in shared\.txt/);
-      assert.match(notices[0].message, /preserv/i);
-      assert.deepEqual(card, beforeCard);
-      kept();
-      console.log(`PASS: real loop/executor conflict warns informatively and preserves closed-Done ticket and Git state with review.enabled=${reviewEnabled}`);
-    } finally { await loop.stop(); }
-  }
+  assert.equal(card.closed, false); assert.equal(card.status, cfg.columns.ready);
+  assert.deepEqual(card.assignees, []); assert.equal(store.read(card.itemId)?.retry?.stage, "build");
+  assert.ok(comments[0].includes(taskSha) && comments[0].includes(baseSha));
+  assert.ok(!calls.some((a) => ["commit-tree", "push", "update-ref"].includes(a[0])));
+  console.log("PASS: genuine pre-integration conflict reopens original Task to Ready ordinary build retry, preserving SHAs/worktree and requiring renewed review/manual close");
+  // Restore only the fixture to independently exercise the process classifier.
+  store.update(card.itemId, (r) => ({ ...r, retry: undefined }));
+  card.closed = true; card.status = cfg.columns.done;
 
   const realConflict = merges[0];
   const tree = realConflict.stdout.split(/\r?\n/)[0];

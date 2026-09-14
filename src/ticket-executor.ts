@@ -354,7 +354,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     return this.legacy?.blocker(itemId) ??
       (record?.schemaVersion === 3 ? "Legacy conversion pending." : undefined) ??
       (record?.integration || record?.retry?.stage === "integrate" || record?.retry?.stage === "cleanup" || record?.finalization
-        ? "pending finalization/integration/cleanup is reserved for resumable finalization (T004)." : undefined);
+        ? "pending finalization/integration/cleanup is reserved for resumable finalization." : undefined);
   }
 
   private matches(record: TicketExecutionRecord, run: PersistedRunState): boolean {
@@ -755,11 +755,11 @@ export class ManagedTicketExecutor implements TicketExecutor {
   /** Ordinary builder retry seam for T004's verified pre-push conflicts. */
   async retryConflict(card: Card, conflict: MergeConflictError): Promise<void> {
     let record = this.deps.worktrees.read(card.itemId);
-    if (!record || this.recoveryBlocker(card.itemId) || record.activeRunId || record.launchingAt !== undefined ||
+    if (!record || this.legacy?.blocker(card.itemId) || record.integration || record.finalization || record.activeRunId || record.launchingAt !== undefined ||
       this.deps.worktrees.hasCleanupReceipt(card.itemId)) throw new Error("Conflict requires the idle original ticket record.");
     const fresh = await this.deps.board.getCard(card.itemId);
     if (!this.target(fresh, record) || ticketCardKey(fresh, record) !== ticketCardKey(card, record) || !fresh.closed ||
-      !statusIs(fresh, this.deps.cfg.columns.done) || fresh.assignees.some((a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase()))
+      !(statusIs(fresh, this.deps.cfg.columns.done) || (record.retry?.stage === "integrate" && statusIs(fresh, this.deps.cfg.columns.ready))) || fresh.assignees.some((a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase()))
       throw new TicketChangedError("Conflict approval/identity/claim changed.");
     if (!this.owned(fresh) && !(await this.deps.board.claim(fresh))) throw new Error("Conflict claim lost.");
     card = await this.currentLaunchCard(record, { ...fresh, assignees: [this.deps.botLogin] });
@@ -768,29 +768,126 @@ export class ManagedTicketExecutor implements TicketExecutor {
     await this.settle(record);
   }
 
+  /** Finalization failure settlement is closed-destination I/O, not the open
+   * build/review helper. The reason carries the identity-bound pending notice. */
+  private async settleFinalizationFailure(record: TicketExecutionRecord): Promise<boolean> {
+    const match = /^<!-- board-agent-finalize:([a-f0-9]+):([^\n]+) -->\n/.exec(record.retry?.reason ?? "");
+    if (!match) return false;
+    const { board, cfg, worktrees } = this.deps;
+    let changed = false;
+    const fresh = async () => {
+      const card = await board.getCard(record.itemId);
+      if (this.stopping || (this.legacy && !this.legacy.authorityHeld()) || !this.target(card, record) || !card.closed ||
+          ticketCardKey(card, record) !== match[1] ||
+          ![decodeURIComponent(match[2]), cfg.columns.ready, ...(record.retry?.stage === "cleanup" ? [cfg.columns.done] : [])].some((s) => statusIs(card, s)) ||
+          card.assignees.some((a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase()) ||
+          JSON.stringify(worktrees.read(record.itemId)) !== JSON.stringify(record))
+        throw new TicketChangedError("Finalization failure settlement identity/claim/lane changed.");
+      return card;
+    };
+    let card = await fresh();
+    const body = record.retry!.reason;
+    const comments = await board.listComments(card);
+    const posted = comments.some((c) => typeof c === "string" ? c === body :
+      c.body === body && c.author?.toLowerCase() === this.deps.botLogin.toLowerCase());
+    if (!posted) {
+      await board.comment(await fresh(), body); changed = true;
+      const observed = await board.listComments(await fresh());
+      if (!observed.some((c) => typeof c === "string" ? c === body : c.body === body && c.author?.toLowerCase() === this.deps.botLogin.toLowerCase()))
+        throw new Error("Finalization diagnostic comment not yet observed.");
+    }
+    card = await fresh();
+    if (!statusIs(card, cfg.columns.ready)) {
+      await board.setStatus(card.itemId, cfg.columns.ready); changed = true;
+      if (!statusIs(await fresh(), cfg.columns.ready)) throw new Error("Finalization Ready write not yet observed.");
+    }
+    card = await fresh();
+    if (this.owned(card)) {
+      await board.release(card); changed = true;
+      if ((await fresh()).assignees.length) throw new Error("Finalization claim release not yet observed.");
+    }
+    return changed;
+  }
+
   async finalizeClosed(snapshot: Card, _canStartWork: () => boolean | Promise<boolean> = () => true,
     _canStartWorkNow: () => boolean = () => true): Promise<FinalizeOutcome> {
+    const { worktrees, board, cfg } = this.deps;
+    let expected: Card | undefined, initial: TicketExecutionRecord | undefined;
     try {
-      let card: Card | undefined;
-      try { card = await this.deps.board.getCard(snapshot.itemId); }
-      catch (error) { return { status: "blocked", reason: `fresh card read failed: ${error instanceof Error ? error.message : String(error)}` }; }
-      if (!card || card.itemId !== snapshot.itemId || !isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task") || card.number !== snapshot.number ||
-        !card.closed || !statusIs(card, this.deps.cfg.columns.done)) return { status: "skipped", reason: "ticket is no longer the same closed Done Task" };
-      const blocked = this.recoveryBlocker(card.itemId); if (blocked) return { status: "blocked", reason: blocked };
-      if (this.legacy && this.deps.worktrees.hasCleanupReceipt(card.itemId)) return { status: "blocked", reason: "Legacy receipt cleanup pending (T004)." };
-      if (this.deps.worktrees.read(card.itemId)?.retry)
+      if (this.stopping || (this.legacy && !this.legacy.authorityHeld())) return { status: "blocked", reason: "Finalization owner is stopping or lost." };
+      let card = await board.getCard(snapshot.itemId);
+      initial = worktrees.read(snapshot.itemId);
+      const retrying = initial?.retry && ["integrate", "cleanup"].includes(initial.retry.stage);
+      if (!card || card.itemId !== snapshot.itemId || !isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task") ||
+          card.number !== snapshot.number || !card.closed ||
+          !(statusIs(card, cfg.columns.done) || (retrying && statusIs(card, cfg.columns.ready))) ||
+          card.assignees.some((a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase()))
+        return { status: "skipped", reason: "Ticket is no longer the same approved closed Task or its retry lane." };
+      if (initial && !this.target(card, initial)) return { status: "blocked", reason: "Original ticket identity/Plan changed." };
+      const blocked = this.legacy?.blocker(card.itemId);
+      if (blocked) return { status: "blocked", reason: blocked };
+      if (initial?.retry && !retrying)
         return { status: "blocked", reason: "Ordinary build/review retry must finish before renewed Review, Done and manual close." };
-      try {
-        const task = buildTasksForWave(this.deps.cfg, "", [card])[0];
-        const resultSha = await this.deps.worktrees.finalizeAccepted(task, this.deps.cfg.task_merge_strategy);
-        if (resultSha) this.deps.callback(`Finalized #${card.number} "${card.title}" at ${resultSha} in ${task.baseBranch}. Deleted local/remote branch ${task.taskBranch} and removed its worktree.`);
-        return resultSha ? { status: "finalized", resultSha } : { status: "skipped", reason: "no local task branch" };
-      } catch (error) {
-        if (!(error instanceof MergeConflictError)) throw error;
-        await this.retryConflict(card, error);
-        return { status: "conflict", baseSha: error.baseSha, taskSha: error.taskSha, reason: error.diagnostic };
+      expected = card;
+      if (initial && await this.settleFinalizationFailure(initial))
+        return { status: "blocked", reason: "Finalization failure settled; retry integration/cleanup next tick." };
+      if (initial?.retry?.reason.startsWith("<!-- board-agent-finalize:")) {
+        initial = worktrees.update(initial.itemId, (r) => ({ ...r,
+          retry: { ...r.retry!, reason: r.retry!.reason.slice(r.retry!.reason.indexOf("\n") + 1) } }));
       }
-    } catch (error) { return { status: "blocked", reason: String(error) }; }
+      const assertCurrent = async (done = false) => {
+        const fresh = await board.getCard(snapshot.itemId);
+        // An admitted finalization drains under the existing owner even when
+        // scheduling stops; BoardLoop awaits this I/O before releasing the lock.
+        if ((this.legacy && !this.legacy.authorityHeld()) || !fresh || !fresh.closed ||
+            (initial ? ticketCardKey(fresh, initial) !== ticketCardKey(expected!, initial) :
+              JSON.stringify(fresh) !== JSON.stringify(expected)) ||
+            !statusIs(fresh, done ? cfg.columns.done : expected!.status!) ||
+            fresh.assignees.some((a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase()))
+          throw new TicketChangedError("Finalization approval, identity, claim or lane changed.");
+      };
+      const task = buildTasksForWave(cfg, "", [card])[0];
+      if (initial) task.taskKey = initial.taskKey;
+      const resultSha = await worktrees.finalizeAccepted(task, cfg.task_merge_strategy, assertCurrent,
+        this.legacy ? { paths: (r) => this.legacy!.residualPaths(r), remove: (r, guard) => this.legacy!.removeResidual(r, guard) } : undefined);
+      if (!resultSha) return { status: "skipped", reason: "No recorded task work remains." };
+      await assertCurrent();
+      if (!statusIs(card, cfg.columns.done)) await board.setStatus(card.itemId, cfg.columns.done);
+      await assertCurrent(true); // a lost Project response keeps the same cleanup record
+      await worktrees.completeFinalization(task, () => assertCurrent(true));
+      this.deps.callback(`Finalized #${card.number} "${card.title}" at ${resultSha} in ${task.baseBranch}. Deleted local/remote branch ${task.taskBranch}, removed its worktree and observed Project Done.`);
+      return { status: "finalized", resultSha };
+    } catch (error) {
+      if (error instanceof MergeConflictError && expected) {
+        try {
+          await this.retryConflict(expected, error);
+          return { status: "conflict", baseSha: error.baseSha, taskSha: error.taskSha, reason: error.diagnostic };
+        } catch (settlementError) {
+          this.deps.callback(`Conflict Ready settlement pending: ${String(settlementError)}`, "warn");
+          return { status: "blocked", reason: String(settlementError) };
+        }
+      }
+      const current = worktrees.read(snapshot.itemId);
+      if (!(error instanceof TicketChangedError) && initial && expected && current &&
+          (["itemId", "issueNumber", "taskKey", "plan", "taskBranch", "baseBranch", "path", "createdAt", "lastRunId", "reviewedTaskSha"] as const)
+            .every((key) => current[key] === initial![key]) &&
+          !current.activeRunId && current.launchingAt === undefined &&
+          (!current.retry || ["integrate", "cleanup"].includes(current.retry.stage))) {
+        try {
+          // Reuse unfinished settlement verbatim. Lost comment/status responses
+          // are observed before another integration or cleanup attempt.
+          const record = current.retry?.reason.startsWith("<!-- board-agent-finalize:") ? current :
+            worktrees.update(current.itemId, (r) => ({ ...r, retry: {
+              stage: r.retry?.stage === "cleanup" ? "cleanup" : "integrate",
+              reason: `<!-- board-agent-finalize:${ticketCardKey(expected!, current)}:${encodeURIComponent(cfg.columns.done)} -->\nFinalization ${r.retry?.stage === "cleanup" ? "cleanup" : "integration"} failed: ${String(error)}\n\nIssue remains CLOSED (approval retained). Retry only integration/cleanup I/O, not a builder or review.`,
+            } }));
+          await this.settleFinalizationFailure(record);
+        } catch (settlementError) {
+          this.deps.callback(`Finalization Ready settlement pending: ${String(settlementError)}; retained retry record.`, "warn");
+        }
+      }
+      return { status: "blocked", reason: String(error) };
+    }
   }
 
   activeCount(): number {

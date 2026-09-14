@@ -1506,7 +1506,9 @@ export class BoardLoop {
     const candidates = cards.filter(
       (card) =>
         card.closed === true &&
-        (card.status ?? "").toLowerCase() === cfg.columns.done.toLowerCase() &&
+        ((card.status ?? "").toLowerCase() === cfg.columns.done.toLowerCase() ||
+          ((card.status ?? "").toLowerCase() === cfg.columns.ready.toLowerCase() &&
+            ["integrate", "cleanup"].includes(this.ticketWorktrees.read(card.itemId)?.retry?.stage ?? ""))) &&
         isTargetIssue(card, repoOwner, repoName, "Task"),
     );
     if (!candidates.length || this.foreground.signal.aborted) return;
@@ -1527,7 +1529,6 @@ export class BoardLoop {
         !refs.has(
           `refs/heads/${taskBranch(cfg.branches.task_prefix, card.number!)}`,
         ) &&
-        !this.ticketWorktrees.hasCleanupReceipt(card.itemId) &&
         !this.ticketWorktrees.read(card.itemId)?.integration &&
         !this.ticketWorktrees.read(card.itemId)?.retry
       ) {

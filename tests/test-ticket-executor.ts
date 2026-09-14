@@ -612,10 +612,9 @@ async function finalFixture(
     git(checkout, "ls-remote", "origin", `refs/heads/${branch}`).split(
       /\s+/,
     )[0];
-  const assertNoAdmissions = () => {
+  const assertNoAdmissions = (settlement = false) => {
     assert.equal(finalBoard.claims, 0);
-    assert.equal(finalBoard.releases, 0);
-    assert.equal(finalBoard.comments.size, 0);
+    if (!settlement) { assert.equal(finalBoard.releases, 0); assert.equal(finalBoard.comments.size, 0); }
     assert.equal(managers, 0);
     assert.equal(ensures, 0);
   };
@@ -668,23 +667,12 @@ async function finalFixture(
     f.store,
   );
   await loop.tickNow();
-  assert.notEqual(
-    f.tip(),
-    f.baseSha,
-    "Done + Closed must merge a local-only branch without Plan, record, worktree or AI approval",
-  );
-  assert.equal(
-    git(f.checkout, "show", "origin/main:accepted.txt"),
-    "approved exact content",
-  );
-  assert.deepEqual(await f.make().finalizeClosed(f.card), {
-    status: "skipped",
-    reason: "no local task branch",
-  });
+  assert.equal(f.tip(), f.baseSha, "A branch alone is not ownership evidence");
+  assert.equal((await f.make().finalizeClosed(f.card)).status, "blocked");
+  assert.equal(f.store.localBranchSha(f.record.taskBranch), f.taskSha);
   f.assertNoAdmissions();
-  console.log(
-    "PASS: Done + Closed finalizes a local-only branch without Plan or execution metadata",
-  );
+  await loop.stop();
+  console.log("PASS: unrecorded local-only branch is preserved without guessing ownership, invoking a builder or changing Project state");
 }
 
 {
@@ -700,7 +688,7 @@ async function finalFixture(
   mkdirSync(f.record.path);
   writeFileSync(join(f.record.path, "leftover.txt"), "do not delete\n");
   const before = f.finalBoard.all();
-  // Remote branch and stale record still exist; neither is needed to settle.
+  // Unknown leftovers and failed Git observation cannot imply successful cleanup.
   git(
     f.checkout,
     "remote",
@@ -727,21 +715,21 @@ async function finalFixture(
       f.store,
     );
     await loop.tickNow();
-    assert.deepEqual(await actual.finalizeClosed(f.card), {
-      status: "skipped",
-      reason: "no local task branch",
-    });
+    assert.equal((await actual.finalizeClosed(f.card)).status, "blocked");
+    await loop.stop();
   }
-  assert.deepEqual(f.notifications, []);
-  assert.deepEqual(f.finalBoard.all(), before);
+  assert.ok(!f.notifications.some((n) => n.message.startsWith("Finalized")));
+  assert.equal(f.finalBoard.all()[0].closed, true);
+  assert.equal(f.finalBoard.all()[0].status, cfg.columns.ready);
+  assert.equal(f.store.read(f.card.itemId)?.retry?.stage, "integrate");
   assert.equal(
     readFileSync(join(f.record.path, "leftover.txt"), "utf8"),
     "do not delete\n",
   );
   assert.ok(f.store.has(f.card.itemId));
-  f.assertNoAdmissions();
+  f.assertNoAdmissions(true);
   console.log(
-    "PASS: no local task branch settles silently offline, regardless of Plan, stale records or remote/worktree leftovers",
+    "PASS: missing local ref with unknown leftovers and unavailable remote retains closed Ready integration retry, never deletes work or invents success",
   );
 }
 
@@ -778,7 +766,7 @@ for (const strategy of ["squash", "merge"] as const) {
   );
   assert.equal(
     git(f.checkout, "show", "-s", "--format=%P", result),
-    strategy === "merge" ? `${f.baseSha} ${f.taskSha}` : f.baseSha,
+    `${f.baseSha} ${f.taskSha}`,
   );
   assert.equal(
     git(f.checkout, "show", "-s", "--format=%T", result),
@@ -803,7 +791,7 @@ for (const strategy of ["squash", "merge"] as const) {
   assert.equal(f.tip(), result);
   assert.deepEqual(await f.make().finalizeClosed(f.card), {
     status: "skipped",
-    reason: "no local task branch",
+    reason: "No recorded task work remains.",
   });
   assert.equal(
     git(
@@ -818,7 +806,7 @@ for (const strategy of ["squash", "merge"] as const) {
   );
   assert.deepEqual(f.notifications, [
     {
-      message: `Finalized #${f.card.number} "${f.card.title}" at ${result} in main. Deleted local/remote branch ${f.record.taskBranch} and removed its worktree.`,
+      message: `Finalized #${f.card.number} "${f.card.title}" at ${result} in main. Deleted local/remote branch ${f.record.taskBranch}, removed its worktree and observed Project Done.`,
       level: "info",
     },
   ]);
@@ -859,7 +847,7 @@ for (const strategy of ["squash", "merge"] as const) {
   };
   assert.deepEqual(await f.make().finalizeClosed(expected), {
     status: "blocked",
-    reason: "fresh card read failed: fresh read unavailable",
+    reason: "Error: fresh read unavailable",
   });
   f.finalBoard.getCard = fresh;
   assert.deepEqual(f.notifications, []);
@@ -868,12 +856,12 @@ for (const strategy of ["squash", "merge"] as const) {
     "PASS: finalizer fresh read rejects identity, repository, type, state drift, removal and read errors before any mutation",
   );
   f.finalBoard.cards.get(expected.itemId)!.plan = "changed-after-build";
-  assert.equal((await f.make().finalizeClosed(expected)).status, "finalized");
+  assert.equal((await f.make().finalizeClosed(expected)).status, "blocked");
   assert.equal(
     f.finalBoard.cards.get(expected.itemId)!.plan,
     "changed-after-build",
   );
-  console.log("PASS: changing Plan does not prevent closed Done finalization");
+  console.log("PASS: changed Plan/identity is preserved without technical writeback over human state");
 }
 {
   const f = await finalFixture("merge", true);
@@ -882,16 +870,12 @@ for (const strategy of ["squash", "merge"] as const) {
   git(f.record.path, "add", "local-only.txt");
   git(f.record.path, "commit", "-m", "local work after review");
   const localSha = git(f.record.path, "rev-parse", "HEAD");
-  assert.equal((await f.make().finalizeClosed(f.card)).status, "finalized");
-  assert.equal(
-    git(f.checkout, "show", "origin/main:local-only.txt"),
-    "latest local work",
-  );
-  git(f.checkout, "merge-base", "--is-ancestor", localSha, "origin/main");
-  f.assertNoAdmissions();
-  console.log(
-    "PASS: closing Done approves the current local branch, including unpushed commits after review",
-  );
+  assert.equal((await f.make().finalizeClosed(f.card)).status, "blocked");
+  assert.equal(f.tip(), f.baseSha);
+  assert.equal(f.store.localBranchSha(f.record.taskBranch), localSha);
+  assert.equal(readFileSync(join(f.record.path, "local-only.txt"), "utf8"), "latest local work\n");
+  f.assertNoAdmissions(true);
+  console.log("PASS: changed/unpushed work after pinned review is preserved and cannot be integrated or deleted as the old approved SHA");
 }
 {
   const f = await finalFixture();
@@ -950,17 +934,17 @@ for (const strategy of ["squash", "merge"] as const) {
   assert.equal(
     f.tip(),
     published,
-    "retry must not create a second squash commit",
+    "retry must not create a second integration commit",
   );
   assert.equal(f.tip(f.record.taskBranch), "");
   assert.equal(f.store.localBranchSha(f.record.taskBranch), undefined);
   assert.equal(existsSync(f.record.path), false);
   assert.deepEqual(await restarted.finalizeClosed(f.card), {
     status: "skipped",
-    reason: "no local task branch",
+    reason: "No recorded task work remains.",
   });
   assert.equal(f.notifications.length, 1);
-  f.assertNoAdmissions();
+  f.assertNoAdmissions(true);
   console.log(
     "PASS: cleanup failure retains the local retry signal; restart finishes without another merge or execution journal",
   );

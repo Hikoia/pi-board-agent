@@ -55,8 +55,11 @@ async function fixture() {
   const taskSha = git(record.path, "rev-parse", "HEAD");
   const tip = (branch = "main") =>
     git(repo, "ls-remote", "origin", `refs/heads/${branch}`).split(/\s+/)[0];
-  const finish = (strategy: "squash" | "merge" = "squash") =>
-    store.finalizeAccepted(task, strategy);
+  const finish = async (strategy: "squash" | "merge" = "squash") => {
+    const result = await store.finalizeAccepted(task, strategy);
+    if (result) await store.completeFinalization(task, async () => {});
+    return result;
+  };
   const kept = () => {
     assert.equal(tip(), baseSha);
     assert.equal(store.localBranchSha(task.taskBranch), taskSha);
@@ -109,7 +112,7 @@ async function fixture() {
   f.kept();
   rmSync(join(f.record.path, "dirty.txt"));
   git(f.repo, "worktree", "lock", f.record.path);
-  await assert.rejects(() => f.finish(), /Locked worktree/);
+  await assert.rejects(() => f.finish(), /locked/i);
   f.kept();
   git(f.repo, "worktree", "unlock", f.record.path);
   const index = git(
@@ -150,6 +153,7 @@ async function fixture() {
   writeFileSync(join(f.record.path, "shared.txt"), "task conflict\n");
   git(f.record.path, "add", ".");
   git(f.record.path, "commit", "-m", "task conflict");
+  git(f.record.path, "push", "origin", f.task.taskBranch);
   const base = f.tip();
   const local = f.store.localBranchSha(f.task.taskBranch);
   await assert.rejects(() => f.finish(), /merge-tree/);
@@ -173,12 +177,13 @@ async function fixture() {
   git(f.repo, "add", ".");
   git(f.repo, "commit", "-m", "base advances");
   git(f.repo, "push", "origin", "main");
+  await assert.rejects(f.finish(), /push/); // normal rejection prepares the next tick
   const result = await f.finish();
   assert.equal(f.tip(), result);
   assert.equal(git(f.repo, "show", "origin/main:later.txt"), "later base work");
   assert.equal(git(f.repo, "show", "origin/main:feature.txt"), "feature");
   console.log(
-    "PASS: rejected pushes retain all work; retry merges into the latest base without a journal",
+    "PASS: rejected pushes retain all work; retry merges into the latest base with the atomic integration journal",
   );
 }
 {
@@ -296,7 +301,7 @@ async function fixture() {
     `refs/heads/${f.task.taskBranch}`,
     "refs/heads/main",
   );
-  await assert.rejects(() => f.finish(), /symbolic/);
+  await assert.rejects(() => f.finish(), /symbolic|ownership/);
   assert.equal(f.tip(), f.baseSha);
   assert.throws(() => f.store.localBranchSha("-invalid"), /Invalid branch/);
   console.log(
@@ -325,10 +330,10 @@ async function fixture() {
     /pending finalization/,
   );
   assert.equal(JSON.stringify(f.store.read(f.task.itemId)), before);
-  // Legacy execution state remains protected for builders, but does not gate human-approved completion.
-  assert.ok(await f.finish());
-  assert.equal(f.store.has(f.task.itemId), false);
+  // Raw old intent cannot enter v4 finalization without stopped-owner conversion.
+  await assert.rejects(f.finish(), /stopped-owner conversion/);
+  assert.equal(JSON.stringify(f.store.read(f.task.itemId)), before);
   console.log(
-    "PASS: builder identity and legacy-journal protections remain; closed-ticket finalization needs neither",
+    "PASS: builder identity and legacy-journal protections remain; raw old intents require the stopped-owner adapter",
   );
 }
