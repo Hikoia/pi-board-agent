@@ -119,11 +119,11 @@ try {
       assert.equal(done, false); assert.ok(existsSync(owner.path));
       releaseFinish.resolve(); await start; await stopping;
       assert.equal(calls, change === 'unchanged' ? 1 : 0, 'no real Review model invocation after admission/stop closes during fetch');
-      assert.deepEqual(f.writes, change === 'unchanged' ? [f.cfg.columns.done, 'release'] : ['release']);
+      assert.deepEqual(f.writes, change === 'unchanged' ? ['comment', f.cfg.columns.done, 'release'] : ['release']);
       assert.equal(releases, 1);
       assert.equal(f.card.status, change === 'unchanged' ? f.cfg.columns.done : f.cfg.columns.review);
       assert.deepEqual(f.card.assignees, []);
-      assert.equal(f.store.read(f.task.itemId)?.reviewedTaskSha, change === 'unchanged' ? taskSha : undefined);
+      assert.equal(f.store.read(f.task.itemId)?.reviewedTaskSha, taskSha, 'a deferred review retains its original target SHA, not a success verdict');
       assert.equal(git(repo, 'for-each-ref', '--format=%(refname)', 'refs/board-agent/reviews/'), '');
       assert.equal(git(repo, 'worktree', 'list', '--porcelain').includes('review-'), false);
       assert.equal(readdirSync(join(repo, '.pi', 'worktrees')).some(name => name.startsWith('review-')), false);

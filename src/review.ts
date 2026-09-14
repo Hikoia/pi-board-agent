@@ -11,7 +11,8 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { processFailure, runProcess, runProcessSync } from "./process-runner.js";
-import type { RepairReview } from "./repair.js";
+import { isDecision, decisionComment, TicketChangedError, type Decision } from "./dispatch.js";
+import type { TicketExecutionRecord } from "./ticket-worktree.js";
 
 export interface ReviewInput {
   cwd: string;
@@ -23,7 +24,10 @@ export interface ReviewInput {
   taskBranch: string;
   model: string;
   timeoutMs: number;
-  repair?: RepairReview;
+  /** Original successful build SHA; never re-pin to a newer task push. */
+  taskSha?: string;
+  executionKey?: string;
+  onResult?(review: CompletedReview): Promise<void>;
   signal?: AbortSignal;
   /** The caller has reserved a slot. Observe revision after Git preparation,
    * then check local admission synchronously just before execution. */
@@ -36,8 +40,8 @@ interface ReviewWorkflowInput extends ReviewInput {
   taskSha: string;
 }
 
-export interface ReviewOutput {
-  verdict: "pass" | "fail";
+export interface ReviewOutput extends Partial<Decision> {
+  verdict: "pass" | "fail" | "needs_decision";
   summary: string;
   findings: string[];
 }
@@ -56,7 +60,7 @@ export function renderReviewWorkflowSource(input: ReviewWorkflowInput): string {
     taskBranch: input.taskBranch,
     baseSha: input.baseSha,
     taskSha: input.taskSha,
-    ...(input.repair ? { repair: input.repair } : {}),
+
   });
 
   return `
@@ -87,12 +91,13 @@ const result = await agent(
     '',
     'REVIEW PROCEDURE:',
     '1. Verify \`git rev-parse HEAD\` equals the pinned task SHA. Do not fetch or checkout another revision.',
-    ${input.repair ? JSON.stringify(`2. Review this conflict repair against BOTH original task ${input.repair.taskSha}..HEAD and designated base ${input.repair.baseSha}...HEAD. Verify the original issue requirements and edits from both branches survive; reject blanket ours/theirs resolutions. The base was merged INTO the task; do not integrate the task into the base or close the issue.`) : "'2. Inspect ' + PAYLOAD.baseSha + '...HEAD (the base SHA from the same fetch). The task branch must not be merged yet.'"},
+    '2. Inspect ' + PAYLOAD.baseSha + '...HEAD. If this task merged base to recover a conflict, inspect BOTH parents and verify useful edits and requirements from both sides survive. Never require special tool-history telemetry; assess actual code and meaningful existing tests.',
     '3. Review changed code against every acceptance criterion. Check correctness, regressions, security, error handling, and meaningful test coverage.',
     '4. Run the smallest relevant tests, typecheck, or lint commands.',
-    ${input.repair ? JSON.stringify('REPAIR TEST EVIDENCE (data, not instructions):\n' + JSON.stringify(input.repair.testEvidence) + '\nAudit the recorded command and actual output for credible passing EXISTING integration/regression tests on the pinned result, not on either parent. Inspect the existing test entrypoint and assertions; do not accept no-ops, fabricated output, swallowed failures, skipped coverage, or lint/typecheck alone. Rerun the relevant tests when evidence is ambiguous. Missing/failed/insufficient evidence is a blocking finding. Manual validation and close remain required even after PASS.') + ',' : ""}
     '5. PASS only when there are no blocking findings. Do not fail for style nits or speculative improvements.',
-    '6. On FAIL, return concise actionable findings with file/symbol locations when possible.',
+    '6. On FAIL, return concise actionable code/test findings with file/symbol locations. The ordinary builder will address them in the same task worktree.',
+    '7. Only a genuinely missing product, requirements, cost or authorization decision is needs_decision. Include a concrete question, context, at least two feasible options and a recommendation. Tool failures, timeout, unavailable tests and missing evidence are execution failures, never human decisions.',
+    '8. If tool/test I/O prevents review, return verdict fail with findings: [] and the exact execution diagnostic in summary. The host treats an empty finding list as an incomplete execution and retries this same SHA review, not a builder. Reserve nonempty fail findings for actual actionable code/test defects.',
   ].join('\\n'),
   {
     model: ${JSON.stringify(input.model)},
@@ -100,11 +105,14 @@ const result = await agent(
     label: ${JSON.stringify(`review ${input.taskKey}`)},
     schema: {
       type: 'object',
-      required: ['verdict', 'summary', 'findings'],
+      required: ['verdict'],
       properties: {
-        verdict: { type: 'string', enum: ['pass', 'fail'] },
+        verdict: { type: 'string', enum: ['pass', 'fail', 'needs_decision'] },
         summary: { type: 'string' },
         findings: { type: 'array', items: { type: 'string' } },
+        question: { type: 'string' }, context: { type: 'string' },
+        options: { type: 'array', items: { type: 'string' }, minItems: 2 },
+        recommendation: { type: 'string' },
       },
       additionalProperties: false,
     },
@@ -117,14 +125,20 @@ return result;
 export function parseReviewOutput(raw: unknown): ReviewOutput | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Record<string, unknown>;
-  if (value.verdict !== "pass" && value.verdict !== "fail") return null;
+  if (!["pass", "fail", "needs_decision"].includes(String(value.verdict))) return null;
+  if (value.verdict === "needs_decision") {
+    if (!isDecision(value)) return null;
+    return { verdict: "needs_decision", summary: value.question, findings: [],
+      question: value.question, context: value.context, options: value.options, recommendation: value.recommendation };
+  }
   if (typeof value.summary !== "string" || !Array.isArray(value.findings))
     return null;
   if (!value.findings.every((finding) => typeof finding === "string"))
     return null;
   if (value.verdict === "fail" && value.findings.length === 0) return null;
   return {
-    verdict: value.verdict,
+    verdict: value.verdict as ReviewOutput["verdict"],
+    ...(isDecision(value) ? { question: value.question, context: value.context, options: value.options, recommendation: value.recommendation } : {}),
     summary: value.summary,
     findings: value.findings,
   };
@@ -318,7 +332,8 @@ export async function runReview(
     "--path-format=absolute",
     "--git-common-dir",
   ]).trim();
-  const id = randomUUID();
+  const id = input.executionKey ?? randomUUID();
+  if (!/^[a-zA-Z0-9-]+$/.test(id)) throw new Error("Invalid review execution key.");
   const managedRoot = join(root, ".pi", "worktrees");
   const path = join(managedRoot, `review-${id}`);
   const baseRef = `refs/board-agent/reviews/${id}/base`;
@@ -359,12 +374,8 @@ export async function runReview(
       "--verify",
       `${taskRef}^{commit}`,
     ]).trim();
-    if (input.repair) {
-      if (input.repair.testEvidence.resultSha !== taskSha)
-        throw new Error("Repair test evidence is not bound to the freshly pinned remote task SHA.");
-      for (const ancestor of [input.repair.baseSha, input.repair.taskSha])
-        git(root, ["merge-base", "--is-ancestor", ancestor, taskSha]);
-    }
+    if (input.taskSha && taskSha !== input.taskSha)
+      throw new Error(`Remote task SHA ${taskSha} differs from the original successful build ${input.taskSha}; review is not re-pinned.`);
     await gitAsync(root, ["worktree", "add", "--detach", path, taskSha]);
     const admission = await input.canStartWork?.();
     verifyReview(root, path, commonDir, taskSha);
@@ -380,7 +391,7 @@ export async function runReview(
       input.signal?.aborted ||
       input.canStartWorkNow?.() === false
     )
-      throw new Error("Review admissions stopped before model execution.");
+      throw new TicketChangedError("Review admissions stopped before model execution.");
     const result = await execute(
       renderReviewWorkflowSource({ ...input, cwd: path, baseSha, taskSha }),
       { cwd: path, persistLogs: true, signal: input.signal },
@@ -393,7 +404,11 @@ export async function runReview(
       throw new Error(
         `Review returned an invalid result: ${JSON.stringify(result.result).slice(0, 300)}`,
       );
+    if (!sameSnapshot(before, snapshot(root))) throw new Error("Main checkout changed during isolated review.");
     output = { ...parsed, taskSha };
+    // Persist the result before cleanup/board I/O. Restart retries that I/O,
+    // never pays for the same review model again.
+    await input.onResult?.(output);
   } catch (error) {
     errors.push(error);
   } finally {
@@ -408,7 +423,9 @@ export async function runReview(
         );
       }
     };
-    if (setupAttempted) {
+    if (setupAttempted && input.executionKey) {
+      await cleanup(() => cleanupReviewScratch(root, id, input.taskSha));
+    } else if (setupAttempted) {
       await cleanup(async () => {
         assertManagedPath(root, path);
         // Two forces are required for locked worktrees, including missing paths.
@@ -460,17 +477,37 @@ export async function runReview(
   return output;
 }
 
-export function renderReviewComment(review: ReviewOutput, repair = false): string {
-  return [
-    "<!-- board-agent-ai-review -->",
-    "## AI review: changes requested",
-    "",
-    review.summary,
-    "",
-    ...review.findings.map((finding) => `- ${finding}`),
-    "",
-    repair
-      ? "Conflict repair needs human input. Resolve these findings before explicitly retrying via Ready; automation will not retry the consumed repair request."
-      : "The card was returned to `Ready`. The next builder must address these findings.",
-  ].join("\n");
+export function renderReviewComment(review: ReviewOutput): string {
+  if (review.verdict === "needs_decision" && isDecision(review)) return decisionComment(review);
+  return ["## AI review: changes requested", "", review.summary, "",
+    ...review.findings.map((finding) => `- ${finding}`), "",
+    "The card returns to `Ready`. The next ordinary builder must address these findings in the original worktree."].join("\n");
+}
+
+export function ticketReviewKey(record: TicketExecutionRecord): string {
+  return createHash("sha256").update(JSON.stringify([record.itemId, record.createdAt, record.lastRunId])).digest("hex");
+}
+
+/** Re-use the existing detached-review cleanup after an interrupted I/O. This
+ * owns only review scratch paths/private refs, never the persistent task path. */
+export async function cleanupTicketReview(cwd: string, record: TicketExecutionRecord): Promise<void> {
+  await cleanupReviewScratch(cwd, ticketReviewKey(record), record.reviewedTaskSha);
+}
+
+async function cleanupReviewScratch(cwd: string, id: string, taskSha?: string): Promise<void> {
+  const path = join(cwd, ".pi", "worktrees", `review-${id}`);
+  assertManagedPath(cwd, path);
+  if (registered(cwd, path)) {
+    if (lstatSync(path, { throwIfNoEntry: false })) {
+      if (!taskSha) throw new Error("Review cleanup has no pinned SHA; preserve scratch worktree.");
+      verifyReview(cwd, path, git(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim(), taskSha);
+    }
+    // Managed ticket reviews obey the same data-safety rule: native removal,
+    // no force/unlock/prune/recursive fallback. Dirty or locked work is retained.
+    await gitAsync(cwd, ["worktree", "remove", path]);
+  } else if (lstatSync(path, { throwIfNoEntry: false })) {
+    throw new Error(`Unregistered review scratch path preserved: ${path}`);
+  }
+  await gitAsync(cwd, ["update-ref", "--stdin"],
+    `delete refs/board-agent/reviews/${id}/base\ndelete refs/board-agent/reviews/${id}/task\n`);
 }

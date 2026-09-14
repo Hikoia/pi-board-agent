@@ -5,10 +5,8 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import {
   createRunPersistence,
-  compactAgentHistory,
   type WorkflowManagerOptions,
 } from "@quintinshaw/pi-dynamic-workflows";
-import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { _DEFAULTS } from "../src/config.js";
 import type { Card, IssueComment } from "../src/gh.js";
 import { BoardLoop, createLoopState, type LoopDeps } from "../src/loop.js";
@@ -125,7 +123,9 @@ export async function fixture(conflict = true) {
       io(`status:${status}`, () => {
         cards.find((c) => c.itemId === id)!.status = status;
       }),
-    listComments: async () => comments.map((c) => c.body),
+    listComments: async () => structuredClone(comments),
+    missionComments: async () => structuredClone(comments),
+    reopen: async () => io("reopen", () => { card.closed = false; }),
     comment: async (_card, body) =>
       io("ordinary-comment", () => {
         comments.push({
@@ -160,21 +160,11 @@ export async function fixture(conflict = true) {
       );
       return id;
     },
-    updateComment: async (_card: Card, id: string, body: string) =>
-      io(
-        body.includes('"phase":"consumed"')
-          ? "consume-comment"
-          : "queue-comment",
-        () => {
-          comments.find((c) => c.id === id)!.body = body;
-        },
-      ),
     reopen: async () =>
       io("reopen", () => {
         card.closed = false;
       }),
   };
-  Object.assign(board, { conflict: conflictOps });
   type Agent = NonNullable<WorkflowManagerOptions["agent"]>;
   type Builder = (...args: Parameters<Agent["run"]>) => Promise<unknown>;
   let builder: Builder = async () => ({
@@ -321,65 +311,4 @@ export async function settle(f: Awaited<ReturnType<typeof fixture>>) {
     await new Promise((r) => setTimeout(r, 20));
   }
   throw new Error("Workflow did not settle (not a pass)");
-}
-
-export async function repairResult(
-  f: Awaited<ReturnType<typeof fixture>>,
-  prompt: string,
-  options: Parameters<NonNullable<WorkflowManagerOptions["agent"]>["run"]>[1],
-) {
-  let sha = "";
-  assert.ok(prompt.includes(f.card.body));
-  assert.ok(prompt.includes(f.baseSha));
-  assert.ok(prompt.includes(f.taskSha));
-  assert.throws(() => git(f.record.path, "merge", "--no-edit", f.baseSha));
-  writeFileSync(
-    join(f.record.path, "value.json"),
-    '{"task":true,"base":true}\n',
-  );
-  git(f.record.path, "add", ".");
-  git(f.record.path, "commit", "-m", "resolve retaining both requirements");
-  sha = git(f.record.path, "rev-parse", "HEAD");
-  const command = `set -euo pipefail
-export GIT_NO_REPLACE_OBJECTS=1
-head=$(git rev-parse HEAD)
-status=$(git status --porcelain=v1 --untracked-files=all)
-test "$head" = '${sha}'
-test -z "$status"
-printf '%s\\n' 'BOARD_AGENT_REPAIR_TEST_BEGIN ${sha}'
-(
-node test.cjs
-)
-head=$(git rev-parse HEAD)
-status=$(git status --porcelain=v1 --untracked-files=all)
-test "$head" = '${sha}'
-test -z "$status"
-printf '%s\\n' 'BOARD_AGENT_REPAIR_TEST_PASS ${sha}'`;
-  const result = await createBashTool(f.record.path).execute(
-    "test",
-    { command },
-    options?.signal,
-  );
-  options?.onHistory?.(
-    compactAgentHistory([
-      {
-        role: "assistant",
-        content: [{ type: "toolCall", name: "bash", arguments: { command } }],
-      },
-      {
-        role: "toolResult",
-        toolName: "bash",
-        isError: false,
-        content: result.content,
-      },
-    ]),
-  );
-  git(f.record.path, "push", "origin", f.task.taskBranch);
-  return {
-    taskKey: f.task.taskKey,
-    itemId: f.task.itemId,
-    branch: f.task.taskBranch,
-    status: "success",
-    testEvidence: { resultSha: sha, command: "node test.cjs" },
-  };
 }

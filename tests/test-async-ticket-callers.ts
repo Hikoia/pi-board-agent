@@ -92,7 +92,7 @@ for (const change of ["unchanged", "revision", "human", "contract", "stop"]) {
       assert.deepEqual(f.card.assignees, []);
       assert.equal(f.card.status, change === "human" ? cfg.columns.needs_human : cfg.columns.ready);
       if (change === "contract" || change === "human") assert.deepEqual(f.writes, ["release"], "async preparation cannot overwrite a later human contract/state");
-      assert.equal(f.writes.includes("comment"), false);
+      assert.equal(f.writes.includes("comment"), change === "revision" || change === "stop");
     }
     console.log(`PASS: async ensure ${change} is awaited before actual-start fresh-card/revision/stop gates and recovery`);
   } finally {
@@ -114,27 +114,20 @@ for (const delta of [false, true]) {
   f.store.beginLaunch(f.card.itemId);
   const launchRecord = f.store.read(f.card.itemId);
   f.card.status = cfg.columns.building; f.card.assignees = ["bot"];
-  const entered = deferred(), finish = deferred(), hasTaskDelta = f.store.hasTaskDelta.bind(f.store);
-  f.store.hasTaskDelta = async (...args) => {
-    const value = await hasTaskDelta(...args);
-    assert.equal(value, delta);
-    entered.resolve(); await finish.promise;
-    return value;
-  };
-  const recovering = f.executor.reconcile([structuredClone(f.card)]);
+  f.store.hasTaskDelta = async () => { throw new Error("Retired delta heuristic must not authorize a builder."); };
   try {
-    await Promise.race([entered.promise, recovering.then(() => { throw new Error("recovery settled before delta observation"); })]);
+    const summary = await f.executor.reconcile([structuredClone(f.card)]);
+    assert.equal(summary.errors, 1);
+    assert.equal(summary.needsHuman, 0);
     assert.deepEqual(f.writes, []);
-    assert.deepEqual(f.store.read(f.card.itemId), launchRecord, "pending fetch preserves exact crash evidence");
-    finish.resolve();
-    const summary = await recovering;
-    assert.equal(summary.errors, 0);
-    assert.equal(summary.needsHuman, delta ? 1 : 0);
-    assert.equal(f.card.status, delta ? cfg.columns.needs_human : cfg.columns.ready);
+    assert.equal(f.card.status, cfg.columns.building);
     assert.ok(existsSync(record.path));
-    assert.equal(f.store.read(f.card.itemId)?.launchingAt, undefined);
-    console.log(`PASS: crash recovery awaits hasTaskDelta=${delta} before returning Ready or quarantining local work`);
-  } finally { finish.resolve(); await recovering; await f.loop.stop(); }
+    assert.equal(f.store.read(f.card.itemId)?.launchingAt, launchRecord?.launchingAt);
+    assert.equal(f.store.read(f.card.itemId)?.retry?.stage, "build");
+    assert.equal((await f.executor.launch(f.card, "demo")).status, "skipped");
+    console.log(`PASS: launch-window observation retains delta=${delta} work without guessing a new builder or Needs Human from Git delta`);
+  } finally { await f.loop.stop(); f.store.clearExecution(f.card.itemId); }
+
 }
 
 {

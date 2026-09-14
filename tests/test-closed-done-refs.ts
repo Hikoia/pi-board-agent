@@ -293,13 +293,16 @@ try {
     try {
       for (let tick = 1; tick <= 2; tick++) {
         await f.loop.tickNow();
-        assert.equal(refQueries(), tick);
+        assert.equal(refQueries(), 0, "a ticket handled during recovery cannot enter finalization in the same tick");
         assert.equal(f.reads.length, tick, "no-branch filter must NOT skip reconcile's fresh read of unsettled records");
-        assert.equal(releases, tick, "unsettled release is retried, not silently completed");
-        assert.deepEqual(f.store.read(record.itemId), before, "failed release retains exact recovery evidence");
+        assert.equal(releases, 0, "missing journal cannot prove lease drain or authorize a release");
+        const after = f.store.read(record.itemId)!;
+        assert.deepEqual({ ...after, retry: undefined }, { ...before, retry: undefined }, "observation retains the original association and recovery evidence");
+        assert.equal(after.retry?.stage, "build");
+        assert.equal(f.executor.activeCount(), 1, "unknown original execution still occupies its slot");
       }
       assert.equal(f.tip(), f.base);
-      console.log("PASS: no-branch unsettled records still get fresh reconcile reads/retries and retain recovery evidence");
+      console.log("PASS: no-branch unsettled records still get fresh reads and retain journal/slot evidence; never settle an unknown lease or process the ticket twice/tick");
     } finally { await f.loop.stop(); }
   }
 } finally {

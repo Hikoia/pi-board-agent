@@ -77,9 +77,11 @@ try {
     if (mode === "review") {
       const dir = join(cwd, ".pi", "board-agent", "ticket-worktrees");
       mkdirSync(dir, { recursive: true });
+      const path = join(cwd, ".pi", "worktrees", "ticket-issue-3-pvti_3");
+      git("worktree", "add", path, "task/issue-3");
       writeFileSync(join(dir, "pvti_3.json"), JSON.stringify({
-        schemaVersion: 3, itemId: card.itemId, issueNumber: 3, taskKey: "T003", plan: "demo",
-        taskBranch: "task/issue-3", baseBranch: "main", path: join(cwd, ".pi", "worktrees", "pvti_3"), createdAt: 1,
+        schemaVersion: 4, itemId: card.itemId, issueNumber: 3, taskKey: "T003", plan: "demo",
+        taskBranch: "task/issue-3", baseBranch: "main", path, createdAt: 1, reviewedTaskSha: sha,
       }));
     }
     if (mode.startsWith("watch-"))

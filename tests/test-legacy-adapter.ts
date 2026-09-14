@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { createRunPersistence, type PersistedRunState } from "@quintinshaw/pi-dynamic-workflows";
 import { _DEFAULTS } from "../src/config.js";
-import type { Card } from "../src/gh.js";
+import type { Card, IssueComment } from "../src/gh.js";
 
 import type { TicketBoardAdapter, TicketWorkflowManager } from "../src/ticket-executor.js";
 import type { LegacyRepair } from "../src/legacy-adapter.js";
@@ -28,6 +28,7 @@ async function setup() {
   const cards = new Map([[card.itemId, card]]);
   const comments = new Map([[card.itemId, ["Original question: which region?", "Maintainer: EU."]]]);
   const writes: string[] = [], notices: string[] = [];
+  const legacyComments: IssueComment[] = [];
   const counts = { starts: 0, resumes: 0, stops: 0 };
   const board: TicketBoardAdapter = {
     getCard: async (id) => cards.has(id) ? structuredClone(cards.get(id)!) : undefined,
@@ -35,6 +36,8 @@ async function setup() {
     claim: async (c) => { writes.push(`claim:${c.itemId}`); cards.get(c.itemId)!.assignees = ["bot"]; return true; },
     release: async (c) => { writes.push(`release:${c.itemId}`); cards.get(c.itemId)!.assignees = []; },
     listComments: async (c) => comments.get(c.itemId) ?? [],
+    missionComments: async () => structuredClone(legacyComments),
+    reopen: async () => { card.closed = false; },
     comment: async (c, body) => { writes.push(`comment:${c.itemId}`); comments.get(c.itemId)!.push(body); },
   };
   const ownerLock = acquireOwnerLock(f.repo, "bot", f.repo, true);
@@ -65,6 +68,8 @@ async function setup() {
       step, attempted: false, commentId: "comment-1", runId, notice: null };
     const dir = join(f.repo, ".pi/board-agent/repair"); mkdirSync(dir, { recursive: true });
     const path = join(dir, `${request.requestKey}.json`); json(path, h);
+    legacyComments.push({ id: h.commentId!, author: "bot", createdAt: "", body:
+      `<!-- board-agent-conflict-repair:v1:${request.requestKey} -->\n${JSON.stringify({ ...request, itemId: card.itemId, phase: "queued" })}` });
     return { path, h, request };
   };
   return { ...f, original, card, cards, comments, writes, notices, counts, board, ownerLock, make, all, saveRun, repair };
@@ -121,13 +126,13 @@ try {
   for (const step of ["queued", "consume", "launching", "consumed"] as const) {
     const f = await setup(); f.card.status = cfg.columns.ready; f.card.assignees = [];
     const r = f.repair(step), before = bytes(r.path);
-    const executor = f.make(); await executor.reconcile(f.all());
+    const executor = f.make(); const reconciled = await executor.reconcile(f.all());
+    assert.equal(reconciled.errors, 0, f.notices.join("\n"));
     const migrated = f.store.read(f.card.itemId)!;
     assert.equal(migrated.schemaVersion, 4, f.notices.join("\n"));
     assert.equal(migrated.retry?.stage, "build");
     assert.ok(migrated.retry?.reason.includes(f.card.body));
     assert.ok(migrated.retry?.reason.includes(f.base));
-    assert.equal(await executor.repairFor(f.card), undefined);
     assert.equal((await executor.launch(f.card, "demo")).status, "launched");
     const run = createRunPersistence(f.record.path).load(f.store.read(f.card.itemId)!.activeRunId!)!;
     assert.equal((run.args as any).repair, undefined); assert.ok(run.script.includes("Original requirements"));
@@ -135,6 +140,26 @@ try {
     assert.equal(f.counts.starts, 1); assert.deepEqual(bytes(r.path), before);
     f.ownerLock.release();
     console.log(`PASS: unlaunched ${step} repair is ordinary build retry with original requirements/diagnostics; ledger remains byte-identical`);
+  }
+
+  {
+    const f = await setup(); f.card.status = cfg.columns.ready; f.card.closed = true; f.card.assignees = [];
+    const r = f.repair("reopen"), before = bytes(r.path);
+    const read = f.board.missionComments!;
+    f.board.missionComments = async () => [];
+    const executor = f.make();
+    assert.equal((await executor.reconcile(f.all())).errors, 1);
+    assert.equal((await executor.launch(f.card, "demo")).status, "skipped");
+    assert.equal(f.counts.starts, 0); assert.equal(f.card.closed, true);
+    f.board.missionComments = read;
+    assert.equal((await executor.reconcile(f.all())).errors, 0, f.notices.join("\n"));
+    assert.equal(f.card.closed, false); assert.equal(f.card.status, cfg.columns.ready);
+    assert.deepEqual(f.card.assignees, []);
+    assert.equal(f.counts.starts, 0, "legacy settlement cannot launch a builder in the same tick");
+    assert.equal((await executor.launch(f.card, "demo")).status, "launched");
+    assert.deepEqual(bytes(r.path), before);
+    f.ownerLock.release();
+    console.log("PASS: incomplete legacy comment/reopen blocks direct admission; fresh authentic evidence settles ordinary Ready before launch without ledger writes");
   }
 
   {

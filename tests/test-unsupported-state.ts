@@ -222,7 +222,6 @@ try {
     "unsupported-state.ts",
     "ticket-worktree.ts",
     "cleanup-snapshot.ts",
-    "repair.ts",
     "dispatch.ts",
     "process-runner.ts",
   ]) {

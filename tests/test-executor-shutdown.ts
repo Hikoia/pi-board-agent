@@ -22,13 +22,18 @@ const deps: LoopDeps = {
 };
 const recordDir = join(cwd, ".pi", "board-agent", "ticket-worktrees");
 mkdirSync(recordDir, { recursive: true });
-// Public activeCount opens the real executor manager map for durable records.
-// Manager I/O is the offline seam; no private map mutation or fake shutdown.
+// Public activeCount opens managers only for owned worktrees. Keep the actual
+// safety gate in this shutdown fixture; nonexistent/external paths are not authority.
+const setupGit = (...args: string[]) => execFileSync("git", args, { cwd, stdio: "ignore" });
+setupGit("config", "user.name", "Offline"); setupGit("config", "user.email", "offline@example.test");
+setupGit("commit", "--allow-empty", "-m", "owned worktree fixture");
 for (const number of [1, 2]) {
+  const path = join(cwd, ".pi", "worktrees", `ticket-issue-${number}-pvti_${number}`);
+  setupGit("worktree", "add", "-b", `task/issue-${number}`, path, "main");
   writeFileSync(join(recordDir, `pvti_${number}.json`), JSON.stringify({
     schemaVersion: 3, itemId: `PVTI_${number}`, issueNumber: number,
     taskKey: `T00${number}`, plan: "demo", taskBranch: `task/issue-${number}`,
-    baseBranch: "main", path: join(cwd, ".pi", "worktrees", `pvti_${number}`),
+    baseBranch: "main", path,
     createdAt: 1, activeRunId: `run-${number}`, activeRunStartedAt: 1,
   }));
 }

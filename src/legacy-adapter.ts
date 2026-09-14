@@ -6,7 +6,7 @@ import { createRunPersistence, type PersistedRunState } from "@quintinshaw/pi-dy
 import { exactKeys, verifySnapshot, verifyBackupSnapshots } from "./cleanup-snapshot.js";
 import { planSlug } from "./config.js";
 import { isTargetIssue, type Card } from "./gh.js";
-import { isRepairRequest, type RepairRequest } from "./repair.js";
+
 import { isTicketExecutionRecord, type TicketExecutionRecord, type TicketIntegrationState } from "./ticket-worktree.js";
 import type { TicketExecutorDeps } from "./ticket-executor.js";
 import { GIT_GH_TIMEOUT_MS, processFailure, runProcess } from "./process-runner.js";
@@ -27,6 +27,8 @@ export function legacyRegular(path: string): Buffer {
   }
   return readFileSync(path);
 }
+
+export interface RepairRequest { requestKey: string; baseSha: string; taskSha: string; }
 
 export type LegacyRepairStep =
   | "comment"
@@ -69,7 +71,7 @@ export const conflictRequestKey = (
   taskSha: string,
 ) => `conflict-${hash(JSON.stringify([itemId, baseSha, taskSha]))}`;
 
-/** Shared read-only validator; the old writer is removed by T003. */
+/** Read-only compatibility validator; new execution never writes this format. */
 export function readLegacyRepair(path: string): LegacyRepair {
     const key = path.replaceAll("\\", "/").split("/").at(-1)!.slice(0, -5);
     let h: LegacyRepair;
@@ -188,7 +190,6 @@ export class LegacyTicketAdapter {
   authorityHeld(): boolean {
     try { this.assertOwner(); return true; } catch { return false; }
   }
-  ignoresRepairFile(path: string): boolean { return this.repairFiles.has(path); }
   owns(itemId: string): boolean {
     return this.deps.worktrees.hasLegacyBackup(itemId) ||
       this.repairs.some((h) => h.card.itemId === itemId) ||
@@ -402,6 +403,32 @@ export class LegacyTicketAdapter {
     }));
   }
 
+  /** Only the old input is consulted. New execution never mutates its ledger. */
+  async assertRetryCard(record: TicketExecutionRecord, card: Card): Promise<void> {
+    const h = this.repairs.find((r) => r.card.itemId === record.itemId && !r.runId);
+    if (!h || !card || !Object.entries(h.card).every(([k, v]) => (card as any)[k] === v) ||
+      ![this.deps.cfg.columns.ready, this.deps.cfg.columns.done].includes(card.status ?? "") ||
+      (card.status === this.deps.cfg.columns.done && !card.closed) ||
+      card.assignees.some((a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase()))
+      throw new Error("Legacy retry identity/claim/lane changed; preserve the original evidence.");
+    this.assertOwner();
+    if (h.notice?.id || h.commentId) {
+      const comments = await (this.deps.board.missionComments?.(card));
+      const authentic = (id: string | null | undefined) => comments?.find((c) => c.id === id &&
+        c.author?.toLowerCase() === this.deps.botLogin.toLowerCase());
+      if (h.commentId) {
+        const comment = authentic(h.commentId);
+        if (!comment?.body.startsWith(`<!-- board-agent-conflict-repair:v1:${h.request.requestKey} -->\n`))
+          throw new Error("Legacy attempted comment is not confirmed; retry observation before launching.");
+        const payload = JSON.parse(comment.body.split("\n").slice(1).join("\n"));
+        if (payload.itemId !== record.itemId || Object.entries(h.request).some(([k, v]) => payload[k] !== v))
+          throw new Error("Legacy comment identity changed; retry remains blocked.");
+      }
+      if (h.notice?.id && authentic(h.notice.id)?.body !== h.notice.body)
+        throw new Error("Legacy terminal notice is not confirmed; preserve the unfinished settlement.");
+    }
+  }
+
   runs(record: TicketExecutionRecord): PersistedRunState[] {
     const check = this.deps.worktrees.check(record, false);
     if (!check.ok) throw new Error(check.reason);
@@ -445,24 +472,13 @@ export class LegacyTicketAdapter {
       !fresh.closed && fresh.status === expected.status && fresh.assignees.length === 1 &&
       fresh.assignees[0].toLowerCase() === this.deps.botLogin.toLowerCase() ? fresh : undefined;
   }
-  // Old ledgers are inputs, never a new settlement protocol. T003 owns result
-  // classification/settlement; keep the existing run's script and args intact.
-  bind(_record: TicketExecutionRecord, _runId: string, _args: unknown): void {}
-  abandon(_record: TicketExecutionRecord): void {}
-  isUnstarted(_record: TicketExecutionRecord): boolean { return false; }
-  async terminalNotice(record: TicketExecutionRecord, card: Card, body: string): Promise<boolean> {
-    const h = this.repairs.find((r) => r.card.itemId === record.itemId && r.runId === record.activeRunId);
-    if (!h?.notice) return false;
-    if (h.notice.body !== body) throw new Error("Legacy terminal notice changed; preserve pending settlement.");
-    const comments = await this.deps.board.conflict?.listComments(card);
-    if (!comments || comments.filter((c) => c.body === body &&
-        c.author?.toLowerCase() === this.deps.botLogin.toLowerCase() &&
-        (!h.notice!.id || h.notice!.id === c.id)).length !== 1)
-      throw new Error("Legacy attempted terminal notice not confirmed; never create a duplicate.");
-    return true;
-  }
-  async assertSettlement(record: TicketExecutionRecord, card: Card): Promise<void> {
-    if (!(await this.executionCard(record, card))) throw new Error("Legacy settlement authority changed.");
-  }
-
+}
+/** Read-only legacy workflow argument validation. New runs never receive repair args. */
+export function isRepairRequest(value: unknown): value is RepairRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const r = value as Record<string, unknown>;
+  return Object.keys(r).length === 3 &&
+    typeof r.requestKey === "string" && /^[a-zA-Z0-9._:-]{1,200}$/.test(r.requestKey) &&
+    typeof r.baseSha === "string" && /^[0-9a-f]{40}$/.test(r.baseSha) &&
+    typeof r.taskSha === "string" && /^[0-9a-f]{40}$/.test(r.taskSha);
 }

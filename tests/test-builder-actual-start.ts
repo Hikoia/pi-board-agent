@@ -317,7 +317,8 @@ async function check(change: string, patch?: Partial<Card>) {
     } else if (change.startsWith("revision")) {
       assert.equal(loop.isAdmittingNewWork(), false);
       assert.equal(card!.status, cfg.columns.ready);
-      assert.deepEqual(writes, [cfg.columns.ready]);
+      assert.deepEqual(writes, ["comment", cfg.columns.ready]);
+      assert.equal(worktrees.read(original.itemId)?.retry?.stage, "build");
       assert.equal(releases.length, 1);
       assert.deepEqual(card!.assignees, []);
       assert.equal(worktrees.read(original.itemId)?.launchingAt, undefined);
@@ -439,6 +440,7 @@ async function check(change: string, patch?: Partial<Card>) {
     await loop.stop();
     // Reuse only the disposable fixture's persistent worktree across scenarios.
     worktrees.clearExecution(original.itemId);
+    worktrees.update(original.itemId, (record) => ({ ...record, retry: undefined })); // independent fixture case, not production settlement
     writeFileSync(settingsPath, JSON.stringify({ packages: [`${BOARD_AGENT_SOURCE}@${packageSha}`] }));
     if (change.includes("async")) {
       packageGit("reset", "--hard", packageSha);

@@ -71,6 +71,15 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
               : cfg.columns.ready,
       }),
     );
+  const reviewPath = join(cwd, ".pi", "worktrees", "ticket-issue-103-item_103");
+  let reviewSha: string | undefined;
+  if (lanes.includes("review")) {
+    const git = (...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    git("init", "-b", "main"); git("config", "user.name", "Offline"); git("config", "user.email", "offline@example.test");
+    git("commit", "--allow-empty", "-m", "capacity fixture");
+    git("worktree", "add", "-b", "task/issue-103", reviewPath, "main");
+    reviewSha = git("rev-parse", "HEAD");
+  }
   const worktrees = new TicketWorktrees(cwd);
   if (lanes.includes("review")) {
     const dir = join(cwd, ".pi", "board-agent", "ticket-worktrees");
@@ -78,14 +87,15 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
     writeFileSync(
       join(dir, "item_103.json"),
       JSON.stringify({
-        schemaVersion: 3,
+        schemaVersion: 4,
         itemId: "ITEM_103",
         issueNumber: 103,
         taskKey: "T103",
         plan: "demo",
         taskBranch: "task/issue-103",
         baseBranch: "main",
-        path: join(cwd, ".pi", "worktrees", "item_103"),
+        path: reviewPath,
+        reviewedTaskSha: reviewSha,
         createdAt: 1,
       }),
     );

@@ -86,8 +86,8 @@ try {
       assert.deepEqual(f.store.read(f.task.itemId), evidence, 'failed prepare never deletes uncertain recovery evidence');
       if (evidence) assert.ok(existsSync(evidence.path));
       if (change === 'unchanged' || change === 'release-error') {
-        assert.equal(f.card.status, f.cfg.columns.needs_human);
-        assert.deepEqual(f.writes, ['comment', f.cfg.columns.needs_human, 'release']);
+        assert.equal(f.card.status, f.cfg.columns.ready, 'technical preparation failure is never a human decision');
+        assert.deepEqual(f.writes, ['release'], 'no verified record means no fabricated retry ownership or fallback status');
         if (change === 'release-error') {
           assert.match(error?.message ?? '', /release unavailable/);
           assert.deepEqual(f.card.assignees, ['bot']);

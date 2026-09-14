@@ -1,4 +1,5 @@
-import { LegacyTicketAdapter } from "./legacy-adapter.js";
+import { LegacyTicketAdapter, isRepairRequest } from "./legacy-adapter.js";
+import { cleanupTicketReview } from "./review.js";
 import type { OwnerLock } from "./owner-lock.js";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import {
@@ -9,15 +10,13 @@ import {
   type WorkflowManagerOptions,
 } from "@quintinshaw/pi-dynamic-workflows";
 import { setTimeout as delay } from "node:timers/promises";
-import {
-  ConflictRecovery,
-  conflictRequestKey,
-  type ConflictBoardOps,
-  type RepairBlocker,
-} from "./conflict-recovery.js";
 import type { Config } from "./config.js";
 import { planSlug } from "./config.js";
-import { normalizeWaveResults, type WaveOutcome } from "./dispatch.js";
+import {
+  normalizeWaveResults, isDecision, decisionComment, failureComment, trustedMissionComments,
+  persistTicketNotice, readTicketNotice, settleTicketNotice, TicketChangedError, ticketCardKey,
+  type TicketSettlementBoard,
+} from "./dispatch.js";
 import {
   createComment,
   getCard,
@@ -27,9 +26,9 @@ import {
   resolveIssueId,
   setStatus,
   tryClaim,
-  updateIssueComment,
   reopenIssue,
   type Card,
+  type IssueComment,
   type ProjectMetadata,
 } from "./gh.js";
 import {
@@ -39,13 +38,6 @@ import {
   type TicketWorktreeRecord,
 } from "./ticket-worktree.js";
 import { buildTasksForWave, renderWorkflowSource } from "./workflow-prompt.js";
-import {
-  isRepairRequest,
-  repairReviewInput,
-  type RepairRequest,
-  type RepairReview,
-} from "./repair.js";
-
 export type ExecutorStatusCallback = (
   message: string,
   level?: "info" | "warn" | "error",
@@ -66,19 +58,18 @@ export interface ReconcileSummary {
   needsHuman: number;
   orphans: number;
   errors: number;
-  repairBlockers?: Array<RepairBlocker & { itemId: string }>;
+  /** Tickets observed/settled this tick cannot enter another lane in that tick. */
+  handledItemIds?: string[];
 }
 
 export type LaunchResult =
   | { status: "launched"; runId: string; worktree: string }
-  | { status: "skipped"; reason: string }
-  | { status: "needs-human"; reason: string };
+  | { status: "skipped"; reason: string };
 
 export type FinalizeOutcome =
   | { status: "finalized"; resultSha: string }
   | { status: "conflict"; baseSha: string; taskSha: string; reason: string }
-  | { status: "skipped"; reason: string; repair?: RepairRequest }
-  | RepairBlocker;
+  | { status: "skipped" | "blocked"; reason: string };
 
 export interface TicketExecutor {
   readonly isolatesLegacyState?: boolean;
@@ -94,11 +85,6 @@ export interface TicketExecutor {
     canStartWorkNow?: () => boolean,
   ): Promise<ReconcileSummary>;
   recoveryBlocker?(itemId: string): string | undefined;
-  repairFor?(card: Card): Promise<RepairRequest | RepairBlocker | undefined>;
-  repairForReview?(
-    record: TicketExecutionRecord,
-    card: Card,
-  ): Promise<RepairReview | RepairBlocker | undefined>;
   /** Observe revision before the final card await, then check local admission
    * synchronously at start. The prepared launch already owns its worker slot. */
   launch(
@@ -106,7 +92,6 @@ export interface TicketExecutor {
     planSlug: string,
     canStartWork?: () => boolean | Promise<boolean>,
     canStartWorkNow?: () => boolean,
-    repair?: RepairRequest,
   ): Promise<LaunchResult>;
   finalizeClosed(
     card: Card,
@@ -120,12 +105,13 @@ export interface TicketExecutor {
 }
 
 export interface TicketBoardAdapter {
-  conflict?: ConflictBoardOps;
   getCard(itemId: string): Promise<Card | undefined>;
   setStatus(itemId: string, status: string): Promise<void>;
   claim(card: Card): Promise<boolean>;
   release(card: Card): Promise<void>;
-  listComments(card: Card): Promise<string[]>;
+  listComments(card: Card): Promise<string[] | IssueComment[]>;
+  missionComments?(card: Card): Promise<IssueComment[]>;
+  reopen?(card: Card): Promise<void>;
   comment(card: Card, body: string): Promise<void>;
 }
 
@@ -136,7 +122,6 @@ export interface TicketWorkflowManager {
       itemId: string;
       issueNumber: number;
       taskKey: string;
-      repair?: RepairRequest;
     },
     options: {
       maxAgents: number;
@@ -193,10 +178,6 @@ function runArgsMatch(
   );
 }
 
-function marker(runId: string, outcome: string): string {
-  return `<!-- board-agent-run:${runId}:${outcome} -->`;
-}
-
 function completedAgentTimeoutReason(
   run: PersistedRunState,
 ): string | undefined {
@@ -218,47 +199,6 @@ function completedAgentTimeoutReason(
       : "Builder agent timed out.";
   }
   return undefined;
-}
-
-function renderNeedsHumanComment(
-  reason: string,
-  details?: WaveOutcome,
-): string {
-  const problem =
-    reason.trim() || "Automation reported an unspecified blocker.";
-  const attempted =
-    details?.attempted?.trim() ||
-    "Board Agent preserved the current state and stopped instead of guessing.";
-  const limitations =
-    details?.limitations?.trim() ||
-    "Automation cannot safely continue until the blocker above is resolved.";
-  const workaround =
-    details?.workaround?.trim() ||
-    "Inspect the task branch/worktree if present, preserve useful changes, and address the reported blocker before retrying.";
-  const humanAction =
-    details?.humanAction?.trim() ||
-    "Reply with the missing decision or describe the manual fix.";
-  return [
-    "## ⚠️ Needs human input",
-    "",
-    "**Problem**",
-    problem,
-    "",
-    "**Attempted**",
-    attempted,
-    "",
-    "**Limitation**",
-    limitations,
-    "",
-    "**Workaround**",
-    workaround,
-    "",
-    "**Human input needed**",
-    humanAction,
-    "",
-    "**Resume**",
-    "After resolving the blocker, manually move this Project card to `Ready`. The next builder run will read trusted maintainer comments and continue.",
-  ].join("\n");
 }
 
 export function createWorkflowManagerAdapter(options: {
@@ -299,7 +239,7 @@ export function createWorkflowManagerAdapter(options: {
   const startScheduling = () => {
     if (stopping || scheduler) return;
     // The scheduler owns the SAME backoff/timers/persistence, but never gets a
-    // raw resume path around the host's repair authorization.
+    // raw resume path around the host's ticket authorization.
     scheduler = new UsageLimitScheduler(
       {
         on: manager.on.bind(manager),
@@ -400,83 +340,26 @@ export class ManagedTicketExecutor implements TicketExecutor {
   private resumeRevision = 0;
   private canResume: () => boolean | Promise<boolean> = () => true;
   private canResumeNow: () => boolean = () => true;
-  observation: NonNullable<TicketExecutor["observation"]> = {
-    active: [],
-    occupiedSlots: 0,
-  };
-
-  get isolatesLegacyState(): boolean { return !!this.legacy; }
-  preservesLegacyLane(lane: "story" | "watchdog"): boolean { return this.legacy?.preservesLane(lane) ?? false; }
-
-  private readonly conflicts: ConflictRecovery;
   private readonly legacy?: LegacyTicketAdapter;
+  observation: NonNullable<TicketExecutor["observation"]> = { active: [], occupiedSlots: 0 };
+
   constructor(private readonly deps: TicketExecutorDeps) {
     if (deps.ownerLock) this.legacy = new LegacyTicketAdapter(deps);
-    this.conflicts = new ConflictRecovery({ ...deps,
-      ignoreRepairFile: (path) => this.legacy?.ignoresRepairFile(path) ?? false });
   }
+  get isolatesLegacyState(): boolean { return !!this.legacy; }
+  preservesLegacyLane(lane: "story" | "watchdog"): boolean { return this.legacy?.preservesLane(lane) ?? false; }
 
   recoveryBlocker(itemId: string): string | undefined {
     const record = this.deps.worktrees.read(itemId);
     return this.legacy?.blocker(itemId) ??
-      (this.legacy && record?.schemaVersion === 3 ? "Legacy conversion pending." : undefined) ??
-      (record?.integration || record?.retry?.stage === "integrate" || record?.retry?.stage === "cleanup"
-        ? "Pending integration/cleanup is reserved for resumable finalization (T004)." : undefined);
+      (record?.schemaVersion === 3 ? "Legacy conversion pending." : undefined) ??
+      (record?.integration || record?.retry?.stage === "integrate" || record?.retry?.stage === "cleanup" || record?.finalization
+        ? "pending finalization/integration/cleanup is reserved for resumable finalization (T004)." : undefined);
   }
 
-  private recovery(record: TicketExecutionRecord): ConflictRecovery | LegacyTicketAdapter {
-    return this.legacy?.owns(record.itemId) ? this.legacy : this.conflicts;
+  private matches(record: TicketExecutionRecord, run: PersistedRunState): boolean {
+    return runArgsMatch(run, record) && (!this.legacy?.owns(record.itemId) || this.legacy.matches(record, run.args, run.runId));
   }
-
-  repairFor(card: Card): Promise<RepairRequest | RepairBlocker | undefined> {
-    const blocked = this.recoveryBlocker(card.itemId);
-    if (blocked) return Promise.resolve({ status: "blocked", reason: blocked });
-    if (this.legacy?.owns(card.itemId)) return Promise.resolve(undefined);
-    return this.conflicts.repairFor(card);
-  }
-
-  async repairForReview(
-    record: TicketExecutionRecord,
-    card: Card,
-  ): Promise<RepairReview | RepairBlocker | undefined> {
-    const required = this.recovery(record).requestForRun(record, record.lastRunId);
-    // Unknown/rejected authority throws, never authorizes a quarantine write.
-    if (!(await this.recovery(record).executionCard(record, card, record.lastRunId)))
-      throw new Error("Repair Review lost its fresh card/claim authority.");
-    try {
-      const run = record.lastRunId
-        ? createRunPersistence(record.path).load(record.lastRunId)
-        : null;
-      if (
-        required &&
-        (!run ||
-          run.runId !== record.lastRunId ||
-          !runArgsMatch(run, record) ||
-          !this.recovery(record).matches(record, run.args, run.runId))
-      )
-        throw new Error(
-          "Bound repair Review run is missing or its exact arguments changed.",
-        );
-      const repair = run ? repairReviewInput(run) : undefined;
-      if (required && !repair)
-        throw new Error("Bound repair Review evidence is missing.");
-      if (
-        repair &&
-        (!runArgsMatch(run!, record) ||
-          !this.recovery(record).matches(record, run!.args, run!.runId))
-      )
-        throw new Error("Repair Review run does not match the ticket record.");
-      return repair;
-    } catch (error) {
-      if (!required) throw error;
-      return {
-        status: "blocked",
-        repair: required,
-        reason: `Repair Review evidence invalid: ${String(error)}`,
-      };
-    }
-  }
-
   private manager(path: string): TicketWorkflowManager {
     const key = process.platform === "win32" ? path.toLowerCase() : path;
     let manager = this.managers.get(key);
@@ -488,1343 +371,449 @@ export class ManagedTicketExecutor implements TicketExecutor {
     }
     return manager;
   }
-
-  private async resumeAuthority(
-    path: string,
-    runId: string,
-  ): Promise<(() => boolean) | undefined> {
+  private owned(card: Card): boolean {
+    return card.assignees.length === 1 && card.assignees[0].toLowerCase() === this.deps.botLogin.toLowerCase();
+  }
+  private target(card: Card | undefined, record: TicketExecutionRecord): card is Card {
+    return !!card && isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task") &&
+      card.itemId === record.itemId && card.number === record.issueNumber &&
+      (card.plan ? planSlug(card.plan) : undefined) === record.plan;
+  }
+  private async resumeAuthority(path: string, runId: string): Promise<(() => boolean) | undefined> {
     try {
       const revision = this.resumeRevision;
-      const record = this.deps.worktrees
-        .list()
-        .find((r) => r.path === path && r.activeRunId === runId);
-      if (!record || this.stopping) return undefined;
+      const record = this.deps.worktrees.list().find((r) => r.path === path && r.activeRunId === runId);
+      if (!record || this.stopping || readTicketNotice(record.retry?.reason) || this.recoveryBlocker(record.itemId)) return;
       const manager = this.manager(path);
       const run = manager.list().find((r) => r.runId === runId);
-      const required = this.recovery(record).requestForRun(record, runId);
       const legacy = this.legacy?.owns(record.itemId);
-      if (!legacy && !required && !(run?.args as { repair?: unknown } | undefined)?.repair)
-        return () => !this.stopping; // ordinary usage-limit handling is unchanged
-      if (
-        !run ||
-        !runArgsMatch(run, record) ||
-        !this.recovery(record).matches(record, run.args, runId) ||
-        (!legacy && !(await this.canResume()))
-      )
-        return undefined;
+      if (!run || !this.matches(record, run) || (!legacy && !(await this.canResume()))) return;
       const card = await this.deps.board.getCard(record.itemId);
-      if (
-        !card ||
-        !isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task") ||
-        card.closed ||
-        !statusIs(card, this.deps.cfg.columns.building) ||
-        card.number !== record.issueNumber ||
-        !card.plan ||
-        planSlug(card.plan) !== record.plan ||
-        card.assignees.length !== 1 ||
-        card.assignees[0].toLowerCase() !== this.deps.botLogin.toLowerCase() ||
-        !(await this.recovery(record).executionCard(record, card))
-      )
-        return undefined;
+      if (!this.target(card, record) || card.closed || !statusIs(card, this.deps.cfg.columns.building) || !this.owned(card) ||
+          (legacy && !(await this.legacy!.executionCard(record, card)))) return;
       const canNow = () => {
         try {
-          if (
-            this.stopping ||
-            revision !== this.resumeRevision ||
-            (legacy ? !this.legacy!.authorityHeld() : !this.canResumeNow()) ||
-            JSON.stringify(this.deps.worktrees.read(record.itemId)) !==
-              JSON.stringify(record) ||
-            this.deps.worktrees.hasCleanupReceipt(record.itemId) ||
-            !this.deps.worktrees.check(record, false).ok
-          )
-            return false;
           const current = manager.list().find((r) => r.runId === runId);
-          return (
-            !!current &&
-            runArgsMatch(current, record) &&
-            this.recovery(record).matches(record, current.args, runId)
-          );
-        } catch {
-          return false;
-        } // the synchronous resumed veto must never throw before pause()
+          return !this.stopping && revision === this.resumeRevision &&
+            (legacy ? this.legacy!.authorityHeld() : this.canResumeNow()) &&
+            JSON.stringify(this.deps.worktrees.read(record.itemId)) === JSON.stringify(record) &&
+            !this.deps.worktrees.hasCleanupReceipt(record.itemId) && this.deps.worktrees.check(record, false).ok &&
+            !!current && this.matches(record, current);
+        } catch { return false; }
       };
       return canNow() ? canNow : undefined;
     } catch (error) {
-      this.deps.callback(
-        `Repair resume ${runId} blocked: ${String(error)}`,
-        "warn",
-      );
+      this.deps.callback(`Resume ${runId} blocked: ${String(error)}`, "warn");
       return undefined;
     }
   }
 
-  private async commentOnce(
-    card: Card,
-    uniqueMarker: string,
-    body: string,
-    guard?: () => Promise<void>,
-    record?: TicketExecutionRecord,
-  ): Promise<void> {
-    if (
-      record &&
-      (await this.recovery(record).terminalNotice(
-        record,
-        card,
-        `${uniqueMarker}\n${body}`,
-      ))
-    )
-      return;
-    const comments = await this.deps.board.listComments(card);
-    if (!comments.some((comment) => comment.includes(uniqueMarker))) {
-      await guard?.();
-      await this.deps.board.comment(card, `${uniqueMarker}\n${body}`);
-    }
+  private board(): TicketSettlementBoard {
+    return { ...this.deps.board, reopen: this.deps.board.reopen,
+      // Class-based offline adapters must retain their receiver.
+      getCard: (id) => this.deps.board.getCard(id),
+      listComments: (c) => this.deps.board.listComments(c),
+      comment: (c, body) => this.deps.board.comment(c, body),
+      setStatus: (id, status) => this.deps.board.setStatus(id, status),
+      release: (c) => this.deps.board.release(c) };
   }
 
-  private async quarantineWithoutRecord(
-    card: Card,
-    reason: string,
-  ): Promise<LaunchResult> {
-    const current = await this.currentLaunchCard(
-      undefined,
-      card,
-      this.deps.cfg.columns.ready,
-    );
-    if (!current)
-      return { status: "skipped", reason: "card changed during preparation" };
-    card = current;
-    const uniqueMarker = `<!-- board-agent-recovery:${card.itemId}:worktree -->`;
-    try {
-      await this.commentOnce(
-        card,
-        uniqueMarker,
-        renderNeedsHumanComment(reason),
-      );
-      await this.deps.board.setStatus(
-        card.itemId,
-        this.deps.cfg.columns.needs_human,
-      );
-      card.status = this.deps.cfg.columns.needs_human;
-      this.deps.callback(
-        `"${card.title}" → ${this.deps.cfg.columns.needs_human}: ${reason}`,
-        "warn",
-      );
-    } finally {
-      await this.deps.board.release(card);
-    }
-    return { status: "needs-human", reason };
+  private matchingLaunchRuns(record: TicketExecutionRecord, manager: TicketWorkflowManager): PersistedRunState[] {
+    return manager.list().filter((run) => run.runId !== record.lastRunId && this.matches(record, run) &&
+      new Date(run.startedAt).getTime() >= (record.launchingAt ?? 0) - 1000);
   }
 
-  private async moveToNeedsHuman(
-    record: TicketWorktreeRecord,
-    card: Card,
-    reason: string,
-    runId?: string,
-    markerOutcome = "needs-human",
-    details?: WaveOutcome,
-  ): Promise<void> {
-    let uniqueMarker: string;
-    if (runId) {
-      uniqueMarker = marker(runId, markerOutcome);
-    } else {
-      const incident =
-        record.lastRunId ?? record.launchingAt ?? record.createdAt;
-      uniqueMarker = `<!-- board-agent-recovery:${record.itemId}:${incident}:${markerOutcome} -->`;
-    }
-    await this.commentOnce(
-      card,
-      uniqueMarker,
-      renderNeedsHumanComment(reason, details),
-      () => this.recovery(record).assertSettlement(record, card),
-      record,
-    );
-    await this.recovery(record).assertSettlement(record, card);
-    if (!statusIs(card, this.deps.cfg.columns.needs_human)) {
-      await this.deps.board.setStatus(
-        card.itemId,
-        this.deps.cfg.columns.needs_human,
-      );
-      card.status = this.deps.cfg.columns.needs_human;
-    }
-    await this.recovery(record).assertSettlement(record, card);
-    await this.deps.board.release(card);
-    this.recovery(record).abandon(record);
-    this.deps.worktrees.clearExecution(record.itemId, runId);
-    this.deps.callback(
-      `"${card.title}" → ${this.deps.cfg.columns.needs_human}: ${reason}`,
-      "warn",
-    );
-  }
-
-  private async complete(
-    record: TicketExecutionRecord,
-    card: Card,
-    runId: string,
-    outcome: WaveOutcome,
-  ): Promise<void> {
-    const uniqueMarker = marker(runId, "success");
-    await this.commentOnce(
-      card,
-      uniqueMarker,
-      `✅ Builder completed on \`${outcome.branch ?? record.taskBranch}\`.\n\n${outcome.summary ?? "Ready for review."}`,
-      () => this.recovery(record).assertSettlement(record, card),
-      record,
-    );
-    await this.recovery(record).assertSettlement(record, card);
-    if (!statusIs(card, this.deps.cfg.columns.review)) {
-      await this.deps.board.setStatus(
-        card.itemId,
-        this.deps.cfg.columns.review,
-      );
-      card.status = this.deps.cfg.columns.review;
-    }
-    await this.recovery(record).assertSettlement(record, card);
-    await this.deps.board.release(card);
-    this.deps.worktrees.clearExecution(record.itemId, runId);
-    this.deps.callback(
-      `"${card.title}" succeeded → ${this.deps.cfg.columns.review}. Worktree: ${record.path}`,
-    );
-  }
-
-  private matchingLaunchRuns(
-    record: TicketExecutionRecord,
-    manager: TicketWorkflowManager,
-  ): PersistedRunState[] {
-    const cutoff = (record.launchingAt ?? 0) - 1000;
-    return manager
-      .list()
-      .filter(
-        (run) =>
-          run.runId !== record.lastRunId &&
-          runArgsMatch(run, record) &&
-          this.recovery(record).matches(record, run.args, run.runId) &&
-          new Date(run.startedAt).getTime() >= cutoff,
-      );
-  }
-
-  private async recoverLaunching(
-    record: TicketExecutionRecord,
-    card: Card,
-    summary: ReconcileSummary,
-  ): Promise<TicketExecutionRecord | undefined> {
-    let manager: TicketWorkflowManager;
-    try {
-      manager = this.manager(record.path);
-    } catch (error: any) {
-      if (this.legacy?.owns(record.itemId)) throw error;
-      await this.moveToNeedsHuman(
-        record,
-        card,
-        `cannot open persisted workflow state: ${error.message}`,
-      );
-      summary.needsHuman++;
-      return undefined;
-    }
-    const matches = this.matchingLaunchRuns(record, manager);
-    if (matches.length === 1) {
-      const run = matches[0];
-      const adopted = this.deps.worktrees.setActiveRun(
-        record.itemId,
-        run.runId,
-        new Date(run.startedAt).getTime(),
-      );
-      this.recovery(adopted).bind(adopted, run.runId, run.args);
-      summary.adopted++;
-      this.deps.callback(
-        `Adopted persisted run ${run.runId} for "${card.title}".`,
-      );
-      return adopted;
-    }
-    if (this.legacy?.owns(record.itemId))
-      throw new Error(`Legacy launch has ${matches.length} matching persisted runs; retain the launch window and retry observation.`);
-    if (matches.length > 1) {
-      await this.moveToNeedsHuman(
-        record,
-        card,
-        "multiple persisted runs match the interrupted launch",
-      );
-      summary.needsHuman++;
-      return undefined;
-    }
-
-    let check = this.deps.worktrees.check(record, true);
-    const delta = check.ok
-      ? await this.deps.worktrees.hasTaskDelta(record)
-      : true;
-    const current = await this.currentLaunchCard(record, card, card.status);
-    if (!current) return undefined;
-    card = current;
-    // Delta fetch and the fresh card read both yield. Recheck local safety last.
-    check = this.deps.worktrees.check(record, true);
-    if (check.ok && !delta && !this.deps.worktrees.hasLocalTaskDelta(record)) {
-      if (statusIs(card, this.deps.cfg.columns.building)) {
-        await this.deps.board.setStatus(
-          card.itemId,
-          this.deps.cfg.columns.ready,
-        );
-        card.status = this.deps.cfg.columns.ready;
-      }
-      await this.deps.board.release(card);
-      this.deps.worktrees.clearExecution(record.itemId);
-      this.deps.callback(
-        `Interrupted launch for "${card.title}" had no side effects; returned to ${this.deps.cfg.columns.ready}.`,
-        "warn",
-      );
-      return undefined;
-    }
-
-    await this.moveToNeedsHuman(
-      record,
-      card,
-      check.reason ?? "task branch changed before a run could be identified",
-    );
-    summary.needsHuman++;
-    return undefined;
-  }
-
-  private async stopForManualState(
-    record: TicketExecutionRecord,
-    card: Card,
-    manager: TicketWorkflowManager,
-  ): Promise<void> {
-    const runs = record.activeRunId
-      ? manager
-          .list()
-          .filter(
-            (run) =>
-              run.runId === record.activeRunId && runArgsMatch(run, record),
-          )
-      : this.matchingLaunchRuns(record, manager);
-    for (const run of runs) await manager.stopAndWait(run.runId);
-    if (statusIs(card, this.deps.cfg.columns.ready)) {
-      const check = this.deps.worktrees.check(record, true);
-      if (!check.ok) {
-        await this.moveToNeedsHuman(
-          record,
-          card,
-          `manual retry is unsafe: ${check.reason}`,
-          record.activeRunId,
-          "manual-dirty",
-        );
-        return;
-      }
-    }
-    await this.deps.board.release(card);
-    this.deps.worktrees.clearExecution(
-      record.itemId,
-      record.activeRunId ?? (runs.length === 1 ? runs[0].runId : undefined),
-    );
-    this.deps.callback(
-      `Stopped stale execution ${record.activeRunId ?? record.itemId}; preserved manual status ${card.status ?? "unknown"}.`,
-      "warn",
-    );
-  }
-
-  private async reconcileActive(
-    record: TicketExecutionRecord,
-    card: Card,
-    summary: ReconcileSummary,
-  ): Promise<void> {
-    let manager: TicketWorkflowManager;
-    try {
-      manager = this.manager(record.path);
-    } catch (error: any) {
-      if (this.legacy?.owns(record.itemId)) throw error;
-      await this.moveToNeedsHuman(
-        record,
-        card,
-        `cannot open workflow manager: ${error.message}`,
-        record.activeRunId,
-        "manager-error",
-      );
-      summary.needsHuman++;
-      return;
-    }
-
-    const run = manager
-      .list()
-      .find((candidate) => candidate.runId === record.activeRunId);
-    if (
-      !run ||
-      !runArgsMatch(run, record) ||
-      !this.recovery(record).matches(record, run.args)
-    ) {
-      if (this.legacy?.owns(record.itemId))
-        throw new Error("Legacy workflow is missing or mismatched; original execution retained.");
-      await this.moveToNeedsHuman(
-        record,
-        card,
-        run
-          ? "workflow arguments do not match the ticket record"
-          : "persisted workflow run is missing",
-        record.activeRunId,
-        "missing",
-      );
-      summary.needsHuman++;
-      return;
-    }
-
-    const authorized = await this.recovery(record).executionCard(record, card);
-    if (!authorized) {
-      await this.stopMissingCardRun(record, summary);
-      return;
-    }
-    card = authorized;
-    this.recovery(record).bind(record, run.runId, run.args);
-    const completedOutcomes =
-      run.status === "completed" ? normalizeWaveResults(run.result) : [];
-    const completedOutcome =
-      completedOutcomes.length === 1
-        ? {
-            ...completedOutcomes[0],
-            taskKey: record.taskKey,
-            itemId: record.itemId,
-          }
-        : undefined;
-    const structural = this.deps.worktrees.check(record, false);
-    const planMatches = !!card.plan && planSlug(card.plan) === record.plan;
-    if (
-      !structural.ok ||
-      !planMatches ||
-      (record.issueNumber > 0 && card.number !== record.issueNumber)
-    ) {
-      if (this.legacy?.owns(record.itemId))
-        throw new Error(structural.reason ?? "Legacy ticket identity changed; preserving original execution.");
-      const failure =
-        completedOutcome?.status === "failure" ? completedOutcome : undefined;
-      const mismatchReason =
-        structural.reason ?? "ticket Plan or issue identity changed";
-      await manager.stopAndWait(run.runId);
-      await this.moveToNeedsHuman(
-        record,
-        card,
-        failure
-          ? `${failure.error ?? "builder reported failure"} Additional safety issue: ${mismatchReason}`
-          : mismatchReason,
-        run.runId,
-        failure ? "failure" : "mismatch",
-        failure,
-      );
-      summary.needsHuman++;
-      return;
-    }
-
-    if (!statusIs(card, this.deps.cfg.columns.building)) {
-      await this.stopForManualState(record, card, manager);
-      return;
-    }
-
-    manager.startScheduling?.();
-    if (run.status === "running" || run.status === "pending") {
-      summary.active.push({
-        itemId: record.itemId,
-        taskKey: record.taskKey,
-        runId: run.runId,
-        status: run.status,
-        worktree: record.path,
-      });
-      return;
-    }
-
-    if (run.status === "paused") {
-      if (this.stopping) return;
-      if (run.pauseReason === "usage_limit") {
-        summary.active.push({
-          itemId: record.itemId,
-          taskKey: record.taskKey,
-          runId: run.runId,
-          status: run.status,
-          worktree: record.path,
-        });
-        return;
-      }
-      if (await manager.resume(run.runId)) {
-        summary.resumed++;
-        summary.active.push({
-          itemId: record.itemId,
-          taskKey: record.taskKey,
-          runId: run.runId,
-          status: "running",
-          worktree: record.path,
-        });
-        this.deps.callback(`Resumed ${run.runId} for "${card.title}".`);
-        return;
-      }
-      // A denied repair resume preserves its slot and persistent run. Only a
-      // freshly authorized structural resume failure may be quarantined.
-      if (!(await this.resumeAuthority(record.path, run.runId))) return;
-      const raced = manager
-        .list()
-        .find((candidate) => candidate.runId === run.runId);
-      if (raced?.status === "running") {
-        summary.active.push({
-          itemId: record.itemId,
-          taskKey: record.taskKey,
-          runId: run.runId,
-          status: "running",
-          worktree: record.path,
-        });
-        return;
-      }
-      await this.moveToNeedsHuman(
-        record,
-        card,
-        "paused workflow could not be resumed",
-        run.runId,
-        "resume-failed",
-      );
-      summary.needsHuman++;
-      return;
-    }
-
-    if (run.status === "completed") {
-      const outcome = completedOutcome;
-      if (!outcome) {
-        await this.moveToNeedsHuman(
-          record,
-          card,
-          completedAgentTimeoutReason(run) ??
-            "persisted builder result is malformed",
-          run.runId,
-          "malformed",
-        );
-        summary.needsHuman++;
-        return;
-      }
-      if (outcome.status === "failure") {
-        await this.moveToNeedsHuman(
-          record,
-          card,
-          outcome.error ?? "builder reported failure",
-          run.runId,
-          "failure",
-          outcome,
-        );
-        summary.needsHuman++;
-        return;
-      }
-      const check = this.deps.worktrees.check(record, true);
-      if (!check.ok || outcome.branch !== record.taskBranch) {
-        await this.moveToNeedsHuman(
-          record,
-          card,
-          check.ok
-            ? "persisted builder result is malformed"
-            : (check.reason ?? "completed worktree is unsafe"),
-          run.runId,
-          "malformed",
-        );
-        summary.needsHuman++;
-        return;
-      }
-      if ((run.args as { repair?: unknown }).repair !== undefined) {
-        let reason: string | undefined;
-        const repair = (run.args as { repair: RepairRequest }).repair;
-        let resultSha: string | undefined;
-        try {
-          resultSha = repairReviewInput(run)!.testEvidence.resultSha;
-          await this.deps.worktrees.verifyRepairResult(
-            record,
-            repair,
-            resultSha,
-          );
-        } catch (error) {
-          reason = `Repair verification failed: ${String(error)}`;
-        }
-        // The remote Git check yields. Never settle against stale ownership,
-        // requirements, execution identity or a later human lane.
-        const current = await this.currentLaunchCard(record, card);
-        if (!current) return;
-        card = current;
-        if (!reason) {
-          try {
-            this.deps.worktrees.checkRepairResult(record, repair, resultSha!);
-          } catch (error) {
-            reason = `Repair verification failed: ${String(error)}`;
-          }
-        }
-        if (reason) {
-          await this.moveToNeedsHuman(
-            record,
-            card,
-            reason,
-            run.runId,
-            "repair-verification",
-          );
-          summary.needsHuman++;
-          return;
-        }
-      }
-      await this.complete(record, card, run.runId, outcome);
-      return;
-    }
-
-    await this.moveToNeedsHuman(
-      record,
-      card,
-      run.error ?? `workflow ended as ${run.status}`,
-      run.runId,
-      run.status,
-    );
-    summary.needsHuman++;
-  }
-
-  private async stopMissingCardRun(
-    record: TicketExecutionRecord,
-    summary: ReconcileSummary,
-  ): Promise<void> {
+  private async drain(record: TicketExecutionRecord): Promise<void> {
+    if (!record.activeRunId && (record.launchingAt === undefined || readTicketNotice(record.retry?.reason))) return;
+    const check = this.deps.worktrees.check(record, false);
+    if (!check.ok) throw new Error(check.reason); // never open a manager on an external/changed worktree
     const manager = this.manager(record.path);
-    const runs = record.activeRunId
-      ? manager.list().filter((run) => run.runId === record.activeRunId)
-      : this.matchingLaunchRuns(record, manager);
-    for (const run of runs) {
-      if (
-        run.status === "pending" ||
-        run.status === "running" ||
-        run.status === "paused"
-      ) {
-        await manager.stopAndWait(run.runId);
-      }
-    }
-    this.deps.worktrees.clearExecution(
-      record.itemId,
-      record.activeRunId ?? (runs.length === 1 ? runs[0].runId : undefined),
-    );
-    this.recovery(record).abandon(record);
-    summary.orphans++;
-    this.deps.callback(
-      `Stopped orphaned ticket run ${record.activeRunId ?? record.itemId}; its Project item is gone or no longer matches the ticket and worktree was preserved.`,
-      "warn",
-    );
+    const runs = record.activeRunId ? manager.list().filter((r) => r.runId === record.activeRunId) : this.matchingLaunchRuns(record, manager);
+    if (record.activeRunId && !runs.length) throw new Error("Persisted workflow is missing; retain its binding and retry observation.");
+    for (const run of runs) await manager.stopAndWait(run.runId);
+    if (!record.activeRunId && runs.length !== 1)
+      throw new Error("Ambiguous launch binding retained after draining known runs; retry observation before any new builder.");
   }
 
-  async reconcile(
-    cards: Card[],
-    canStartWork: () => boolean | Promise<boolean> = () => true,
-    canStartWorkNow: () => boolean = () => true,
-  ): Promise<ReconcileSummary> {
-    const summary: ReconcileSummary = {
-      active: [],
-      resumed: 0,
-      adopted: 0,
-      needsHuman: 0,
-      orphans: 0,
-      errors: 0,
-    };
+  /** Human withdrawal is not a failure. Only release our freshly observed claim,
+   * after drain; never restore a lane, edit the issue, or replace its identity. */
+  private async withdraw(record: TicketExecutionRecord, expected?: Card): Promise<void> {
+    if (JSON.stringify(this.deps.worktrees.read(record.itemId)) !== JSON.stringify(record)) throw new Error("Record changed before withdrawal.");
+    await this.drain(record);
+    const fresh = await this.deps.board.getCard(record.itemId);
+    if (fresh && expected && isTargetIssue(fresh, this.deps.repoOwner, this.deps.repoName, "Task") &&
+      fresh.itemId === record.itemId && fresh.number === record.issueNumber &&
+      fresh.assignees.some((a) => a.toLowerCase() === this.deps.botLogin.toLowerCase())) {
+      await this.deps.board.release(fresh);
+      const observed = await this.deps.board.getCard(record.itemId);
+      if (observed && this.target(observed, record) && this.owned(observed)) throw new Error("Claim release not yet observed.");
+    }
+    if (!fresh || !isTargetIssue(fresh, this.deps.repoOwner, this.deps.repoName, "Task") ||
+      fresh.itemId !== record.itemId || fresh.number !== record.issueNumber)
+      this.deps.callback(`Original Issue claim for ${record.itemId} requires manual verification/cleanup; no remote writes attempted.`, "warn");
+    this.deps.worktrees.update(record.itemId, (current) => {
+      if (JSON.stringify(current) !== JSON.stringify(record)) throw new Error("Execution changed before withdrawal acknowledgement.");
+      return { ...current,
+      lastRunId: record.activeRunId ?? current.lastRunId,
+      activeRunId: undefined, activeRunStartedAt: undefined, launchingAt: undefined,
+      // Withdrawal cancels writeback, not the diagnostic or original work.
+      retry: current.retry && readTicketNotice(current.retry.reason)
+        ? { ...current.retry, reason: current.retry.reason.slice(current.retry.reason.indexOf("\n") + 1) }
+        : current.retry };
+    });
+  }
+
+  private async settle(record: TicketExecutionRecord): Promise<boolean> {
+    const occupied = !!record.activeRunId || record.launchingAt !== undefined;
+    await this.drain(record);
+    const notice = readTicketNotice(record.retry?.reason);
+    if (!occupied && (record.retry?.stage === "review" || notice?.from === this.deps.cfg.columns.review))
+      await cleanupTicketReview(this.deps.cwd, record);
+    const result = await settleTicketNotice(this.deps.worktrees, record, this.board(), this.deps.botLogin);
+    this.deps.worktrees.update(record.itemId, (current) => {
+      if (JSON.stringify(current) !== JSON.stringify(record)) throw new Error("Execution changed before settlement acknowledgement.");
+      return { ...current, lastRunId: record.activeRunId ?? current.lastRunId,
+        activeRunId: undefined, activeRunStartedAt: undefined, launchingAt: undefined,
+        // Review remains an obligation until the independent verdict settles.
+        retry: statusIs(result.card, this.deps.cfg.columns.ready) || statusIs(result.card, this.deps.cfg.columns.review)
+          ? current.retry : undefined };
+    });
+    if (occupied || result.changed)
+      this.deps.callback(`"${result.card.title}" → ${result.card.status}; previous execution drained and claim released.`);
+    return occupied || result.changed;
+  }
+
+  private async terminal(record: TicketExecutionRecord, card: Card, run: PersistedRunState): Promise<boolean> {
+    const { worktrees, cfg } = this.deps;
+    const timeout = completedAgentTimeoutReason(run);
+    const outcomes = run.status === "completed" && !timeout ? normalizeWaveResults(run.result) : [];
+    const outcome = outcomes.length === 1 && outcomes[0].itemId === record.itemId && outcomes[0].taskKey === record.taskKey ? outcomes[0] : undefined;
+    let target = cfg.columns.ready, stage: "build" | "review" = "build", body: string;
+    if (outcome?.status === "needs_decision" && isDecision(outcome)) {
+      target = cfg.columns.needs_human;
+      body = decisionComment(outcome);
+    } else if (outcome?.status === "success") {
+      // A terminal journal can precede cooperative teardown. Pin/check the
+      // completed work only after the original lease has drained.
+      await this.drain(record);
+      const check = worktrees.check(record, true);
+      if (!check.ok || outcome.branch !== record.taskBranch) {
+        body = failureComment(check.reason ?? "Builder result branch does not match the original task branch.");
+      } else {
+        const sha = worktrees.localBranchSha(record.taskBranch);
+        if (!sha) throw new Error("Successful build SHA is unavailable; retry Git observation, not the builder.");
+        record = worktrees.update(record.itemId, (r) => {
+          if (JSON.stringify(r) !== JSON.stringify(record)) throw new Error("Execution changed while draining the successful builder.");
+          return { ...r, reviewedTaskSha: sha };
+        });
+        target = cfg.columns.review; stage = "review";
+        body = `## Builder completed\n\n${outcome.summary ?? "Ready for independent review."}\n\nTask branch: \`${record.taskBranch}\` at \`${sha}\`. Review must verify this exact pushed SHA.`;
+      }
+    } else {
+      body = failureComment(outcome?.error ?? timeout ?? run.error ??
+        (run.status === "completed" ? "Persisted builder result is malformed or missing." : `Workflow ended as ${run.status}.`), outcome);
+    }
+    if (target === cfg.columns.ready && record.retry?.reason && !readTicketNotice(record.retry.reason))
+      body += `\n\nPrior recovery context:\n${record.retry.reason}`;
+    record = persistTicketNotice(worktrees, record, card, stage, target, body);
+    await this.settle(record);
+    return target === cfg.columns.needs_human;
+  }
+
+  async reconcile(cards: Card[], canStartWork: () => boolean | Promise<boolean> = () => true,
+    canStartWorkNow: () => boolean = () => true): Promise<ReconcileSummary> {
+    const summary: ReconcileSummary = { active: [], resumed: 0, adopted: 0, needsHuman: 0, orphans: 0, errors: 0, handledItemIds: [] };
     if (this.stopping) return summary;
-    this.canResume = canStartWork;
-    this.canResumeNow = canStartWorkNow;
-    this.resumeRevision++;
-    const legacyErrors = await this.legacy?.reconcile(cards, () => !this.stopping) ?? [];
-    for (const error of legacyErrors)
-      this.deps.callback(`Legacy recovery ${error.itemId}: ${error.reason}`, "warn");
-    summary.errors += legacyErrors.length;
-    const repairBlockers = await this.conflicts.reconcile(
-      async () => !this.stopping && (await canStartWork()),
-      () => !this.stopping && canStartWorkNow(),
-    );
-    if (repairBlockers.length) summary.repairBlockers = repairBlockers;
-    summary.errors += repairBlockers.length;
-    const cardsById = new Map(cards.map((card) => [card.itemId, card]));
-    const records = this.deps.worktrees.list();
-    const recordIds = new Set(records.map((record) => record.itemId));
-
-    for (const original of records) {
+    this.canResume = canStartWork; this.canResumeNow = canStartWorkNow; this.resumeRevision++;
+    const errors = await this.legacy?.reconcile(cards, () => !this.stopping) ?? [];
+    for (const error of errors) this.deps.callback(`Legacy recovery ${error.itemId}: ${error.reason}`, "warn");
+    summary.errors += errors.length;
+    for (let record of this.deps.worktrees.list()) {
       if (this.stopping) break;
-      if (this.recoveryBlocker(original.itemId)) continue;
-      const snapshot = cardsById.get(original.itemId);
+      if (this.recoveryBlocker(record.itemId) || this.deps.worktrees.hasCleanupReceipt(record.itemId)) continue;
+      let card: Card | undefined;
+      const handled = () => { if (!summary.handledItemIds!.includes(record.itemId)) summary.handledItemIds!.push(record.itemId); };
       try {
-        // A failed read preserves recovery evidence; confirmed absence or a
-        // replacement target stops only the local run, never mutates a snapshot.
-        const card = await this.deps.board.getCard(original.itemId);
+        card = await this.deps.board.getCard(record.itemId);
         if (this.stopping) break;
-        if (
-          !card ||
-          !isTargetIssue(
-            card,
-            this.deps.repoOwner,
-            this.deps.repoName,
-            "Task",
-          ) ||
-          card.itemId !== original.itemId ||
-          card.number !== original.issueNumber
-        ) {
-          if (original.activeRunId || original.launchingAt !== undefined)
-            await this.stopMissingCardRun(original, summary);
+        const snapshot = cards.find((c) => c.itemId === record.itemId);
+        if (snapshot && card) Object.assign(snapshot, card);
+        if (!this.target(card, record)) {
+          if (record.activeRunId || record.launchingAt !== undefined) { handled(); await this.withdraw(record); summary.orphans++; }
           continue;
         }
-        if (snapshot) {
-          snapshot.status = card.status;
-          snapshot.plan = card.plan;
-          snapshot.assignees = card.assignees;
-          snapshot.closed = card.closed;
+        // Cold queued repairs carry only ordinary retry context. The adapter
+        // verifies old identity/evidence; no requested/queued/consumed writes.
+        if (record.retry?.reason.startsWith("Legacy merge conflict:")) {
+          handled();
+          await this.legacy?.assertRetryCard(record, card);
+          if (!this.owned(card)) {
+            if (card.assignees.length || !(await this.deps.board.claim(card))) continue;
+            card = (await this.deps.board.getCard(record.itemId))!;
+            await this.legacy?.assertRetryCard(record, card);
+          }
+          if (!this.target(card, record) || !this.owned(card)) continue;
+          record = persistTicketNotice(this.deps.worktrees, record, card, "build", this.deps.cfg.columns.ready, failureComment(record.retry.reason));
         }
-
-        // A valid finalization journal owns the ticket until cleanup finishes.
-        // Mixed execution/finalization files are unsupported, never migrated here.
-        if (
-          original.finalization ||
-          original.integration ||
-          this.deps.worktrees.hasCleanupReceipt(original.itemId)
-        )
-          continue;
-
-        let record: TicketExecutionRecord | undefined = original;
-        const authorized = await this.recovery(record).executionCard(record, card);
-        if (!authorized) {
-          await this.stopMissingCardRun(record, summary);
-          continue;
-        }
-        if (this.recovery(record).isUnstarted(record)) {
-          await this.moveToNeedsHuman(
-            record,
-            authorized,
-            "Consumed repair launch was interrupted before a persistent run existed.",
-          );
-          summary.needsHuman++;
+        const notice = readTicketNotice(record.retry?.reason);
+        if (notice && notice.from !== this.deps.cfg.columns.ready && statusIs(card, this.deps.cfg.columns.ready) && !card.closed &&
+          (notice.to !== this.deps.cfg.columns.ready || notice.key !== ticketCardKey(card, record))) {
+          if (record.activeRunId || record.launchingAt !== undefined || this.owned(card)) {
+            handled(); await this.withdraw(record, notice.key === ticketCardKey(card, record) ? card : undefined);
+          }
+          // Explicit manual Ready is the only override. Comments alone never
+          // reach this branch. Preserve original worktree identity and diagnostics.
+          if (notice.to === this.deps.cfg.columns.needs_human &&
+            !card.assignees.some((a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase()))
+            this.deps.worktrees.update(record.itemId, (r) => ({ ...r, retry: undefined }));
           continue;
         }
-        if (
-          (record.activeRunId || record.launchingAt !== undefined) &&
-          !statusIs(card, this.deps.cfg.columns.building) &&
-          !statusIs(card, this.deps.cfg.columns.ready)
-        ) {
-          // Review/Needs Human may already have been written before release
-          // failed. Preserve those (and later human states), even if the run or
-          // worktree is now unreadable/mismatched. Only drain and release; Ready
-          // retries still pass the existing structural/dirty recovery gates.
-          await this.stopForManualState(
-            record,
-            card,
-            this.manager(record.path),
-          );
+        if (notice) {
+          try { if (await this.settle(record)) handled(); }
+          catch (error) { handled(); throw error; }
           continue;
         }
-        if (record.launchingAt !== undefined && !record.activeRunId)
-          record = await this.recoverLaunching(record, card, summary);
-        if (record?.activeRunId)
-          await this.reconcileActive(record, card, summary);
-        else if (record && statusIs(card, this.deps.cfg.columns.building)) {
-          await this.moveToNeedsHuman(
-            record,
-            card,
-            "In Progress ticket has no active workflow run",
-          );
-          summary.needsHuman++;
+        if (!record.activeRunId && record.launchingAt === undefined) {
+          if (statusIs(card, this.deps.cfg.columns.building) && this.owned(card)) {
+            handled();
+            record = persistTicketNotice(this.deps.worktrees, record, card, "build", this.deps.cfg.columns.ready,
+              failureComment("In Progress ticket has no active workflow run."));
+            await this.settle(record);
+          }
+          continue;
         }
-      } catch (error: any) {
-        this.resumeRevision++; // revoke any resume admitted before this failed fresh read
-        summary.errors++;
-        // This idle handoff's blocker is already returned to the loop. Its
-        // ordinary record read still runs, but must not emit a second wrapper.
-        if (
-          !repairBlockers.some((blocker) => blocker.itemId === original.itemId)
-        )
-          this.deps.callback(
-            `Reconcile failed for ${original.itemId}: ${error.message}`,
-            "warn",
-          );
+        handled();
+        if (card.closed || !statusIs(card, this.deps.cfg.columns.building) || !this.owned(card)) { await this.withdraw(record, card); continue; }
+        const check = this.deps.worktrees.check(record, false);
+        if (!check.ok) throw new Error(check.reason);
+        const manager = this.manager(record.path);
+        if (!record.activeRunId) {
+          const matches = this.matchingLaunchRuns(record, manager);
+          if (matches.length !== 1) throw new Error(`Interrupted launch has ${matches.length} matching runs; retain launch window and retry observation.`);
+          record = this.deps.worktrees.setActiveRun(record.itemId, matches[0].runId, Date.parse(matches[0].startedAt));
+          summary.adopted++;
+        }
+        const run = manager.list().find((r) => r.runId === record.activeRunId);
+        if (!run || !this.matches(record, run)) throw new Error("Persisted workflow is missing or mismatched; original run/script/args retained.");
+        if (this.legacy?.owns(record.itemId) && !(await this.legacy.executionCard(record, card))) { await this.withdraw(record); continue; }
+        if (["pending", "running"].includes(run.status)) {
+          manager.startScheduling?.();
+          summary.active.push({ itemId: record.itemId, taskKey: record.taskKey, runId: run.runId, status: run.status, worktree: record.path });
+        } else if (run.status === "paused") {
+          manager.startScheduling?.();
+          if (run.pauseReason !== "usage_limit" && !this.stopping && await this.resumeAuthority(record.path, run.runId) && await manager.resume(run.runId)) summary.resumed++;
+          summary.active.push({ itemId: record.itemId, taskKey: record.taskKey, runId: run.runId, status: run.status, worktree: record.path });
+        } else if (await this.terminal(record, card, run)) summary.needsHuman++;
+      } catch (error) {
+        const current = this.deps.worktrees.read(record.itemId);
+        handled(); this.resumeRevision++;
+        if (!current || ["issueNumber", "createdAt", "path", "taskBranch", "baseBranch", "activeRunId", "launchingAt", "lastRunId"].some(
+          (key) => (current as any)[key] !== (record as any)[key])) {
+          summary.errors++;
+          this.deps.callback(`Execution association changed for ${record.itemId}; preserving the newer record. ${String(error)}`, "warn");
+          continue;
+        }
+        record = current;
+        if (error instanceof TicketChangedError) {
+          await this.withdraw(record, card).catch((e) => this.deps.callback(`Withdrawal drain pending: ${String(e)}`, "warn"));
+        } else {
+          summary.errors++;
+          if (!record.retry && !record.finalization && !record.integration)
+            this.deps.worktrees.update(record.itemId, (r) => ({ ...r, retry: { stage: "build", reason: String(error) } }));
+        }
+        this.deps.callback(`Reconcile ${record.itemId}: ${String(error)}`, "warn");
       }
     }
-
-    for (const snapshot of cards) {
-      if (this.stopping) break;
-      if (
-        !isTargetIssue(
-          snapshot,
-          this.deps.repoOwner,
-          this.deps.repoName,
-          "Task",
-        ) ||
-        !statusIs(snapshot, this.deps.cfg.columns.building) ||
-        recordIds.has(snapshot.itemId) ||
-        (this.legacy && this.deps.worktrees.has(snapshot.itemId)) ||
-        this.recoveryBlocker(snapshot.itemId) ||
-        this.deps.worktrees.hasCleanupReceipt(snapshot.itemId)
-      )
-        continue;
-      try {
-        const card = await this.deps.board.getCard(snapshot.itemId);
-        if (this.stopping) break;
-        if (
-          !card ||
-          !isTargetIssue(
-            card,
-            this.deps.repoOwner,
-            this.deps.repoName,
-            "Task",
-          ) ||
-          card.itemId !== snapshot.itemId ||
-          card.number !== snapshot.number ||
-          !statusIs(card, this.deps.cfg.columns.building)
-        )
-          continue;
-        const uniqueMarker = `<!-- board-agent-orphan:${card.itemId} -->`;
-        await this.commentOnce(
-          card,
-          uniqueMarker,
-          "⚠️ This ticket is In Progress but has no execution record. It was quarantined without retrying.",
-        );
-        await this.deps.board.setStatus(
-          card.itemId,
-          this.deps.cfg.columns.needs_human,
-        );
-        card.status = this.deps.cfg.columns.needs_human;
-        snapshot.status = card.status;
-        await this.deps.board.release(card);
-        summary.orphans++;
-        summary.needsHuman++;
-        this.deps.callback(
-          `Orphaned ticket "${card.title}" → ${this.deps.cfg.columns.needs_human}.`,
-          "warn",
-        );
-      } catch (error: any) {
-        summary.errors++;
-        this.deps.callback(
-          `Orphan recovery failed for ${snapshot.itemId}: ${error.message}`,
-          "warn",
-        );
-      }
+    // Unknown/corrupt evidence is not a product decision or permission to invent
+    // ownership. Keep diagnostics and do not mutate GitHub.
+    for (const card of cards) if (isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task") &&
+      statusIs(card, this.deps.cfg.columns.building) && !this.deps.worktrees.read(card.itemId)) {
+      summary.orphans++; summary.handledItemIds!.push(card.itemId);
+      this.deps.callback(`Ticket ${card.itemId} has no readable execution record; preserved for retry observation.`, "warn");
     }
-
     this.activeCount();
     return summary;
   }
 
-  private eligible(
-    card: Card,
-    expectedPlan: string,
-    requireClaim = false,
-  ): string | undefined {
+  private eligible(card: Card, expectedPlan: string, requireClaim = false): string | undefined {
     if (this.stopping) return "executor is stopping";
-    const blocked = this.recoveryBlocker(card.itemId);
-    if (blocked) return blocked;
-    if (!isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task"))
-      return "card is not a Task Issue in the configured repository";
-    if (card.closed) return "issue is closed";
-    if (!statusIs(card, this.deps.cfg.columns.ready))
-      return `status is ${card.status ?? "unset"}`;
-    if (!card.plan || planSlug(card.plan) !== expectedPlan)
-      return "Plan changed";
-    if (card.assignees.some((assignee) => assignee !== this.deps.botLogin))
-      return "another assignee is present";
-    if (requireClaim && !card.assignees.includes(this.deps.botLogin))
-      return "claim was not retained";
+    const blocked = this.recoveryBlocker(card.itemId); if (blocked) return blocked;
+    if (!isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task")) return "not a target Task Issue";
+    if (card.closed || !statusIs(card, this.deps.cfg.columns.ready)) return "ticket is not open Ready";
+    if (!card.plan || planSlug(card.plan) !== expectedPlan) return "Plan changed";
+    if (card.assignees.some((a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase())) return "another assignee is present";
+    if (requireClaim && !this.owned(card)) return "claim was not retained";
     const record = this.deps.worktrees.read(card.itemId);
-    if (
-      record?.finalization ||
-      record?.integration ||
-      this.deps.worktrees.hasCleanupReceipt(card.itemId)
-    )
-      return "ticket has a pending finalization; recover it before starting another builder";
-    if (record && (record.activeRunId || record.launchingAt !== undefined))
-      return "ticket already has an active run";
+    if (record?.activeRunId || record?.launchingAt !== undefined) return "ticket already has an active run";
+    if (record?.retry?.reason.startsWith("Legacy merge conflict:")) return "Legacy board settlement must be observed before launch.";
+    if (record?.retry?.stage === "review") return "retry the original SHA review, not a builder";
+    if (this.deps.worktrees.hasCleanupReceipt(card.itemId)) return "pending cleanup receipt";
     return undefined;
   }
 
-  /** Shared by preparation, actual invocation and failed/stopped cleanup. A
-   * failed read/release throws before clearing any launch recovery evidence. */
-  private async currentLaunchCard(
-    record: TicketExecutionRecord | undefined,
-    expected: Card,
-    expectedStatus = this.deps.cfg.columns.building,
-  ): Promise<Card | undefined> {
-    const itemId = record?.itemId ?? expected.itemId;
-    const issueNumber = record?.issueNumber ?? expected.number;
-    const card = await this.deps.board.getCard(itemId);
-    // Never settle a replaced/unreadable local association from the old record.
-    // JSON persistence omits optional undefined fields on both sides.
-    if (
-      record &&
-      JSON.stringify(this.deps.worktrees.read(itemId)) !==
-        JSON.stringify(record)
-    )
-      throw new Error(
-        `Ticket execution record changed during launch: ${itemId}`,
-      );
-    const sameTarget =
-      card &&
-      isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task") &&
-      card.itemId === itemId &&
-      card.number === issueNumber;
-    if (
-      sameTarget &&
-      !card.closed &&
-      statusIs(card, expectedStatus) &&
-      card.plan === expected.plan &&
-      card.title === expected.title &&
-      card.body === expected.body &&
-      card.assignees.includes(this.deps.botLogin) &&
-      card.assignees.every((login) => login === this.deps.botLogin)
-    )
-      return card;
-
-    // Only fresh identity/ownership can authorize releasing our claim. Never
-    // restore Ready or post a blocker against a changed contract/human state.
-    if (sameTarget && card.assignees.includes(this.deps.botLogin))
-      await this.deps.board.release(card);
-    // Failed ensure may have left partial/unreadable recovery artifacts. It
-    // supplied no verified record, so even confirmed staleness cannot clear it.
-    if (record) this.deps.worktrees.clearExecution(record.itemId);
-    this.deps.callback(
-      `Skipped stale launch for #${issueNumber}; preserved card status and worktree.` +
-        (sameTarget
-          ? ""
-          : " Original issue claim requires manual verification/cleanup; no remote writes attempted."),
-      "warn",
-    );
-    return undefined;
+  private async currentLaunchCard(record: TicketExecutionRecord, expected: Card): Promise<Card> {
+    const fresh = await this.deps.board.getCard(record.itemId);
+    if (JSON.stringify(this.deps.worktrees.read(record.itemId)) !== JSON.stringify(record)) throw new Error("Execution record changed during launch.");
+    if (!this.target(fresh, record) || ticketCardKey(fresh, record) !== ticketCardKey(expected, record) ||
+      fresh.closed !== expected.closed || fresh.status !== expected.status || !this.owned(fresh))
+      throw new TicketChangedError("Card changed during builder preparation.");
+    return fresh;
   }
 
-  private async resetUnstarted(
-    record: TicketExecutionRecord,
-    expected: Card,
-    reason: string,
-  ): Promise<LaunchResult> {
-    let card = await this.currentLaunchCard(record, expected);
-    if (!card)
-      return { status: "skipped", reason: "card changed before builder start" };
-    let check = this.deps.worktrees.check(record, true);
-    const delta = check.ok
-      ? await this.deps.worktrees.hasTaskDelta(record)
-      : true;
-    card = await this.currentLaunchCard(record, expected);
-    if (!card)
-      return { status: "skipped", reason: "card changed during launch reset" };
-    check = this.deps.worktrees.check(record, true);
-    if (check.ok && !delta && !this.deps.worktrees.hasLocalTaskDelta(record)) {
-      if (!statusIs(card, this.deps.cfg.columns.ready)) {
-        await this.deps.board.setStatus(
-          card.itemId,
-          this.deps.cfg.columns.ready,
-        );
-        card.status = this.deps.cfg.columns.ready;
-      }
-      await this.deps.board.release(card);
-      this.deps.worktrees.clearExecution(record.itemId);
-      this.deps.callback(
-        `Launch preparation failed for "${card.title}": ${reason}. Returned to ${this.deps.cfg.columns.ready}.`,
-        "warn",
-      );
-      return { status: "skipped", reason };
-    }
-    await this.moveToNeedsHuman(record, card, reason);
-    return { status: "needs-human", reason };
-  }
-
-  async launch(
-    snapshot: Card,
-    expectedPlan: string,
-    canStartWork: () => boolean | Promise<boolean> = () => true,
-    canStartWorkNow: () => boolean = () => true,
-    repair?: RepairRequest,
-  ): Promise<LaunchResult> {
-    // Keep the designated input stable across preparation awaits.
-    this.canResume = canStartWork;
-    this.canResumeNow = canStartWorkNow;
-    if (repair) repair = { ...repair };
-    if (repair && this.legacy?.owns(snapshot.itemId))
-      return { status: "skipped", reason: "Migrated repair uses ordinary build retry, not the retired handoff protocol." };
-    if (this.stopping)
-      return { status: "skipped", reason: "executor is stopping" };
+  async launch(snapshot: Card, expectedPlan: string, canStartWork: () => boolean | Promise<boolean> = () => true,
+    canStartWorkNow: () => boolean = () => true): Promise<LaunchResult> {
+    if (this.stopping) return { status: "skipped", reason: "executor is stopping" };
+    this.canResume = canStartWork; this.canResumeNow = canStartWorkNow;
     let card = await this.deps.board.getCard(snapshot.itemId);
-    if (!card) return { status: "skipped", reason: "card no longer exists" };
-    if (card.itemId !== snapshot.itemId || card.number !== snapshot.number)
-      return { status: "skipped", reason: "issue identity changed" };
-    try {
-      if (!this.legacy?.owns(card.itemId)) this.conflicts.assertLaunch(card.itemId, repair);
-    } catch (error) {
-      return { status: "skipped", reason: String(error) };
+    if (!card || card.itemId !== snapshot.itemId || card.number !== snapshot.number) return { status: "skipped", reason: "issue identity changed" };
+    const reason = this.eligible(card, expectedPlan); if (reason) return { status: "skipped", reason };
+    let record = this.deps.worktrees.read(card.itemId);
+    if (readTicketNotice(record?.retry?.reason)) {
+      try { if (await this.settle(record!)) return { status: "skipped", reason: "retry settlement completed; defer builder until next tick" }; }
+      catch (error) {
+        if (!(error instanceof TicketChangedError) || record?.activeRunId || card.assignees.length) throw error;
+      }
+      record = this.deps.worktrees.read(card.itemId);
     }
-    const preClaim = this.eligible(card, expectedPlan);
-    if (preClaim) return { status: "skipped", reason: preClaim };
-
-    if (!(await this.deps.board.claim(card)))
-      return { status: "skipped", reason: "claim lost" };
+    if (!(await this.deps.board.claim(card))) return { status: "skipped", reason: "claim lost" };
     const claimed = card;
     card = await this.deps.board.getCard(snapshot.itemId);
-    if (
-      !card ||
-      card.itemId !== snapshot.itemId ||
-      card.number !== snapshot.number
-    ) {
-      await this.deps.board.release(claimed);
-      return {
-        status: "skipped",
-        reason: "issue identity changed after claim",
-      };
+    if (!card || card.itemId !== claimed.itemId || card.number !== snapshot.number || this.eligible(card, expectedPlan, true)) {
+      if (card && card.number === claimed.number && isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task") && this.owned(card)) await this.deps.board.release(card);
+      return { status: "skipped", reason: "card changed after claim" };
     }
-    const postClaim = this.eligible(card, expectedPlan, true);
-    if (postClaim) {
-      await this.deps.board.release(card);
-      return { status: "skipped", reason: postClaim };
-    }
-
     const task = buildTasksForWave(this.deps.cfg, expectedPlan, [card])[0];
-    const retry = this.deps.worktrees.read(card.itemId)?.retry;
-    if (this.legacy?.owns(card.itemId) && retry?.stage === "build")
-      task.body += `
-
-Recovery context (preserve partial work):
-${retry.reason}`;
-
-    let record: TicketExecutionRecord;
+    let started = false;
     try {
-      if (
-        repair !== undefined &&
-        (!isRepairRequest(repair) || !this.deps.worktrees.read(task.itemId))
-      )
-        throw new Error(
-          "Repair requires a valid request and the original ticket worktree record.",
-        );
       record = await this.deps.worktrees.ensure(task, expectedPlan);
-      if (repair) await this.deps.worktrees.prepareRepair(record, repair);
-    } catch (error: any) {
-      return this.quarantineWithoutRecord(
-        card,
-        `worktree preparation failed: ${error.message}`,
-      );
-    }
-    // Fetch/worktree preparation now yields. Do not overwrite a human state
-    // with In Progress before the later actual-start checkpoint can see it.
-    const prepared = await this.currentLaunchCard(
-      record,
-      card,
-      this.deps.cfg.columns.ready,
-    );
-    if (!prepared)
-      return { status: "skipped", reason: "card changed during preparation" };
-    card = prepared;
-    // The persistent worktree belongs to the ticket, not to a previous run ID.
-    const check = this.deps.worktrees.check(record, false);
-    if (!check.ok) {
-      await this.moveToNeedsHuman(
-        record,
-        card,
-        check.reason ?? "worktree is unsafe",
-      );
-      return {
-        status: "needs-human",
-        reason: check.reason ?? "worktree is unsafe",
-      };
-    }
-
-    if (repair) {
-      try {
-        await this.conflicts.consume(
-          repair,
-          async () => !this.stopping && (await canStartWork()),
-          () => !this.stopping && canStartWorkNow(),
-        );
-      } catch (error) {
-        return { status: "skipped", reason: String(error) };
-      }
-    }
-    record = this.deps.worktrees.beginLaunch(record.itemId);
-    this.activeCount();
-    try {
-      await this.deps.board.setStatus(
-        card.itemId,
-        this.deps.cfg.columns.building,
-      );
-      card.status = this.deps.cfg.columns.building;
-    } catch (error: any) {
-      if (!repair) {
-        await this.deps.board.release(card);
-        this.deps.worktrees.clearExecution(record.itemId);
-      }
-      return {
-        status: "skipped",
-        reason: `could not move ticket to ${this.deps.cfg.columns.building}: ${error.message}`,
-      };
-    }
-
-    let context: string | undefined;
-    try {
-      context = await this.deps.context?.(record);
-    } catch (error: any) {
-      this.deps.callback(`Context generation failed: ${error.message}`, "warn");
-    }
-
-    let script: string;
-    try {
-      script = renderWorkflowSource({
-        cfg: this.deps.cfg,
-        planSlug: expectedPlan,
-        baseBranch: this.deps.cfg.branches.base,
-        tasks: [{ ...task, baseBranch: record.baseBranch }],
-        skillName: "board-agent",
-        context,
-        ...(repair ? { repair } : {}),
+      task.taskKey = record.taskKey;
+      card = await this.currentLaunchCard(record, card);
+      const priorRetry = record.retry?.reason;
+      const retryContext = readTicketNotice(priorRetry) ? priorRetry!.slice(priorRetry!.indexOf("\n") + 1) : priorRetry;
+      record = this.deps.worktrees.beginLaunch(record.itemId);
+      // Known-unstarted preparation. Removed synchronously before start(); a
+      // later launch window is observation-only, never guessed or re-launched.
+      record = persistTicketNotice(this.deps.worktrees, record, { ...card, status: this.deps.cfg.columns.building }, "build",
+        this.deps.cfg.columns.ready, failureComment("Builder preparation was interrupted before invocation."));
+      this.activeCount();
+      await this.deps.board.setStatus(card.itemId, this.deps.cfg.columns.building);
+      card = { ...card, status: this.deps.cfg.columns.building };
+      const comments = this.deps.board.missionComments ? await this.deps.board.missionComments(card) : [];
+      let context: string | undefined;
+      try { context = await this.deps.context?.(record); }
+      catch (error) { this.deps.callback(`Context generation failed: ${String(error)}`, "warn"); }
+      const script = renderWorkflowSource({ cfg: this.deps.cfg, planSlug: expectedPlan, baseBranch: record.baseBranch,
+        tasks: [{ ...task, baseBranch: record.baseBranch }], skillName: "board-agent", context,
+        retry: retryContext, decisions: trustedMissionComments(comments, this.deps.botLogin) });
+      const manager = this.manager(record.path);
+      card = await this.currentLaunchCard(record, card);
+      const admission = await canStartWork();
+      card = await this.currentLaunchCard(record, card);
+      const check = this.deps.worktrees.check(record, false);
+      if (!check.ok) throw new Error(check.reason);
+      if (!admission || !canStartWorkNow() || this.stopping) throw new Error("Builder admissions stopped.");
+      record = this.deps.worktrees.update(record.itemId, (r) => {
+        if (JSON.stringify(r) !== JSON.stringify(record)) throw new Error("Execution changed before builder start.");
+        return { ...r, retry: retryContext ? { stage: "build", reason: retryContext } : undefined };
       });
-    } catch (error: any) {
-      return this.resetUnstarted(record, card, error.message);
-    }
-
-    let manager: TicketWorkflowManager;
-    try {
-      manager = this.manager(record.path);
-    } catch (error: any) {
-      return this.resetUnstarted(
-        record,
-        card,
-        `workflow manager failed: ${error.message}`,
-      );
-    }
-    // Keep the pre-observation gate: it rejects withdrawn work before revision
-    // I/O, and preserves callers whose revision changes during this first read.
-    const beforeRevision = await this.currentLaunchCard(record, card);
-    if (!beforeRevision)
-      return { status: "skipped", reason: "card changed before builder start" };
-    const admission = await canStartWork();
-    if (!(await this.recovery(record).executionCard(record, beforeRevision)))
-      return {
-        status: "skipped",
-        reason: "repair authorization changed before start",
-      };
-    const current = await this.currentLaunchCard(record, beforeRevision);
-    if (!current)
-      return { status: "skipped", reason: "card changed before builder start" };
-    card = current;
-    // No await after fresh remote authority: the local revision/admission latch
-    // and stop may have changed during that read. Do not reserve a second slot.
-    if (!admission || !canStartWorkNow() || this.stopping)
-      return this.resetUnstarted(record, card, "builder admissions stopped");
-
-    if (repair) {
-      try {
-        this.deps.worktrees.checkRepairStart(record, repair);
-      } catch (error) {
-        const reason = `Repair admission failed: ${String(error)}`;
-        await this.moveToNeedsHuman(record, card, reason);
-        return { status: "needs-human", reason };
-      }
-    }
-    let runId: string;
-    try {
-      runId = manager.start(
-        script,
-        {
-          itemId: record.itemId,
-          issueNumber: record.issueNumber,
-          taskKey: record.taskKey,
-          ...(repair ? { repair } : {}),
-        },
-        {
-          maxAgents: 1,
-          concurrency: 1,
-          agentRetries: this.deps.cfg.builder_retries,
-          ...(this.deps.cfg.builder_timeout_ms === undefined
-            ? {}
-            : { agentTimeoutMs: this.deps.cfg.builder_timeout_ms }),
-        },
-      );
-    } catch (error: any) {
-      const matches = this.matchingLaunchRuns(record, manager);
-      if (matches.length === 1) {
-        runId = matches[0].runId;
-      } else {
-        return this.resetUnstarted(
-          record,
-          card,
-          `workflow launch failed: ${error.message}`,
-        );
-      }
-    }
-
-    try {
-      const active = this.deps.worktrees.setActiveRun(record.itemId, runId);
-      this.recovery(active).bind(active, runId, { repair });
-    } catch (error: any) {
-      this.deps.callback(
-        `Run ${runId} persisted but its ticket record was not updated: ${error.message}`,
-        "warn",
-      );
-    }
-    this.activeCount();
-    this.deps.callback(
-      `Launched ${record.taskKey} as ${runId} in ${record.path}.`,
-    );
-    return { status: "launched", runId, worktree: record.path };
-  }
-
-  async finalizeClosed(
-    snapshot: Card,
-    canStartWork: () => boolean | Promise<boolean> = () => true,
-    canStartWorkNow: () => boolean = () => true,
-  ): Promise<FinalizeOutcome> {
-    let card: Card | undefined;
-    try {
-      card = await this.deps.board.getCard(snapshot.itemId);
+      started = true;
+      const runId = manager.start(script, { itemId: record.itemId, issueNumber: record.issueNumber, taskKey: record.taskKey },
+        { maxAgents: 1, concurrency: 1, agentRetries: this.deps.cfg.builder_retries,
+          ...(this.deps.cfg.builder_timeout_ms === undefined ? {} : { agentTimeoutMs: this.deps.cfg.builder_timeout_ms }) });
+      try { this.deps.worktrees.setActiveRun(record.itemId, runId); }
+      catch (error) { this.deps.callback(`Run ${runId} persisted; ticket binding pending: ${String(error)}`, "warn"); }
+      this.activeCount();
+      this.deps.callback(`Launched ${record.taskKey} as ${runId} in ${record.path}.`);
+      return { status: "launched", runId, worktree: record.path };
     } catch (error) {
-      return {
-        status: "blocked",
-        reason: `fresh card read failed: ${error instanceof Error ? error.message : String(error)}`,
-      };
-    }
-    if (!card) return { status: "skipped", reason: "card no longer exists" };
-    if (!isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task"))
-      return {
-        status: "skipped",
-        reason: "card is not a Task Issue in the configured repository",
-      };
-    if (card.itemId !== snapshot.itemId || card.number !== snapshot.number)
-      return { status: "skipped", reason: "issue changed" };
-    if (!card.closed || !statusIs(card, this.deps.cfg.columns.done))
-      return {
-        status: "skipped",
-        reason: "ticket is no longer closed and Done",
-      };
-
-    const blocked = this.recoveryBlocker(card.itemId);
-    if (blocked) return { status: "blocked", reason: blocked };
-    if (this.legacy && this.deps.worktrees.hasCleanupReceipt(card.itemId))
-      return { status: "blocked", reason: "Legacy receipt conversion/cleanup pending (T004)." };
-    try {
-      const task = buildTasksForWave(this.deps.cfg, "", [card])[0];
-      const resultSha = await this.deps.worktrees.finalizeAccepted(
-        task,
-        this.deps.cfg.task_merge_strategy,
-      );
-      if (!resultSha)
-        return { status: "skipped", reason: "no local task branch" };
-      this.deps.callback(
-        `Finalized #${card.number} "${card.title}" at ${resultSha} in ${task.baseBranch}. Deleted local/remote branch ${task.taskBranch} and removed its worktree.`,
-      );
-      return { status: "finalized", resultSha };
-    } catch (error) {
-      if (error instanceof MergeConflictError) {
-        if (this.deps.board.conflict) {
-          const repair: RepairRequest = {
-            requestKey: conflictRequestKey(
-              card.itemId,
-              error.baseSha,
-              error.taskSha,
-            ),
-            baseSha: error.baseSha,
-            taskSha: error.taskSha,
-          };
-          try {
-            if (this.deps.worktrees.read(card.itemId)?.finalization) {
-              await this.deps.worktrees.clearPrePushConflict(
-                buildTasksForWave(this.deps.cfg, "", [card])[0],
-                error,
-                async () => {
-                  if (this.stopping || !(await canStartWork()))
-                    throw new Error("Repair admissions stopped.");
-                  const fresh = await this.deps.board.getCard(card!.itemId);
-                  if (
-                    !fresh ||
-                    JSON.stringify({
-                      ...fresh,
-                      assignees: [],
-                      status: undefined,
-                      closed: undefined,
-                    }) !==
-                      JSON.stringify({
-                        ...card,
-                        assignees: [],
-                        status: undefined,
-                        closed: undefined,
-                      }) ||
-                    !fresh.closed ||
-                    !statusIs(fresh, this.deps.cfg.columns.done) ||
-                    fresh.assignees.length > 1 ||
-                    fresh.assignees.some(
-                      (a) =>
-                        a.toLowerCase() !== this.deps.botLogin.toLowerCase(),
-                    ) ||
-                    this.stopping ||
-                    !canStartWorkNow()
-                  )
-                    throw new Error(
-                      "Legacy repair approval/ownership changed.",
-                    );
-                },
-              );
-            }
-            await this.conflicts.request(
-              card,
-              repair,
-              async () => !this.stopping && (await canStartWork()),
-              () => !this.stopping && canStartWorkNow(),
-            );
-            return {
-              status: "skipped",
-              repair,
-              reason:
-                "Conflict repair queued for the existing Ready scheduler.",
-            };
-          } catch (handoffError) {
-            return {
-              status: "blocked",
-              repair,
-              reason:
-                handoffError instanceof Error
-                  ? handoffError.message
-                  : String(handoffError),
-            };
+      const reason = String(error);
+      if (record && !started) {
+        if (error instanceof TicketChangedError) await this.withdraw(record, card);
+        else {
+          if (!readTicketNotice(record.retry?.reason)) record = persistTicketNotice(this.deps.worktrees, record, card, "build", this.deps.cfg.columns.ready, failureComment(reason));
+          try { await this.settle(record); }
+          catch (e) {
+            if (e instanceof TicketChangedError) await this.withdraw(record, card);
+            else this.deps.callback(`Launch settlement pending: ${String(e)}`, "warn");
           }
         }
-        return {
-          status: "conflict",
-          baseSha: error.baseSha,
-          taskSha: error.taskSha,
-          reason: error.diagnostic,
-        };
       }
-      return {
-        status: "blocked",
-        reason: error instanceof Error ? error.message : String(error),
-      };
+      if (!record) {
+        // No verified record was returned: never fabricate ownership or erase
+        // ensure's possible partial evidence. Only the original Issue's bot
+        // claim can be freshly released; technical diagnostics remain local.
+        const fresh = await this.deps.board.getCard(snapshot.itemId);
+        if (fresh && isTargetIssue(fresh, this.deps.repoOwner, this.deps.repoName, "Task") &&
+          fresh.itemId === snapshot.itemId && fresh.number === snapshot.number && this.owned(fresh))
+          await this.deps.board.release(fresh);
+      }
+      this.deps.callback(`Builder launch ${snapshot.itemId}: ${reason}; original worktree/evidence retained.`, "warn");
+      return { status: "skipped", reason };
     }
+  }
+
+  /** Ordinary builder retry seam for T004's verified pre-push conflicts. */
+  async retryConflict(card: Card, conflict: MergeConflictError): Promise<void> {
+    let record = this.deps.worktrees.read(card.itemId);
+    if (!record || this.recoveryBlocker(card.itemId) || record.activeRunId || record.launchingAt !== undefined ||
+      this.deps.worktrees.hasCleanupReceipt(card.itemId)) throw new Error("Conflict requires the idle original ticket record.");
+    const fresh = await this.deps.board.getCard(card.itemId);
+    if (!this.target(fresh, record) || ticketCardKey(fresh, record) !== ticketCardKey(card, record) || !fresh.closed ||
+      !statusIs(fresh, this.deps.cfg.columns.done) || fresh.assignees.some((a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase()))
+      throw new TicketChangedError("Conflict approval/identity/claim changed.");
+    if (!this.owned(fresh) && !(await this.deps.board.claim(fresh))) throw new Error("Conflict claim lost.");
+    card = await this.currentLaunchCard(record, { ...fresh, assignees: [this.deps.botLogin] });
+    record = persistTicketNotice(this.deps.worktrees, record, card, "build", this.deps.cfg.columns.ready,
+      failureComment(`Merge conflict after manual close.\nBase commit: ${conflict.baseSha}\nOriginal task commit: ${conflict.taskSha}\n${conflict.diagnostic}\n\nMerge this base into the ORIGINAL task branch, resolve conflicts preserving both sides' requirements, and run the existing relevant tests. Continue MERGE_HEAD if already present. Independent Review, Done and a NEW manual close are required.`));
+    await this.settle(record);
+  }
+
+  async finalizeClosed(snapshot: Card, _canStartWork: () => boolean | Promise<boolean> = () => true,
+    _canStartWorkNow: () => boolean = () => true): Promise<FinalizeOutcome> {
+    try {
+      let card: Card | undefined;
+      try { card = await this.deps.board.getCard(snapshot.itemId); }
+      catch (error) { return { status: "blocked", reason: `fresh card read failed: ${error instanceof Error ? error.message : String(error)}` }; }
+      if (!card || card.itemId !== snapshot.itemId || !isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task") || card.number !== snapshot.number ||
+        !card.closed || !statusIs(card, this.deps.cfg.columns.done)) return { status: "skipped", reason: "ticket is no longer the same closed Done Task" };
+      const blocked = this.recoveryBlocker(card.itemId); if (blocked) return { status: "blocked", reason: blocked };
+      if (this.legacy && this.deps.worktrees.hasCleanupReceipt(card.itemId)) return { status: "blocked", reason: "Legacy receipt cleanup pending (T004)." };
+      if (this.deps.worktrees.read(card.itemId)?.retry)
+        return { status: "blocked", reason: "Ordinary build/review retry must finish before renewed Review, Done and manual close." };
+      try {
+        const task = buildTasksForWave(this.deps.cfg, "", [card])[0];
+        const resultSha = await this.deps.worktrees.finalizeAccepted(task, this.deps.cfg.task_merge_strategy);
+        if (resultSha) this.deps.callback(`Finalized #${card.number} "${card.title}" at ${resultSha} in ${task.baseBranch}. Deleted local/remote branch ${task.taskBranch} and removed its worktree.`);
+        return resultSha ? { status: "finalized", resultSha } : { status: "skipped", reason: "no local task branch" };
+      } catch (error) {
+        if (!(error instanceof MergeConflictError)) throw error;
+        await this.retryConflict(card, error);
+        return { status: "conflict", baseSha: error.baseSha, taskSha: error.taskSha, reason: error.diagnostic };
+      }
+    } catch (error) { return { status: "blocked", reason: String(error) }; }
   }
 
   activeCount(): number {
-    let count = 0;
     const active: ActiveTicketRun[] = [];
     for (const record of this.deps.worktrees.list()) {
-      let status: string;
-      if (record.launchingAt !== undefined && !record.activeRunId) {
-        status = "launching";
-        count++;
-      } else if (record.activeRunId) {
+      if (!record.activeRunId && record.launchingAt === undefined) continue;
+      let status = "launching";
+      if (record.activeRunId) {
         try {
-          if (this.legacy && !this.deps.worktrees.check(record, false).ok)
-            throw new Error("Unsafe legacy worktree; do not open its manager.");
-          status =
-            this.manager(record.path)
-              .list()
-              .find((candidate) => candidate.runId === record.activeRunId)
-              ?.status ?? "missing";
-        } catch {
-          status = "unreadable";
-        }
-        if (
-          ["missing", "unreadable", "pending", "running", "paused"].includes(
-            status,
-          )
-        )
-          count++;
-      } else continue;
-      active.push({
-        itemId: record.itemId,
-        taskKey: record.taskKey,
-        runId: record.activeRunId ?? "launching",
-        status,
-        worktree: record.path,
-      });
+          if (!this.deps.worktrees.check(record, false).ok) throw new Error("Unsafe worktree.");
+          status = this.manager(record.path).list().find((r) => r.runId === record.activeRunId)?.status ?? "missing";
+        } catch { status = "unreadable"; }
+      }
+      active.push({ itemId: record.itemId, taskKey: record.taskKey, runId: record.activeRunId ?? "launching", status, worktree: record.path });
     }
-    // Refresh UI from the live admission observation, never the reverse.
-    this.observation = { active, occupiedSlots: count };
-    return count;
+    // Terminal status isn't drain/release proof. Keep the slot until settlement.
+    this.observation = { active, occupiedSlots: active.length };
+    return active.length;
   }
-
   stopScheduling(): void {
     this.stopping = true;
     for (const manager of this.managers.values()) manager.stopScheduling?.();
   }
-
   async shutdown(): Promise<void> {
     this.stopScheduling();
     const errors: string[] = [];
@@ -1832,26 +821,17 @@ ${retry.reason}`;
       const before = errors.length;
       try {
         for (const run of manager.list()) {
-          // Paused is a request, not proof that the agent's finally settled.
           if (!["running", "pending", "paused"].includes(run.status)) continue;
-          try {
-            await manager.pauseAndWait(run.runId);
-          } catch (error: any) {
-            errors.push(`${run.runId}: ${error.message}`);
-          }
+          try { await manager.pauseAndWait(run.runId); }
+          catch (error) { errors.push(`${run.runId}: ${String(error)}`); }
         }
-        if (errors.length === before) {
-          manager.dispose();
-          this.managers.delete(path);
-        }
-      } catch (error: any) {
-        errors.push(`${path}: ${error.message}`);
-      }
+        if (errors.length === before) { manager.dispose(); this.managers.delete(path); }
+      } catch (error) { errors.push(`${path}: ${String(error)}`); }
     }
-    if (errors.length > 0)
-      throw new Error(`Could not pause workflow run(s): ${errors.join("; ")}`);
+    if (errors.length) throw new Error(`Could not pause workflow run(s): ${errors.join("; ")}`);
   }
 }
+
 
 export function createProductionTicketExecutor(options: {
   ownerLock?: OwnerLock;
@@ -1868,20 +848,8 @@ export function createProductionTicketExecutor(options: {
   sessionId?: string;
 }): ManagedTicketExecutor {
   const board: TicketBoardAdapter = {
-    conflict: {
-      listComments: (card) =>
-        listIssueComments(card.repoOwner!, card.repoName!, card.number!),
-      createComment: async (card, body) =>
-        createComment(
-          await resolveIssueId(card.repoOwner!, card.repoName!, card.number!),
-          body,
-        ),
-      updateComment: (_card, id, body) => updateIssueComment(id, body),
-      reopen: async (card) =>
-        reopenIssue(
-          await resolveIssueId(card.repoOwner!, card.repoName!, card.number!),
-        ),
-    },
+    reopen: async (card) => reopenIssue(await resolveIssueId(card.repoOwner!, card.repoName!, card.number!)),
+    missionComments: (card) => listIssueComments(card.repoOwner!, card.repoName!, card.number!),
     getCard: (itemId) =>
       getCard(
         itemId,
@@ -1894,9 +862,7 @@ export function createProductionTicketExecutor(options: {
     release: (card) => release(card, options.botLogin),
     async listComments(card) {
       if (!card.number || !card.repoOwner || !card.repoName) return [];
-      return (
-        await listIssueComments(card.repoOwner, card.repoName, card.number)
-      ).map((comment) => comment.body);
+      return listIssueComments(card.repoOwner, card.repoName, card.number);
     },
     async comment(card, body) {
       if (!card.number || !card.repoOwner || !card.repoName)

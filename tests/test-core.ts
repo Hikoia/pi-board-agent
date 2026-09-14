@@ -121,8 +121,8 @@ check(builder.prompt.includes("[T001] Add login form") && builder.options?.model
 check(builder.prompt.includes("persistent worktree") && !builderSource.includes("isolation:") && !builderSource.includes("parallel("), "builder uses only its prepared persistent worktree");
 check(builder.prompt.includes("MINIMALISM:") && builder.prompt.includes("standard-library/native") && builder.prompt.includes("required now"), "builder prompt retains the minimal implementation ladder");
 check(builder.prompt.includes("Do NOT merge") && builder.prompt.includes("do NOT close the ticket") && !builderSource.includes("git merge --"), "builder leaves the task unmerged for manual validation");
-check(builder.prompt.includes("gh issue view 42 --json comments") && builder.prompt.includes("OWNER, MEMBER, or COLLABORATOR"), "builder reads linked Issue comments with the trusted-reply rule");
-check(["attempted", "limitations", "workaround", "humanAction"].every((key) => builder.prompt.includes(key) && schemaHas(builder, key)), "builder prompt and schema preserve actionable failure guidance");
+check(builder.prompt.includes("supplied trusted maintainer replies") && builder.prompt.includes("only after manual Ready") && !builder.prompt.includes("gh issue view 42 --json comments"), "builder uses host-filtered decisions after manual Ready rather than a comment listener");
+check(["attempted", "limitations", "workaround", "question", "context", "options", "recommendation"].every((key) => builder.prompt.includes(key) && schemaHas(builder, key)), "builder schema separates technical diagnostics from complete human decisions");
 const agentPrompt = readFileSync(new URL("../agents/board-agent-builder.md", import.meta.url), "utf8");
 const skill = readFileSync(new URL("../skills/board-agent/SKILL.md", import.meta.url), "utf8");
 check(agentPrompt.includes("NON-production compatibility pointer") && agentPrompt.includes("../skills/board-agent/SKILL.md") && agentPrompt.includes("../src/workflow-prompt.ts") && !agentPrompt.includes("## Rules") && !agentPrompt.includes("## System prompt") && skill.includes("## Minimal implementation"), "packaged compatibility pointer links the builder skill and actual workflow mission without a second rule body");
@@ -250,6 +250,7 @@ check(!state.running && shutdowns === 1, "awaited loop.stop settles the executor
 const live = [card(1), card(2), card(3), card(42, { status: "Review" }), card(43, { status: "Review" })];
 const worktrees = new TicketWorktrees(repo);
 for (const c of live.slice(3)) await worktrees.ensure(buildTasksForWave(cfg, "001-auth", [c])[0], "001-auth");
+const pinnedReviewSha = worktrees.localBranchSha("task/issue-42")!;
 let active = 0;
 let reviewCalls = 0;
 const events: string[] = [];
@@ -259,7 +260,7 @@ const board: LoopBoardOps = {
   claim: async (c) => { current(c).assignees = ["bot"]; events.push(`claim:${c.number}`); return true; },
   release: async (c) => { current(c).assignees = []; events.push(`release:${c.number}`); },
   listComments: async () => [],
-  comment: async (c, body) => { events.push(`comment:${c.number}`); check(body.includes("missing guard"), "loop publishes actual blocking review findings"); return "COMMENT_1"; },
+  comment: async (c, body) => { events.push(`comment:${c.number}`); if (c.number === 43) check(body.includes("missing guard"), "loop publishes actual blocking review findings"); return "COMMENT_1"; },
   setStatus: async (c, status) => { current(c).status = status; events.push(`status:${status}`); },
 };
 const schedulingExecutor: TicketExecutor = { ...executor,
@@ -278,7 +279,8 @@ const schedulingLoop = new BoardLoop({ ...deps,
     reviewCalls++; events.push(`review:${input.issueNumber}`); entered();
     await pendingReview;
     active = 0; // A background builder finished while the reviewer was awaited.
-    return reviewCalls === 1 ? { verdict: "pass", summary: "ok", findings: [], taskSha } : { verdict: "fail", summary: "Bug", findings: ["src/a.ts: missing guard"], taskSha };
+    assert.equal(input.taskSha, pinnedReviewSha);
+    return reviewCalls === 1 ? { verdict: "pass", summary: "ok", findings: [], taskSha: pinnedReviewSha } : { verdict: "fail", summary: "Bug", findings: ["src/a.ts: missing guard"], taskSha: pinnedReviewSha };
   },
 }, schedulingState, schedulingExecutor, worktrees);
 let tickSettled = false;
@@ -289,7 +291,7 @@ check(!tickSettled && schedulingState.reviewingTask === "T042" && !events.includ
 finishReview();
 await tick;
 check(reviewCalls === 1 && !events.includes("claim:43"), "loop reviews at most one claimed card per tick");
-check(live[3].status === "Done" && !live[3].closed && worktrees.read(live[3].itemId)?.reviewedTaskSha === taskSha && messages.some((m) => m.includes("close issue #42")), "accepted review records the exact SHA, moves to Done, and waits for manual closure");
+check(live[3].status === "Done" && !live[3].closed && worktrees.read(live[3].itemId)?.reviewedTaskSha === pinnedReviewSha && messages.some((m) => m.includes("close issue #42")), "accepted review records the exact SHA, moves to Done, and waits for manual closure");
 check(events.indexOf("build:2") > events.indexOf("release:42") && events.includes("build:3") && active === 2, "review completion recounts active builders before filling both newly available slots");
 check(schedulingState.reviewingTask === null && schedulingState.wavesLaunched === 3, "review indicator is cleared and only launched builders count as waves");
 active = 0;
