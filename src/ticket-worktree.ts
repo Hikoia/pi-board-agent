@@ -275,7 +275,10 @@ const hash = (bytes: Buffer) =>
   createHash("sha256").update(bytes).digest("hex");
 const equalRecordBytes = (bytes: Buffer, record: TicketExecutionRecord) => {
   try {
-    return JSON.stringify(JSON.parse(bytes.toString("utf8"))) === JSON.stringify(record);
+    return (
+      JSON.stringify(JSON.parse(bytes.toString("utf8"))) ===
+      JSON.stringify(record)
+    );
   } catch (error) {
     throw new Error("Corrupt cleanup execution record.", { cause: error });
   }
@@ -704,7 +707,10 @@ export class TicketWorktrees {
     if (JSON.stringify(current) !== JSON.stringify(record))
       throw new Error("Conflict record changed.");
     await this.prepareRepair(record, repair);
-    if (!allowBaseAdvance && this.fetchedSha(record.baseBranch) !== repair.baseSha)
+    if (
+      !allowBaseAdvance &&
+      this.fetchedSha(record.baseBranch) !== repair.baseSha
+    )
       throw new Error("Conflict base advanced before handoff.");
     this.checkConflict(record, repair);
   }
