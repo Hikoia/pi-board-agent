@@ -62,7 +62,7 @@ for (const interruptedConsume of [false, true]) {
       ])
         assert.equal(f.events.filter((e) => e === event).length, 1, event);
       assert.equal(f.store.read(f.card.itemId)?.path, f.record.path);
-      assert.equal(f.store.read(f.card.itemId)?.schemaVersion, 3);
+      assert.equal(f.store.read(f.card.itemId)?.schemaVersion, f.record.schemaVersion);
       assert.equal(f.card.status, f.cfg.columns.review, f.notices.join("\n"));
       assert.equal(f.card.closed, false);
       assert.ok(existsSync(f.record.path));

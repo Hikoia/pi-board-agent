@@ -162,9 +162,9 @@ function integrate(f: Awaited<ReturnType<typeof fixture>>) {
     if (launched.status !== "launched") throw new Error("not launched");
     const run = await settled(f, launched.runId);
     assert.equal(run.status, "completed", JSON.stringify(run));
-    assert.deepEqual((run.args as any).repair, f.repair, "repair is in durable args, not the v3 record");
+    assert.deepEqual((run.args as any).repair, f.repair, "repair is in durable args, not the ticket record");
     assert.equal(run.maxAgents, 1); assert.equal(run.concurrency, 1);
-    assert.equal(f.store.read(f.card.itemId)?.schemaVersion, 3);
+    assert.equal(f.store.read(f.card.itemId)?.schemaVersion, f.record.schemaVersion);
     assert.equal(Object.hasOwn(f.store.read(f.card.itemId)!, "repair"), false);
     assert.equal(readFileSync(join(f.record.path, ".pi/tested"), "utf8"), resultSha + "\n", "existing tests actually executed at integrated commit");
     assert.equal(readFileSync(join(f.record.path, "task-only.txt"), "utf8"), "original task edit\n");

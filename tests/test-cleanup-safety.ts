@@ -197,6 +197,12 @@ try {
         r.record.activeRunId = "mixed";
         r.record.activeRunStartedAt = 1;
       },
+      (r: any) => {
+        r.record.retry = { stage: "cleanup", reason: "Unfinished settlement" };
+      },
+      (r: any) => {
+        r.record.integration = { baseSha: f.base, taskSha: f.taskSha, resultSha: r.resultSha };
+      },
     ]) {
       const value = JSON.parse(receipt.toString());
       change(value);

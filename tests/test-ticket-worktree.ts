@@ -78,6 +78,32 @@ async function fixture() {
 
 {
   const f = await fixture();
+  assert.equal(f.record.schemaVersion, 4);
+  const task = { ...f.task, itemId: "NO_PLAN", issueNumber: 101, taskBranch: "task/issue-101" };
+  const record = await f.store.ensure(task);
+  assert.equal(record.schemaVersion, 4);
+  assert.equal(Object.hasOwn(record, "plan"), false);
+  const file = join(f.repo, ".pi/board-agent/ticket-worktrees/no_plan.json");
+  assert.equal(Object.hasOwn(JSON.parse(readFileSync(file, "utf8")), "plan"), false);
+  writeFileSync(join(record.path, "partial.txt"), "unfinished builder work\n");
+  assert.deepEqual(await new TicketWorktrees(f.repo).ensure(task), record);
+  assert.equal(readFileSync(join(record.path, "partial.txt"), "utf8"), "unfinished builder work\n");
+  await assert.rejects(() => f.store.ensure(task, "changed-plan"), /no longer matches/);
+  const invalid = { ...task, itemId: "INVALID", issueNumber: 102, taskBranch: "task/issue-102" };
+  await assert.rejects(() => f.store.ensure(invalid, ""), /Invalid ticket execution record/);
+  assert.equal(f.store.has(invalid.itemId), false);
+  assert.equal(f.store.localBranchSha(invalid.taskBranch), undefined);
+  // T001 retains the old execution path, not an implicit v3 -> v4 conversion.
+  const legacyFile = join(f.repo, ".pi/board-agent/ticket-worktrees", `${f.task.itemId.toLowerCase()}.json`);
+  const legacy = { ...f.record, schemaVersion: 3 };
+  writeFileSync(legacyFile, JSON.stringify(legacy, null, "\t") + "\r\n");
+  const original = readFileSync(legacyFile);
+  assert.deepEqual(await new TicketWorktrees(f.repo).ensure(f.task, "demo"), legacy);
+  assert.deepEqual(readFileSync(legacyFile), original);
+  console.log("PASS: ensure creates v4 with optional Plan, resumes original dirty work, validates before creating refs, and retains v3 reads byte-for-byte");
+}
+{
+  const f = await fixture();
   writeFileSync(join(f.record.path, "dirty.txt"), "keep me\n");
   await assert.rejects(() => f.finish(), /Dirty worktree/);
   f.kept();

@@ -47,12 +47,27 @@ export interface TicketFinalizationState {
   resultSha?: string;
 }
 
+export interface TicketRetryState {
+  stage: "build" | "review" | "integrate" | "cleanup";
+  /** Also retained while failure comment/status/reopen/release is unfinished. */
+  reason: string;
+}
+
+export interface TicketIntegrationState {
+  baseSha: string;
+  taskSha: string;
+  /** A prepared result, NOT proof of a successful push or permission to clean up. */
+  resultSha: string;
+}
+
 export interface TicketExecutionRecord {
-  schemaVersion: 3;
+  /** v3 remains readable/writable in place until the stopped-upgrade adapter. */
+  schemaVersion: 3 | 4;
   itemId: string;
   issueNumber: number;
   taskKey: string;
-  plan: string;
+  /** Required in v3; optional in v4. */
+  plan?: string;
   taskBranch: string;
   baseBranch: string;
   path: string;
@@ -62,7 +77,10 @@ export interface TicketExecutionRecord {
   activeRunStartedAt?: number;
   lastRunId?: string;
   reviewedTaskSha?: string;
+  /** Legacy paths remain available during the serial upgrade. */
   finalization?: TicketFinalizationState;
+  retry?: TicketRetryState;
+  integration?: TicketIntegrationState;
 }
 
 export type TicketWorktreeRecord = TicketExecutionRecord;
@@ -102,6 +120,7 @@ const RECORD_FIELDS = new Set([
   "reviewedTaskSha",
   "finalization",
 ]);
+const V4_RECORD_FIELDS = new Set([...RECORD_FIELDS, "retry", "integration"]);
 const FINALIZATION_FIELDS = new Set([
   "targetBranch",
   "baseSha",
@@ -220,19 +239,40 @@ function isFinalization(value: unknown): value is TicketFinalizationState {
   );
 }
 
+function isRetry(value: unknown): value is TicketRetryState {
+  if (!exactKeys(value, ["stage", "reason"])) return false;
+  const state = value as TicketRetryState;
+  return (
+    ["build", "review", "integrate", "cleanup"].includes(state.stage) &&
+    typeof state.reason === "string" &&
+    state.reason.trim().length > 0
+  );
+}
+
+function isIntegration(value: unknown): value is TicketIntegrationState {
+  if (!exactKeys(value, ["baseSha", "taskSha", "resultSha"])) return false;
+  const state = value as TicketIntegrationState;
+  return [state.baseSha, state.taskSha, state.resultSha].every(
+    (sha) => typeof sha === "string" && SHA.test(sha),
+  );
+}
+
 export function isTicketExecutionRecord(
   value: unknown,
 ): value is TicketExecutionRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
+  const fields = record.schemaVersion === 4 ? V4_RECORD_FIELDS : RECORD_FIELDS;
   return (
-    Object.keys(record).every((key) => RECORD_FIELDS.has(key)) &&
-    record.schemaVersion === 3 &&
+    Object.keys(record).every((key) => fields.has(key)) &&
+    (record.schemaVersion === 3 || record.schemaVersion === 4) &&
     singleLine(record.itemId) &&
     Number.isSafeInteger(record.issueNumber) &&
     Number(record.issueNumber) > 0 &&
     singleLine(record.taskKey) &&
-    singleLine(record.plan) &&
+    (record.schemaVersion === 3
+      ? singleLine(record.plan)
+      : optionalString(record.plan)) &&
     singleLine(record.taskBranch) &&
     singleLine(record.baseBranch) &&
     singleLine(record.path) &&
@@ -246,13 +286,16 @@ export function isTicketExecutionRecord(
       (record.activeRunStartedAt === undefined) &&
     !(record.launchingAt !== undefined && record.activeRunId !== undefined) &&
     !(
-      record.finalization !== undefined &&
+      (record.finalization !== undefined || record.integration !== undefined) &&
       (record.launchingAt !== undefined || record.activeRunId !== undefined)
     ) &&
+    !(record.finalization !== undefined && record.integration !== undefined) &&
     (record.reviewedTaskSha === undefined ||
       (typeof record.reviewedTaskSha === "string" &&
         SHA.test(record.reviewedTaskSha))) &&
-    (record.finalization === undefined || isFinalization(record.finalization))
+    (record.finalization === undefined || isFinalization(record.finalization)) &&
+    (record.retry === undefined || isRetry(record.retry)) &&
+    (record.integration === undefined || isIntegration(record.integration))
   );
 }
 
@@ -353,8 +396,12 @@ export class TicketWorktrees {
 
   private parse(path: string): TicketExecutionRecord | undefined {
     try {
+      if (this.hasSymlink(path) || !lstatSync(path).isFile()) return undefined;
       const value: unknown = JSON.parse(readFileSync(path, "utf8"));
-      return isTicketExecutionRecord(value) ? value : undefined;
+      return isTicketExecutionRecord(value) &&
+        path === this.recordPath(value.itemId)
+        ? value
+        : undefined;
     } catch {
       return undefined;
     }
@@ -362,7 +409,7 @@ export class TicketWorktrees {
 
   read(itemId: string): TicketExecutionRecord | undefined {
     const path = this.recordPath(itemId);
-    const record = existsSync(path) ? this.parse(path) : undefined;
+    const record = this.parse(path);
     return record?.itemId === itemId ? record : undefined;
   }
 
@@ -377,7 +424,8 @@ export class TicketWorktrees {
   }
 
   has(itemId: string): boolean {
-    return existsSync(this.recordPath(itemId));
+    // Presence, not validity: even dangling links must block replacement.
+    return !!lstatSync(this.recordPath(itemId), { throwIfNoEntry: false });
   }
 
   /** Full local ref names for a tick's negative filter, never approval evidence. */
@@ -407,8 +455,11 @@ export class TicketWorktrees {
 
   private save(record: TicketExecutionRecord, expectedBytes?: Buffer): void {
     if (!isTicketExecutionRecord(record))
-      throw new Error("Invalid v3 ticket execution record.");
+      throw new Error("Invalid ticket execution record.");
     const path = this.recordPath(record.itemId);
+    const stat = lstatSync(path, { throwIfNoEntry: false });
+    if (this.hasSymlink(path) || (stat && !stat.isFile()))
+      throw new Error("Unsafe ticket execution record path.");
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
     try {
       writeFileSync(temporary, JSON.stringify(record, null, 2), {
@@ -424,7 +475,7 @@ export class TicketWorktrees {
       )
         throw new Error("Legacy intent changed at atomic clear boundary.");
       renameSync(temporary, path);
-      if (expectedBytes && process.platform !== "win32") {
+      if (process.platform !== "win32") {
         const fd = openSync(this.recordsDir, "r");
         try {
           fsyncSync(fd);
@@ -451,10 +502,13 @@ export class TicketWorktrees {
         `Ticket execution record is missing or unsupported: ${itemId}`,
       );
     const next = mutate(structuredClone(current));
-    if (!sameIdentity(current, next) || next.schemaVersion !== 3)
+    if (
+      !sameIdentity(current, next) ||
+      next.schemaVersion !== current.schemaVersion
+    )
       throw new Error(`Invalid ticket execution update for ${itemId}`);
     if (
-      next.finalization &&
+      (next.finalization || next.integration) &&
       (next.activeRunId || next.launchingAt !== undefined)
     )
       throw new Error(
@@ -472,6 +526,16 @@ export class TicketWorktrees {
         next.reviewedTaskSha !== current.reviewedTaskSha)
     )
       throw new Error("Cannot replace a pending finalization journal.");
+    const integration = current.integration;
+    if (
+      integration &&
+      (!next.integration ||
+        next.integration.baseSha !== integration.baseSha ||
+        next.integration.taskSha !== integration.taskSha ||
+        next.integration.resultSha !== integration.resultSha ||
+        next.reviewedTaskSha !== current.reviewedTaskSha)
+    )
+      throw new Error("Cannot replace a pending integration result.");
     this.save(next);
     return next;
   }
@@ -507,6 +571,7 @@ export class TicketWorktrees {
     });
   }
 
+  /** Release run occupancy without acknowledging retry settlement or integration. */
   clearExecution(itemId: string, lastRunId?: string): TicketExecutionRecord {
     return this.update(itemId, (record) => ({
       ...record,
@@ -531,7 +596,11 @@ export class TicketWorktrees {
   }
 
   private assertNoFinalization(record: TicketExecutionRecord): void {
-    if (record.finalization || this.hasCleanupReceipt(record.itemId))
+    if (
+      record.finalization ||
+      record.integration ||
+      this.hasCleanupReceipt(record.itemId)
+    )
       throw new Error(
         "Ticket has a pending finalization; recover it before starting another builder or review.",
       );
@@ -847,7 +916,7 @@ export class TicketWorktrees {
   /** Create or resume the one persistent worktree owned by an Issue. */
   async ensure(
     task: BuilderTask,
-    plan: string,
+    plan?: string,
   ): Promise<TicketExecutionRecord> {
     if (this.hasCleanupReceipt(task.itemId))
       throw new Error(
@@ -875,6 +944,21 @@ export class TicketWorktrees {
       return saved;
     }
 
+    const path = this.pathFor(task.itemId, task.issueNumber);
+    const record: TicketExecutionRecord = {
+      schemaVersion: 4,
+      itemId: task.itemId,
+      issueNumber: task.issueNumber,
+      taskKey: task.taskKey,
+      ...(plan === undefined ? {} : { plan }),
+      taskBranch: task.taskBranch,
+      baseBranch: task.baseBranch,
+      path,
+      createdAt: Date.now(),
+    };
+    if (!isTicketExecutionRecord(record))
+      throw new Error("Invalid ticket execution record.");
+
     const branchOwner = this.list().find(
       (record) => record.taskBranch === task.taskBranch,
     );
@@ -889,17 +973,16 @@ export class TicketWorktrees {
     await this.fetchRequired(task.baseBranch);
     if (this.registeredPathForBranch(task.taskBranch))
       throw new Error(
-        `${task.taskBranch} is already checked out without a v3 ticket record.`,
+        `${task.taskBranch} is already checked out without a ticket record.`,
       );
     if (
       branchSha(task.taskBranch, this.repoRoot) ||
       (await this.remoteSha(task.taskBranch))
     )
       throw new Error(
-        `${task.taskBranch} already exists without a v3 ticket record.`,
+        `${task.taskBranch} already exists without a ticket record.`,
       );
 
-    const path = this.pathFor(task.itemId, task.issueNumber);
     if (!this.isManagedPath(path))
       throw new Error(`Refusing unmanaged worktree path: ${path}`);
     if (existsSync(path))
@@ -917,17 +1000,6 @@ export class TicketWorktrees {
       this.repoRoot,
     );
 
-    const record: TicketExecutionRecord = {
-      schemaVersion: 3,
-      itemId: task.itemId,
-      issueNumber: task.issueNumber,
-      taskKey: task.taskKey,
-      plan,
-      taskBranch: task.taskBranch,
-      baseBranch: task.baseBranch,
-      path,
-      createdAt: Date.now(),
-    };
     this.save(record);
     return record;
   }
@@ -937,6 +1009,11 @@ export class TicketWorktrees {
     task: BuilderTask,
     strategy: Config["task_merge_strategy"],
   ): Promise<string | undefined> {
+    // Legacy finalization cannot settle new retry state or infer a successful
+    // push from a prepared result. Leave both for the resumable path.
+    const progress = this.read(task.itemId);
+    if (progress?.retry || progress?.integration)
+      throw new Error("Pending ticket progress requires resumable finalization.");
     if (this.hasCleanupReceipt(task.itemId)) {
       const receipt = await this.readReceipt(task);
       await this.cleanupFinalized(task, receipt);
@@ -1345,7 +1422,9 @@ export class TicketWorktrees {
           receipt.record.baseBranch !== task.baseBranch ||
           !samePath(receipt.record.path, receipt.snapshots[0].path) ||
           receipt.record.activeRunId ||
-          receipt.record.launchingAt !== undefined)) ||
+          receipt.record.launchingAt !== undefined ||
+          receipt.record.retry ||
+          receipt.record.integration)) ||
       (!receipt.record && receipt.snapshots.some((s) => s.entries.length))
     )
       throw new Error("Cleanup receipt identity/path mismatch.");
