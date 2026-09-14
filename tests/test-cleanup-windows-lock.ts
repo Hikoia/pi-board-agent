@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fixture, calls, faults, root, dispose } from "./cleanup-fixture.js";
 
 try {
-  const f = await fixture();
+  const f = await fixture(true);
   if (process.platform !== "win32") {
     calls.length = 0;
     assert.ok(await f.finish());

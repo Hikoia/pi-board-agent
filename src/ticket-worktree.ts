@@ -273,8 +273,13 @@ interface CleanupReceipt {
 }
 const hash = (bytes: Buffer) =>
   createHash("sha256").update(bytes).digest("hex");
-const equalRecordBytes = (bytes: Buffer, record: TicketExecutionRecord) =>
-  JSON.stringify(JSON.parse(bytes.toString("utf8"))) === JSON.stringify(record);
+const equalRecordBytes = (bytes: Buffer, record: TicketExecutionRecord) => {
+  try {
+    return JSON.stringify(JSON.parse(bytes.toString("utf8"))) === JSON.stringify(record);
+  } catch (error) {
+    throw new Error("Corrupt cleanup execution record.", { cause: error });
+  }
+};
 
 /** Persistent builder worktrees and local-branch finalization. */
 export class TicketWorktrees {
@@ -684,11 +689,12 @@ export class TicketWorktrees {
     return { ok: true, clean };
   }
 
-  /** Conflict handoff must still describe today's exact remote pair and the
-   * strict owner inventory, not merely a commit somewhere in base history. */
+  /** Closed handoff needs the exact remote pair; open Ready confirmation may
+   * accept base descendants, with prepareRepair's original ancestry/owner gates. */
   async prepareConflict(
     record: TicketExecutionRecord,
     repair: RepairRequest,
+    allowBaseAdvance = false,
   ): Promise<void> {
     const current = await this.cleanupRecord({
       ...record,
@@ -698,7 +704,7 @@ export class TicketWorktrees {
     if (JSON.stringify(current) !== JSON.stringify(record))
       throw new Error("Conflict record changed.");
     await this.prepareRepair(record, repair);
-    if (this.fetchedSha(record.baseBranch) !== repair.baseSha)
+    if (!allowBaseAdvance && this.fetchedSha(record.baseBranch) !== repair.baseSha)
       throw new Error("Conflict base advanced before handoff.");
     this.checkConflict(record, repair);
   }
@@ -1356,11 +1362,7 @@ export class TicketWorktrees {
     const recordBytes = record
       ? await readRegular(this.recordPath(task.itemId))
       : null;
-    if (
-      recordBytes &&
-      JSON.stringify(JSON.parse(recordBytes.toString("utf8"))) !==
-        JSON.stringify(record)
-    )
+    if (recordBytes && !equalRecordBytes(recordBytes, record!))
       throw new Error("Cleanup execution record changed.");
     // Freeze a receipt only once every destructive precondition, including the remote task, is ready.
     const remote = await gitAsync(
@@ -1600,6 +1602,11 @@ export class TicketWorktrees {
     if (local && local !== receipt.taskSha)
       throw new Error(`Local ${task.taskBranch} moved; cleanup refused.`);
     if (!this.gitCommonDir) throw new Error("Missing Git common directory.");
+    for (const entry of receipt.snapshots[1]?.entries ?? []) {
+      const name = entry.path.split("/").at(-1)!;
+      if (name.endsWith(".lock") || name === "locked")
+        throw new Error(`Locked Git cleanup path: ${entry.path}`);
+    }
     for (const name of await readdir(this.gitCommonDir)) {
       if (name.endsWith(".lock"))
         throw new Error(`Locked Git cleanup: ${name}`);

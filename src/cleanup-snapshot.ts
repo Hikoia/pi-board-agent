@@ -254,8 +254,6 @@ export async function cleanupSnapshot(path: string): Promise<CleanupSnapshot> {
     if (!relativePath(rel))
       throw new Error(`Unsafe cleanup filename: ${target}`);
     const name = rel.split("/").at(-1)!;
-    if (name.endsWith(".lock") || name === "locked")
-      throw new Error(`Locked cleanup path: ${target}`);
     if (name.toLowerCase() === ".git" && (rel !== ".git" || !stat.isFile()))
       throw new Error(`Nested Git identity: ${target}`);
     if (stat.isSymbolicLink()) {

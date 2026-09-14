@@ -1,9 +1,42 @@
 import assert from "node:assert/strict";
-import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fixture, legacy, calls, faults, git, dispose } from "./cleanup-fixture.js";
 
 try {
+  for (const kind of ["admin-index", "admin-locked", "common", "ref"] as const)
+  for (const afterReceipt of [false, true]) {
+    const f = await fixture();
+    const lock = kind === "admin-index" ? join(f.admin, "index.lock")
+      : kind === "admin-locked" ? join(f.admin, "locked")
+      : kind === "common" ? join(f.repo, ".git", "index.lock")
+      : join(f.repo, ".git", "refs", "heads", `${f.task.taskBranch}.lock`);
+    if (afterReceipt) {
+      faults.afterFs = (operation, path) => {
+        if (operation === "link" && path.startsWith(f.receipt)) {
+          faults.afterFs = undefined;
+          writeFileSync(lock, "Git lock after snapshot");
+        }
+      };
+    } else writeFileSync(lock, "Git lock before snapshot");
+    calls.length = 0;
+    await assert.rejects(f.finish(), /Locked|snapshot changed|added/i);
+    faults.afterFs = undefined;
+    assert.equal(existsSync(f.receipt), afterReceipt);
+    assert.ok(existsSync(f.recordFile)); assert.ok(existsSync(f.record.path));
+    assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
+    assert.equal(git(f.origin, "rev-parse", `refs/heads/${f.task.taskBranch}`), f.taskSha);
+    assert.ok(!calls.some((args) => args[0] === "worktree" && args[1] === "remove" || args[0] === "update-ref" || args[0] === "push" && args.includes(`:refs/heads/${f.task.taskBranch}`)));
+    if (kind === "admin-index" && afterReceipt) {
+      unlinkSync(lock);
+      const integrated = f.tip(); calls.length = 0;
+      assert.equal(await f.finish(), integrated);
+      assert.equal(f.tip(), integrated);
+      assert.ok(!calls.some((args) => args[0] === "commit-tree"));
+    }
+    console.log(`PASS: ${kind} Git lock ${afterReceipt ? "after" : "before"} receipt blocks cleanup and retains evidence`);
+  }
+
   {
     const f = await fixture();
     faults.beforeGit = (args) => {

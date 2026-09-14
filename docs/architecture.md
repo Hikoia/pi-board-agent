@@ -208,6 +208,15 @@ admission. Final synchronous ownership/SHA checks follow awaited validation.
 A later human lane, identity or claim change stops unsafe handoff/settlement;
 an observed contrary state invalidates an unfinished handoff even if moved back.
 These are fresh observable checks, not an atomic cross-resource GitHub lock.
+While the Issue is still closed, handoff requires the exact original remote base
+HEAD. Checks expecting open Ready (including confirmation after an interrupted
+reopen or queued-comment write), queue and consume allow base advancement only
+if the designated `request.baseSha` remains an ancestor of fresh remote base.
+The request key and specified SHAs never change to chase newer main commits;
+rewritten-away base history or a moved task SHA still blocks. An interrupted
+`consume` with no attempted comment write returns to queued admission only after
+fresh queued-comment and open Ready authority checks; attempted writes retain
+the existing no-replay recovery rules.
 
 A key derived from item/base/task SHAs binds a strict v1 local ledger at
 `.pi/board-agent/repair/conflict-<hash>.json` and one versioned Issue comment.
@@ -341,6 +350,12 @@ snapshots. Asynchronous non-following traversal includes ignored files and
 empty directories; entries record type, identity, size/content hash or symlink
 target and creation kind. Link targets are not traversed, copied or deleted.
 Atomic create-only publication refuses overwriting an existing receipt.
+Ordinary `.lock` or `locked` files, including ignored dependency lockfiles, are
+fully snapshotted, hashed, backed up and verified like other files, not excluded.
+The filename lock veto applies only to the owned worktree Git administration
+snapshot; common-directory, target-ref and registered worktree locks remain
+separate gates. Fresh snapshots at destructive guards reject newly added or
+changed Git locks; real OS access errors still abort cleanup.
 
 Registered ticket worktrees use normal `git worktree remove`, never a force
 fallback. Once registration is gone, only exact receipted leftovers are removed

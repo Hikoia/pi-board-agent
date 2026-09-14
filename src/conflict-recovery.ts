@@ -71,7 +71,9 @@ export class ConflictRecovery {
     const stat = lstatSync(path, { throwIfNoEntry: false });
     if (!stat) return undefined;
     if (!stat.isFile()) throw new Error("Invalid repair ledger file.");
-    const h = JSON.parse(readFileSync(path, "utf8")) as Handoff;
+    let h: Handoff;
+    try { h = JSON.parse(readFileSync(path, "utf8")); }
+    catch (error) { throw new Error("Corrupt or unreadable repair ledger.", { cause: error }); }
     if (!exactKeys(h, ["schemaVersion", "request", "card", "record", "step", "attempted", "commentId", "runId", "notice"]) || h.schemaVersion !== 1 ||
         !isRepairRequest(h.request) || h.request.requestKey !== key ||
         !exactKeys(h.card, ["itemId", "number", "repoOwner", "repoName", "contentType", "type", "plan", "title", "body"]) ||
@@ -126,7 +128,7 @@ export class ConflictRecovery {
     const record = worktrees.read(h.card.itemId);
     if (!equal(record, h.record) || worktrees.hasCleanupReceipt(h.card.itemId)) throw new HandoffChanged("Repair record changed or cleanup owns the ticket.");
     if (record!.baseBranch !== cfg.branches.base || record!.taskBranch !== taskBranch(cfg.branches.task_prefix, h.card.number) || planSlug(h.card.plan) !== record!.plan) throw new HandoffChanged("Repair branch or Plan changed.");
-    await worktrees.prepareConflict(record!, h.request);
+    await worktrees.prepareConflict(record!, h.request, !closed && status === cfg.columns.ready);
     const card = await this.deps.board.getCard(h.card.itemId);
     if (!card || !equal(identity(card), h.card) ||
         card.repoOwner?.toLowerCase() !== this.deps.repoOwner.toLowerCase() || card.repoName?.toLowerCase() !== this.deps.repoName.toLowerCase() ||
@@ -194,13 +196,17 @@ export class ConflictRecovery {
     const blockers: Array<RepairBlocker & { itemId: string }> = [];
     for (const h of this.all()) {
       if (["launching", "consumed", "blocked"].includes(h.step)) continue;
+      const unattemptedConsume = h.step === "consume" && !h.attempted;
       try {
-        if (h.step === "queued") {
+        if (h.step === "queued" || unattemptedConsume) {
           if (!(await this.comments(h, ["queued"]))) throw new Error("Queued repair marker missing.");
           await this.current(h, this.deps.cfg.columns.ready, false, canWork, canNow);
+          // No consume write was attempted: re-enter normal capacity/launch admission,
+          // not a consumed launch window with no builder to recover.
+          if (unattemptedConsume) this.change(h, { step: "queued" });
         } else await this.progress(h, canWork, canNow);
       } catch (error) {
-        if (h.step === "queued" && error instanceof HandoffChanged) this.change(h, { step: "blocked" });
+        if ((h.step === "queued" || unattemptedConsume) && error instanceof HandoffChanged) this.change(h, { step: "blocked" });
         blockers.push({ itemId: h.card.itemId, status: "blocked", repair: h.request, reason: error instanceof Error ? error.message : String(error) });
       }
     }

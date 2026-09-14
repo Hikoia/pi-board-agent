@@ -1,5 +1,6 @@
 // Public TicketWorktrees/loop seams; all repositories and processes are disposable/offline.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { _DEFAULTS } from "../src/config.js";
@@ -19,7 +20,7 @@ try {
   }
 
   {
-    const f = await fixture();
+    const f = await fixture(true);
     const recordBytes = readFileSync(f.recordFile);
     faults.beforeGit = (args) => {
       if (args[0] !== "worktree" || args[1] !== "remove") return;
@@ -35,6 +36,13 @@ try {
     const receipt = readFileSync(f.receipt, "utf8");
     assert.match(receipt, /ignored\/cache.bin/, "snapshot includes ignored binary files");
     assert.match(receipt, /ignored\/empty/, "snapshot includes empty directory identities");
+    for (const path of ["Cargo.lock", "locked", "node_modules/uri-js/yarn.lock"]) {
+      const entry = JSON.parse(receipt).snapshots[0].entries.find((e: any) => e.path === path);
+      const bytes = readFileSync(join(f.record.path, path));
+      assert.equal(entry?.type, "file");
+      assert.equal(entry.size, String(bytes.length));
+      assert.equal(entry.sha256, createHash("sha256").update(bytes).digest("hex"));
+    }
     const integrated = f.tip(); calls.length = 0;
     assert.equal(await f.finish(), integrated);
     assert.equal(f.tip(), integrated, "retry does not integrate twice");

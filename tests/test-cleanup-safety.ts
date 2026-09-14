@@ -5,6 +5,18 @@ import { fixture, legacy, calls, faults, git, root, dispose } from "./cleanup-fi
 
 try {
   {
+    const f = await fixture(true);
+    calls.length = 0;
+    assert.ok(await f.finish());
+    assert.ok(calls.some((args) => args[0] === "worktree" && args[1] === "remove" && args.length === 3));
+    assert.equal(existsSync(f.record.path), false);
+    assert.equal(f.store.localBranchSha(f.task.taskBranch), undefined);
+    assert.equal(existsSync(f.recordFile), false);
+    assert.equal(existsSync(f.receipt), false);
+    console.log("PASS: ordinary Cargo.lock, locked and ignored node_modules/uri-js/yarn.lock permit normal Git removal and completed cleanup");
+  }
+
+  {
     const f = await fixture();
     legacy(f, "squash", "result");
     faults.beforeFs = (operation, path) => {
@@ -22,9 +34,10 @@ try {
   }
 
   for (const strategy of ["merge", "squash"] as const) for (const journal of ["none", "intent", "result"] as const) {
-    const f = await fixture();
+    const lockfiles = strategy === "squash" && journal === "result";
+    const f = await fixture(lockfiles);
     const integrated = legacy(f, strategy, journal), recordBytes = readFileSync(f.recordFile);
-    const files = [".gitignore", "base.txt", "feature.txt", "ignored/cache.bin"];
+    const files = [".gitignore", "base.txt", "feature.txt", "ignored/cache.bin", ...(lockfiles ? ["Cargo.lock", "locked", "node_modules/uri-js/yarn.lock"] : [])];
     const original = files.map((path) => readFileSync(join(f.record.path, path)));
     calls.length = 0;
     assert.equal(await f.finish(strategy), integrated);

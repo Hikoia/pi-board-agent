@@ -395,6 +395,15 @@ not a new role or queue. Actual author and exact marker data are read back;
 ordinary/fake comments cannot authorize repair. Failed or ambiguous writes stop
 until their exact results can be confirmed, rather than being blindly repeated.
 Fresh human lane/claim checks apply through settlement, not only at selection.
+While the Issue remains closed, the remote base HEAD must still equal the
+original conflict SHA. When confirming open Ready or queueing/consuming the
+request, main may advance only while the original base SHA remains in its
+history. This also covers a successful reopen or queued-comment write interrupted
+before local confirmation. The same request, comment and original SHAs are kept;
+do not replace them to chase main. Rewritten-away base or changed task SHAs block.
+If consumption stopped before its comment write was attempted, fresh validation
+of the queued marker and open Ready card returns the same request to normal
+capacity/launch admission. An attempted but unconfirmed write is never replayed.
 
 The builder retains original work and requirements, merges the specified base
 commit into the task, resolves both sides without blanket ours/theirs, and runs
@@ -427,6 +436,12 @@ it is **not an early merge intent**. Its strict versioned data binds ticket,
 branches, task/result SHAs, exact record, managed paths/Git ownership, directory
 identities and relative entries (type, size, content hash or symlink target),
 including ignored files. Symlink targets are recorded, not traversed or deleted.
+Ordinary dependency lockfiles (`node_modules/uri-js/yarn.lock`, `Cargo.lock`) and
+files named `locked` are included in full snapshots, hashes and verified backups;
+their names do not block cleanup. Only the owned Git administration snapshot has
+the `.lock`/`locked` filename veto, alongside existing Git common-directory,
+target-ref and worktree locks. New/changed Git locks fail fresh destructive
+checks, and real OS file-access errors still block and preserve retry evidence.
 
 Registered ticket worktrees use normal `git worktree remove`. After registration
 is gone, only matching receipted leftovers are removed item-by-item, rechecked

@@ -48,13 +48,17 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 } });
 export const { TicketWorktrees } = await import("../src/ticket-worktree.js");
 let sequence = 0;
-export async function fixture() {
+export async function fixture(lockfiles = false) {
     const dir = join(root, `case-${++sequence}`), repo = join(dir, "repo"), origin = join(dir, "origin.git");
     mkdirSync(repo, { recursive: true });
     git(dir, "init", "--bare", origin); git(repo, "init", "-b", "main");
     git(repo, "config", "user.name", "Offline"); git(repo, "config", "user.email", "offline@example.test");
     git(repo, "config", "core.autocrlf", "false");
-    writeFileSync(join(repo, ".gitignore"), ".pi/\nignored/\n");
+    writeFileSync(join(repo, ".gitignore"), ".pi/\nignored/\nnode_modules/\n");
+    if (lockfiles) {
+      writeFileSync(join(repo, "Cargo.lock"), "version = 4\n");
+      writeFileSync(join(repo, "locked"), "ordinary tracked file\n");
+    }
     writeFileSync(join(repo, "base.txt"), "base\n"); git(repo, "add", "."); git(repo, "commit", "-m", "base");
     git(repo, "remote", "add", "origin", origin); git(repo, "push", "origin", "main");
     const base = git(repo, "rev-parse", "HEAD");
@@ -66,6 +70,10 @@ export async function fixture() {
     const admin = git(record.path, "rev-parse", "--absolute-git-dir");
     mkdirSync(join(record.path, "ignored", "empty"), { recursive: true });
     writeFileSync(join(record.path, "ignored", "cache.bin"), Buffer.from([0, 1, 2, 255]));
+    if (lockfiles) {
+      mkdirSync(join(record.path, "node_modules", "uri-js"), { recursive: true });
+      writeFileSync(join(record.path, "node_modules", "uri-js", "yarn.lock"), "# tiny ignored dependency lockfile\n");
+    }
     const receipt = join(repo, ".pi", "board-agent", "cleanup", `item_${sequence}.json`);
     const recordFile = join(repo, ".pi", "board-agent", "ticket-worktrees", `item_${sequence}.json`);
     const tip = () => git(origin, "rev-parse", "refs/heads/main");

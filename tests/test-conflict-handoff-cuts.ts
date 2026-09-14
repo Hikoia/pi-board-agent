@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
-import { fixture, settle } from "./conflict-handoff-fixture.js";
+import { fixture, settle, advanceBase } from "./conflict-handoff-fixture.js";
 
 for (const target of ["request-comment", "status:Ready", "reopen", "queue-comment", "consume-comment", "status:In Progress", "claim"])
 for (const edge of ["before", "after"] as const) {
   const f = await fixture();
   let cut = false;
-  f.setHook((event) => { if (!cut && event === `${edge}:${target}`) { cut = true; throw new Error(`offline cut ${event}`); } });
+  f.setHook((event) => { if (!cut && event === `${edge}:${target}`) {
+    cut = true;
+    if (!f.card.closed) advanceBase(f);
+    throw new Error(`offline cut ${event}`);
+  } });
   try {
     for (let i = 0; i < 3 && !cut; i++) await f.loop.tickNow().catch(() => {});
     assert.ok(cut, target);
@@ -30,9 +34,13 @@ for (const edge of ["before", "after"] as const) {
         assert.equal(f.calls(), 1, `${edge}:${target}: confirmed state resumes into one bound run\n${f.notices.join("\n")}`);
         assert.equal(f.card.closed, false);
         assert.equal(f.card.status, f.cfg.columns.needs_human);
-        assert.ok((f.runs()[0].args as any).repair?.requestKey.startsWith("conflict-"));
+        const repair = (f.runs()[0].args as any).repair;
+        assert.ok(repair?.requestKey.startsWith("conflict-"));
+        assert.equal(repair.baseSha, f.baseSha); assert.equal(repair.taskSha, f.taskSha);
       }
-      console.log(`PASS: ${edge} ${target} fault/restart confirms state or blocks, never duplicates marker/run or falls back to ordinary builder`);
+      for (const event of ["reopen", "queue-comment", "consume-comment"])
+        assert.ok(f.events.filter((e) => e === event).length <= 1, `never repeat ${event}`);
+      console.log(`PASS: ${edge} ${target} fault/restart with main advancing when open confirms state or blocks, never duplicates marker/run or falls back to ordinary builder`);
     } finally { await next.loop.stop(); }
   } finally { await f.loop.stop(); }
 }
@@ -40,7 +48,7 @@ for (const edge of ["before", "after"] as const) {
 for (const target of ["read:comments", "read:card"]) {
   const f = await fixture(); let fail = false;
   f.setHook((event) => {
-    if (event === "after:reopen") fail = true;
+    if (event === "after:reopen") { advanceBase(f); fail = true; }
     if (fail && event === target) throw new Error("read outcome unavailable");
   });
   try {

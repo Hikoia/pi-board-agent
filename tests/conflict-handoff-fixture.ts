@@ -76,6 +76,12 @@ export async function fixture(conflict = true) {
     runs: () => createRunPersistence(record.path).list(),
   };
 }
+export function advanceBase(f: Awaited<ReturnType<typeof fixture>>) {
+  git(f.repo, "commit", "--allow-empty", "-m", "main advances while original repair waits");
+  git(f.repo, "push", "origin", "main");
+  return git(f.repo, "rev-parse", "HEAD");
+}
+
 export async function settle(f: Awaited<ReturnType<typeof fixture>>) {
   for (let i = 0; i < 400; i++) {
     const runs = f.runs();
