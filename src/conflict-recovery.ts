@@ -1,3 +1,4 @@
+import { readLegacyRepair, conflictRequestKey, type LegacyRepair as Handoff, type LegacyRepairStep as Step } from "./legacy-adapter.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -6,20 +7,17 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
   readdirSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { exactKeys } from "./cleanup-snapshot.js";
 import type { Config } from "./config.js";
 import { planSlug, taskBranch } from "./config.js";
 import type { Card, IssueComment } from "./gh.js";
-import { isRepairRequest, type RepairRequest } from "./repair.js";
+import type { RepairRequest } from "./repair.js";
 import {
-  isTicketExecutionRecord,
   type TicketExecutionRecord,
   type TicketWorktrees,
 } from "./ticket-worktree.js";
@@ -38,47 +36,10 @@ export interface RepairBlocker {
   repair?: RepairRequest;
 }
 class HandoffChanged extends Error {}
-type Step =
-  | "comment"
-  | "ready"
-  | "reopen"
-  | "queue"
-  | "queued"
-  | "consume"
-  | "launching"
-  | "consumed"
-  | "blocked";
-interface Handoff {
-  schemaVersion: 1;
-  request: RepairRequest;
-  card: ReturnType<typeof identity>;
-  record: TicketExecutionRecord;
-  step: Step;
-  attempted: boolean;
-  commentId: string | null;
-  runId: string | null;
-  notice: { body: string; id: string | null } | null;
-}
-const steps: Step[] = [
-  "comment",
-  "ready",
-  "reopen",
-  "queue",
-  "queued",
-  "consume",
-  "launching",
-  "consumed",
-  "blocked",
-];
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
-const equal = (a: unknown, b: unknown) =>
-  JSON.stringify(a) === JSON.stringify(b);
+const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const PREFIX = "<!-- board-agent-conflict-repair:";
-export const conflictRequestKey = (
-  itemId: string,
-  baseSha: string,
-  taskSha: string,
-) => `conflict-${hash(JSON.stringify([itemId, baseSha, taskSha]))}`;
+export { conflictRequestKey } from "./legacy-adapter.js";
 function identity(card: Card) {
   return {
     itemId: card.itemId,
@@ -102,6 +63,7 @@ export class ConflictRecovery {
   private readonly dir: string;
   constructor(
     private readonly deps: {
+      ignoreRepairFile?(path: string): boolean;
       worktrees: TicketWorktrees;
       cfg: Config;
       botLogin: string;
@@ -139,85 +101,13 @@ export class ConflictRecovery {
     const stat = lstatSync(path, { throwIfNoEntry: false });
     if (!stat) return undefined;
     if (!stat.isFile()) throw new Error("Invalid repair ledger file.");
-    let h: Handoff;
-    try {
-      h = JSON.parse(readFileSync(path, "utf8"));
-    } catch (error) {
-      throw new Error("Corrupt or unreadable repair ledger.", { cause: error });
-    }
-    if (
-      !exactKeys(h, [
-        "schemaVersion",
-        "request",
-        "card",
-        "record",
-        "step",
-        "attempted",
-        "commentId",
-        "runId",
-        "notice",
-      ]) ||
-      h.schemaVersion !== 1 ||
-      !isRepairRequest(h.request) ||
-      h.request.requestKey !== key ||
-      !exactKeys(h.card, [
-        "itemId",
-        "number",
-        "repoOwner",
-        "repoName",
-        "contentType",
-        "type",
-        "plan",
-        "title",
-        "body",
-      ]) ||
-      !isTicketExecutionRecord(h.record) ||
-      h.record.finalization ||
-      h.record.activeRunId ||
-      h.record.launchingAt !== undefined ||
-      h.card.itemId !== h.record.itemId ||
-      h.card.number !== h.record.issueNumber ||
-      h.card.contentType !== "Issue" ||
-      h.card.type?.toLowerCase() !== "task" ||
-      ![
-        h.card.repoOwner,
-        h.card.repoName,
-        h.card.plan,
-        h.card.title,
-        h.card.body,
-      ].every((s) => typeof s === "string") ||
-      !h.card.plan ||
-      key !==
-        conflictRequestKey(
-          h.card.itemId,
-          h.request.baseSha,
-          h.request.taskSha,
-        ) ||
-      !steps.includes(h.step) ||
-      typeof h.attempted !== "boolean" ||
-      !(
-        h.commentId === null ||
-        (typeof h.commentId === "string" && !!h.commentId)
-      ) ||
-      !(h.runId === null || (typeof h.runId === "string" && !!h.runId)) ||
-      !(
-        h.notice === null ||
-        (exactKeys(h.notice, ["body", "id"]) &&
-          typeof h.notice.body === "string" &&
-          !!h.notice.body &&
-          (h.notice.id === null ||
-            (typeof h.notice.id === "string" && !!h.notice.id)))
-      ) ||
-      (!["comment", "blocked"].includes(h.step) && !h.commentId)
-    )
-      throw new Error("Corrupt or unsupported repair ledger.");
-    return h;
+    return readLegacyRepair(path);
   }
   private all(): Handoff[] {
     this.safePath(join(this.dir, "probe"));
     if (!existsSync(this.dir)) return [];
     return readdirSync(this.dir)
-      .filter((n) => n.endsWith(".json"))
+      .filter((n) => n.endsWith(".json") && !this.deps.ignoreRepairFile?.(join(this.dir, n)))
       .map((n) => this.read(n.slice(0, -5))!);
   }
   private save(h: Handoff, previous?: Handoff): void {

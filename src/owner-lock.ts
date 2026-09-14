@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { assertSupportedState, resolveStateRepoRoot } from "./unsupported-state.js";
+import { assertSafeStateDirectories, assertSupportedState, resolveStateRepoRoot } from "./unsupported-state.js";
 
 export interface OwnerLockRecord {
   pid: number;
@@ -92,8 +92,9 @@ export function acquireOwnerLock(
   cwd: string,
   botLogin: string,
   root = resolveStateRepoRoot(cwd),
+  isolateLegacyTickets = false,
 ): OwnerLock {
-  assertSupportedState(cwd, root);
+  (isolateLegacyTickets ? assertSafeStateDirectories : assertSupportedState)(cwd, root);
   const dir = join(root, ".pi", "board-agent");
   const path = join(dir, "owner.lock");
   mkdirSync(dir, { recursive: true });

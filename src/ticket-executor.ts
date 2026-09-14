@@ -1,3 +1,5 @@
+import { LegacyTicketAdapter } from "./legacy-adapter.js";
+import type { OwnerLock } from "./owner-lock.js";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import {
   UsageLimitScheduler,
@@ -79,6 +81,8 @@ export type FinalizeOutcome =
   | RepairBlocker;
 
 export interface TicketExecutor {
+  readonly isolatesLegacyState?: boolean;
+  preservesLegacyLane?(lane: "story" | "watchdog"): boolean;
   /** Display only. Never used to authorize launches, recovery or capacity. */
   readonly observation?: {
     active: readonly ActiveTicketRun[];
@@ -89,6 +93,7 @@ export interface TicketExecutor {
     canStartWork?: () => boolean | Promise<boolean>,
     canStartWorkNow?: () => boolean,
   ): Promise<ReconcileSummary>;
+  recoveryBlocker?(itemId: string): string | undefined;
   repairFor?(card: Card): Promise<RepairRequest | RepairBlocker | undefined>;
   repairForReview?(
     record: TicketExecutionRecord,
@@ -156,6 +161,8 @@ export interface TicketWorkflowManager {
 }
 
 export interface TicketExecutorDeps {
+  /** Supplied only after exclusive acquisition; the previous owner must be drained. */
+  ownerLock?: OwnerLock;
   cwd: string;
   cfg: Config;
   botLogin: string;
@@ -398,12 +405,33 @@ export class ManagedTicketExecutor implements TicketExecutor {
     occupiedSlots: 0,
   };
 
+  get isolatesLegacyState(): boolean { return !!this.legacy; }
+  preservesLegacyLane(lane: "story" | "watchdog"): boolean { return this.legacy?.preservesLane(lane) ?? false; }
+
   private readonly conflicts: ConflictRecovery;
+  private readonly legacy?: LegacyTicketAdapter;
   constructor(private readonly deps: TicketExecutorDeps) {
-    this.conflicts = new ConflictRecovery(deps);
+    if (deps.ownerLock) this.legacy = new LegacyTicketAdapter(deps);
+    this.conflicts = new ConflictRecovery({ ...deps,
+      ignoreRepairFile: (path) => this.legacy?.ignoresRepairFile(path) ?? false });
+  }
+
+  recoveryBlocker(itemId: string): string | undefined {
+    const record = this.deps.worktrees.read(itemId);
+    return this.legacy?.blocker(itemId) ??
+      (this.legacy && record?.schemaVersion === 3 ? "Legacy conversion pending." : undefined) ??
+      (record?.integration || record?.retry?.stage === "integrate" || record?.retry?.stage === "cleanup"
+        ? "Pending integration/cleanup is reserved for resumable finalization (T004)." : undefined);
+  }
+
+  private recovery(record: TicketExecutionRecord): ConflictRecovery | LegacyTicketAdapter {
+    return this.legacy?.owns(record.itemId) ? this.legacy : this.conflicts;
   }
 
   repairFor(card: Card): Promise<RepairRequest | RepairBlocker | undefined> {
+    const blocked = this.recoveryBlocker(card.itemId);
+    if (blocked) return Promise.resolve({ status: "blocked", reason: blocked });
+    if (this.legacy?.owns(card.itemId)) return Promise.resolve(undefined);
     return this.conflicts.repairFor(card);
   }
 
@@ -411,9 +439,9 @@ export class ManagedTicketExecutor implements TicketExecutor {
     record: TicketExecutionRecord,
     card: Card,
   ): Promise<RepairReview | RepairBlocker | undefined> {
-    const required = this.conflicts.requestForRun(record, record.lastRunId);
+    const required = this.recovery(record).requestForRun(record, record.lastRunId);
     // Unknown/rejected authority throws, never authorizes a quarantine write.
-    if (!(await this.conflicts.executionCard(record, card, record.lastRunId)))
+    if (!(await this.recovery(record).executionCard(record, card, record.lastRunId)))
       throw new Error("Repair Review lost its fresh card/claim authority.");
     try {
       const run = record.lastRunId
@@ -424,7 +452,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         (!run ||
           run.runId !== record.lastRunId ||
           !runArgsMatch(run, record) ||
-          !this.conflicts.matches(record, run.args, run.runId))
+          !this.recovery(record).matches(record, run.args, run.runId))
       )
         throw new Error(
           "Bound repair Review run is missing or its exact arguments changed.",
@@ -435,7 +463,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
       if (
         repair &&
         (!runArgsMatch(run!, record) ||
-          !this.conflicts.matches(record, run!.args, run!.runId))
+          !this.recovery(record).matches(record, run!.args, run!.runId))
       )
         throw new Error("Repair Review run does not match the ticket record.");
       return repair;
@@ -473,14 +501,15 @@ export class ManagedTicketExecutor implements TicketExecutor {
       if (!record || this.stopping) return undefined;
       const manager = this.manager(path);
       const run = manager.list().find((r) => r.runId === runId);
-      const required = this.conflicts.requestForRun(record, runId);
-      if (!required && !(run?.args as { repair?: unknown } | undefined)?.repair)
+      const required = this.recovery(record).requestForRun(record, runId);
+      const legacy = this.legacy?.owns(record.itemId);
+      if (!legacy && !required && !(run?.args as { repair?: unknown } | undefined)?.repair)
         return () => !this.stopping; // ordinary usage-limit handling is unchanged
       if (
         !run ||
         !runArgsMatch(run, record) ||
-        !this.conflicts.matches(record, run.args, runId) ||
-        !(await this.canResume())
+        !this.recovery(record).matches(record, run.args, runId) ||
+        (!legacy && !(await this.canResume()))
       )
         return undefined;
       const card = await this.deps.board.getCard(record.itemId);
@@ -494,7 +523,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         planSlug(card.plan) !== record.plan ||
         card.assignees.length !== 1 ||
         card.assignees[0].toLowerCase() !== this.deps.botLogin.toLowerCase() ||
-        !(await this.conflicts.executionCard(record, card))
+        !(await this.recovery(record).executionCard(record, card))
       )
         return undefined;
       const canNow = () => {
@@ -502,7 +531,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
           if (
             this.stopping ||
             revision !== this.resumeRevision ||
-            !this.canResumeNow() ||
+            (legacy ? !this.legacy!.authorityHeld() : !this.canResumeNow()) ||
             JSON.stringify(this.deps.worktrees.read(record.itemId)) !==
               JSON.stringify(record) ||
             this.deps.worktrees.hasCleanupReceipt(record.itemId) ||
@@ -513,7 +542,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
           return (
             !!current &&
             runArgsMatch(current, record) &&
-            this.conflicts.matches(record, current.args, runId)
+            this.recovery(record).matches(record, current.args, runId)
           );
         } catch {
           return false;
@@ -538,7 +567,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
   ): Promise<void> {
     if (
       record &&
-      (await this.conflicts.terminalNotice(
+      (await this.recovery(record).terminalNotice(
         record,
         card,
         `${uniqueMarker}\n${body}`,
@@ -606,10 +635,10 @@ export class ManagedTicketExecutor implements TicketExecutor {
       card,
       uniqueMarker,
       renderNeedsHumanComment(reason, details),
-      () => this.conflicts.assertSettlement(record, card),
+      () => this.recovery(record).assertSettlement(record, card),
       record,
     );
-    await this.conflicts.assertSettlement(record, card);
+    await this.recovery(record).assertSettlement(record, card);
     if (!statusIs(card, this.deps.cfg.columns.needs_human)) {
       await this.deps.board.setStatus(
         card.itemId,
@@ -617,9 +646,9 @@ export class ManagedTicketExecutor implements TicketExecutor {
       );
       card.status = this.deps.cfg.columns.needs_human;
     }
-    await this.conflicts.assertSettlement(record, card);
+    await this.recovery(record).assertSettlement(record, card);
     await this.deps.board.release(card);
-    this.conflicts.abandon(record);
+    this.recovery(record).abandon(record);
     this.deps.worktrees.clearExecution(record.itemId, runId);
     this.deps.callback(
       `"${card.title}" → ${this.deps.cfg.columns.needs_human}: ${reason}`,
@@ -638,10 +667,10 @@ export class ManagedTicketExecutor implements TicketExecutor {
       card,
       uniqueMarker,
       `✅ Builder completed on \`${outcome.branch ?? record.taskBranch}\`.\n\n${outcome.summary ?? "Ready for review."}`,
-      () => this.conflicts.assertSettlement(record, card),
+      () => this.recovery(record).assertSettlement(record, card),
       record,
     );
-    await this.conflicts.assertSettlement(record, card);
+    await this.recovery(record).assertSettlement(record, card);
     if (!statusIs(card, this.deps.cfg.columns.review)) {
       await this.deps.board.setStatus(
         card.itemId,
@@ -649,7 +678,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
       );
       card.status = this.deps.cfg.columns.review;
     }
-    await this.conflicts.assertSettlement(record, card);
+    await this.recovery(record).assertSettlement(record, card);
     await this.deps.board.release(card);
     this.deps.worktrees.clearExecution(record.itemId, runId);
     this.deps.callback(
@@ -668,7 +697,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         (run) =>
           run.runId !== record.lastRunId &&
           runArgsMatch(run, record) &&
-          this.conflicts.matches(record, run.args, run.runId) &&
+          this.recovery(record).matches(record, run.args, run.runId) &&
           new Date(run.startedAt).getTime() >= cutoff,
       );
   }
@@ -682,6 +711,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     try {
       manager = this.manager(record.path);
     } catch (error: any) {
+      if (this.legacy?.owns(record.itemId)) throw error;
       await this.moveToNeedsHuman(
         record,
         card,
@@ -698,13 +728,15 @@ export class ManagedTicketExecutor implements TicketExecutor {
         run.runId,
         new Date(run.startedAt).getTime(),
       );
-      this.conflicts.bind(adopted, run.runId, run.args);
+      this.recovery(adopted).bind(adopted, run.runId, run.args);
       summary.adopted++;
       this.deps.callback(
         `Adopted persisted run ${run.runId} for "${card.title}".`,
       );
       return adopted;
     }
+    if (this.legacy?.owns(record.itemId))
+      throw new Error(`Legacy launch has ${matches.length} matching persisted runs; retain the launch window and retry observation.`);
     if (matches.length > 1) {
       await this.moveToNeedsHuman(
         record,
@@ -797,6 +829,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     try {
       manager = this.manager(record.path);
     } catch (error: any) {
+      if (this.legacy?.owns(record.itemId)) throw error;
       await this.moveToNeedsHuman(
         record,
         card,
@@ -814,8 +847,10 @@ export class ManagedTicketExecutor implements TicketExecutor {
     if (
       !run ||
       !runArgsMatch(run, record) ||
-      !this.conflicts.matches(record, run.args)
+      !this.recovery(record).matches(record, run.args)
     ) {
+      if (this.legacy?.owns(record.itemId))
+        throw new Error("Legacy workflow is missing or mismatched; original execution retained.");
       await this.moveToNeedsHuman(
         record,
         card,
@@ -829,13 +864,13 @@ export class ManagedTicketExecutor implements TicketExecutor {
       return;
     }
 
-    const authorized = await this.conflicts.executionCard(record, card);
+    const authorized = await this.recovery(record).executionCard(record, card);
     if (!authorized) {
       await this.stopMissingCardRun(record, summary);
       return;
     }
     card = authorized;
-    this.conflicts.bind(record, run.runId, run.args);
+    this.recovery(record).bind(record, run.runId, run.args);
     const completedOutcomes =
       run.status === "completed" ? normalizeWaveResults(run.result) : [];
     const completedOutcome =
@@ -853,6 +888,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
       !planMatches ||
       (record.issueNumber > 0 && card.number !== record.issueNumber)
     ) {
+      if (this.legacy?.owns(record.itemId))
+        throw new Error(structural.reason ?? "Legacy ticket identity changed; preserving original execution.");
       const failure =
         completedOutcome?.status === "failure" ? completedOutcome : undefined;
       const mismatchReason =
@@ -1053,7 +1090,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
       record.itemId,
       record.activeRunId ?? (runs.length === 1 ? runs[0].runId : undefined),
     );
-    this.conflicts.abandon(record);
+    this.recovery(record).abandon(record);
     summary.orphans++;
     this.deps.callback(
       `Stopped orphaned ticket run ${record.activeRunId ?? record.itemId}; its Project item is gone or no longer matches the ticket and worktree was preserved.`,
@@ -1078,6 +1115,10 @@ export class ManagedTicketExecutor implements TicketExecutor {
     this.canResume = canStartWork;
     this.canResumeNow = canStartWorkNow;
     this.resumeRevision++;
+    const legacyErrors = await this.legacy?.reconcile(cards, () => !this.stopping) ?? [];
+    for (const error of legacyErrors)
+      this.deps.callback(`Legacy recovery ${error.itemId}: ${error.reason}`, "warn");
+    summary.errors += legacyErrors.length;
     const repairBlockers = await this.conflicts.reconcile(
       async () => !this.stopping && (await canStartWork()),
       () => !this.stopping && canStartWorkNow(),
@@ -1090,6 +1131,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
 
     for (const original of records) {
       if (this.stopping) break;
+      if (this.recoveryBlocker(original.itemId)) continue;
       const snapshot = cardsById.get(original.itemId);
       try {
         // A failed read preserves recovery evidence; confirmed absence or a
@@ -1122,17 +1164,18 @@ export class ManagedTicketExecutor implements TicketExecutor {
         // Mixed execution/finalization files are unsupported, never migrated here.
         if (
           original.finalization ||
+          original.integration ||
           this.deps.worktrees.hasCleanupReceipt(original.itemId)
         )
           continue;
 
         let record: TicketExecutionRecord | undefined = original;
-        const authorized = await this.conflicts.executionCard(record, card);
+        const authorized = await this.recovery(record).executionCard(record, card);
         if (!authorized) {
           await this.stopMissingCardRun(record, summary);
           continue;
         }
-        if (this.conflicts.isUnstarted(record)) {
+        if (this.recovery(record).isUnstarted(record)) {
           await this.moveToNeedsHuman(
             record,
             authorized,
@@ -1195,6 +1238,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
         ) ||
         !statusIs(snapshot, this.deps.cfg.columns.building) ||
         recordIds.has(snapshot.itemId) ||
+        (this.legacy && this.deps.worktrees.has(snapshot.itemId)) ||
+        this.recoveryBlocker(snapshot.itemId) ||
         this.deps.worktrees.hasCleanupReceipt(snapshot.itemId)
       )
         continue;
@@ -1252,6 +1297,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
     requireClaim = false,
   ): string | undefined {
     if (this.stopping) return "executor is stopping";
+    const blocked = this.recoveryBlocker(card.itemId);
+    if (blocked) return blocked;
     if (!isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task"))
       return "card is not a Task Issue in the configured repository";
     if (card.closed) return "issue is closed";
@@ -1266,6 +1313,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     const record = this.deps.worktrees.read(card.itemId);
     if (
       record?.finalization ||
+      record?.integration ||
       this.deps.worktrees.hasCleanupReceipt(card.itemId)
     )
       return "ticket has a pending finalization; recover it before starting another builder";
@@ -1375,6 +1423,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
     this.canResume = canStartWork;
     this.canResumeNow = canStartWorkNow;
     if (repair) repair = { ...repair };
+    if (repair && this.legacy?.owns(snapshot.itemId))
+      return { status: "skipped", reason: "Migrated repair uses ordinary build retry, not the retired handoff protocol." };
     if (this.stopping)
       return { status: "skipped", reason: "executor is stopping" };
     let card = await this.deps.board.getCard(snapshot.itemId);
@@ -1382,7 +1432,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     if (card.itemId !== snapshot.itemId || card.number !== snapshot.number)
       return { status: "skipped", reason: "issue identity changed" };
     try {
-      this.conflicts.assertLaunch(card.itemId, repair);
+      if (!this.legacy?.owns(card.itemId)) this.conflicts.assertLaunch(card.itemId, repair);
     } catch (error) {
       return { status: "skipped", reason: String(error) };
     }
@@ -1411,6 +1461,12 @@ export class ManagedTicketExecutor implements TicketExecutor {
     }
 
     const task = buildTasksForWave(this.deps.cfg, expectedPlan, [card])[0];
+    const retry = this.deps.worktrees.read(card.itemId)?.retry;
+    if (this.legacy?.owns(card.itemId) && retry?.stage === "build")
+      task.body += `
+
+Recovery context (preserve partial work):
+${retry.reason}`;
 
     let record: TicketExecutionRecord;
     try {
@@ -1521,7 +1577,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     if (!beforeRevision)
       return { status: "skipped", reason: "card changed before builder start" };
     const admission = await canStartWork();
-    if (!(await this.conflicts.executionCard(record, beforeRevision)))
+    if (!(await this.recovery(record).executionCard(record, beforeRevision)))
       return {
         status: "skipped",
         reason: "repair authorization changed before start",
@@ -1578,7 +1634,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
 
     try {
       const active = this.deps.worktrees.setActiveRun(record.itemId, runId);
-      this.conflicts.bind(active, runId, { repair });
+      this.recovery(active).bind(active, runId, { repair });
     } catch (error: any) {
       this.deps.callback(
         `Run ${runId} persisted but its ticket record was not updated: ${error.message}`,
@@ -1620,6 +1676,10 @@ export class ManagedTicketExecutor implements TicketExecutor {
         reason: "ticket is no longer closed and Done",
       };
 
+    const blocked = this.recoveryBlocker(card.itemId);
+    if (blocked) return { status: "blocked", reason: blocked };
+    if (this.legacy && this.deps.worktrees.hasCleanupReceipt(card.itemId))
+      return { status: "blocked", reason: "Legacy receipt conversion/cleanup pending (T004)." };
     try {
       const task = buildTasksForWave(this.deps.cfg, "", [card])[0];
       const resultSha = await this.deps.worktrees.finalizeAccepted(
@@ -1730,6 +1790,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
         count++;
       } else if (record.activeRunId) {
         try {
+          if (this.legacy && !this.deps.worktrees.check(record, false).ok)
+            throw new Error("Unsafe legacy worktree; do not open its manager.");
           status =
             this.manager(record.path)
               .list()
@@ -1792,6 +1854,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
 }
 
 export function createProductionTicketExecutor(options: {
+  ownerLock?: OwnerLock;
   cwd: string;
   worktrees?: TicketWorktrees;
   cfg: Config;
@@ -1848,6 +1911,7 @@ export function createProductionTicketExecutor(options: {
   };
   const worktrees = options.worktrees ?? new TicketWorktrees(options.cwd);
   return new ManagedTicketExecutor({
+    ownerLock: options.ownerLock,
     cwd: options.cwd,
     cfg: options.cfg,
     botLogin: options.botLogin,

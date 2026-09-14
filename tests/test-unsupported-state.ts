@@ -406,7 +406,7 @@ try {
     join(state, "runtime.json"),
     '{"sentinel":"must not change"}\n',
   );
-  for (const action of ["session_start", "run", "lint", "init-project"]) {
+  for (const action of ["lint", "init-project"]) {
     const unchanged = inventory(state);
     const messageStart = messages.length;
     if (action === "session_start") await event(action);
@@ -433,6 +433,17 @@ try {
       `${action} rejects unsupported state with byte/mtime-identical state and zero GitHub calls`,
     );
   }
+  const retiredBefore = inventory(join(state, "inflight"));
+  await event("session_start"); // retired state alone does not restart a lane
+  assert.equal(loops.length, 0);
+  assert.equal(ghCalls.length, 0);
+  await command("run");
+  assert.equal(loops.length, 1);
+  assert.ok(existsSync(loops[0].lock.path));
+  assert.deepEqual(inventory(join(state, "inflight")), retiredBefore);
+  await command("stop");
+  loops.length = 0; executors = 0; ghCalls.length = 0;
+  check(true, "startup isolates retired evidence instead of blocking healthy tickets; explicit run acquires its owner and leaves legacy bytes unchanged");
   rmSync(join(state, "inflight"), { recursive: true });
   for (const [label, patch, error] of [
     ["missing Plan", { planFieldId: undefined }, /Plan.*TEXT.*SINGLE_SELECT/],
@@ -522,14 +533,12 @@ try {
   const unchanged = inventory(state);
   const callCount = ghCalls.length;
   await command("run");
-  assert.equal(recovery.promotions, 0);
-  assert.equal(recovery.ticks, 0);
-  assert.equal(ghCalls.length, callCount);
+  assert.equal(recovery.promotions, 1);
+  assert.equal(recovery.ticks, 1);
+  assert.ok(ghCalls.length > callCount);
   assert.deepEqual(inventory(state), unchanged);
-  check(
-    true,
-    "a cached recovery loop cannot be promoted past newly introduced unsupported state",
-  );
+  check(true, "cached promotion leaves newly introduced retired state read-only instead of replaying it");
+  recovery.admissions = false; recovery.promotions = 0; recovery.ticks = 0;
   rmSync(join(state, "inflight"), { recursive: true });
   writeFileSync(configFile, configText + "pr: null\n");
   await command("run");

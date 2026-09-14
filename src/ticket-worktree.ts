@@ -61,7 +61,7 @@ export interface TicketIntegrationState {
 }
 
 export interface TicketExecutionRecord {
-  /** v3 remains readable/writable in place until the stopped-upgrade adapter. */
+  /** v3 is read-only input to the stopped-upgrade adapter in production. */
   schemaVersion: 3 | 4;
   itemId: string;
   issueNumber: number;
@@ -299,7 +299,7 @@ export function isTicketExecutionRecord(
   );
 }
 
-interface CleanupReceipt {
+export interface CleanupReceipt {
   schemaVersion: 1;
   itemId: string;
   issueNumber: number;
@@ -453,7 +453,7 @@ export class TicketWorktrees {
     return mustGit(["rev-parse", "--verify", `${ref}^{commit}`], this.repoRoot);
   }
 
-  private save(record: TicketExecutionRecord, expectedBytes?: Buffer): void {
+  private save(record: TicketExecutionRecord, expectedBytes?: Buffer | null, beforePublish?: () => void): void {
     if (!isTicketExecutionRecord(record))
       throw new Error("Invalid ticket execution record.");
     const path = this.recordPath(record.itemId);
@@ -474,6 +474,9 @@ export class TicketWorktrees {
           !readFileSync(path).equals(expectedBytes))
       )
         throw new Error("Legacy intent changed at atomic clear boundary.");
+      if (expectedBytes === null && this.has(record.itemId))
+        throw new Error("Legacy receipt restore raced with another record.");
+      beforePublish?.();
       renameSync(temporary, path);
       if (process.platform !== "win32") {
         const fd = openSync(this.recordsDir, "r");
@@ -486,6 +489,60 @@ export class TicketWorktrees {
     } finally {
       if (existsSync(temporary)) unlinkSync(temporary);
     }
+  }
+
+  /** Adapter-only publication, not an update() escape hatch. A stopped owner
+   * must supply the exact v3 bytes; backups are create-only and never replayed. */
+  publishLegacy(record: TicketExecutionRecord, original?: Buffer): void {
+    if (record.schemaVersion !== 4 || !isTicketExecutionRecord(record))
+      throw new Error("Invalid legacy conversion result.");
+    const path = this.recordPath(record.itemId);
+    if (original) {
+      const previous: unknown = JSON.parse(original.toString("utf8"));
+      if (!isTicketExecutionRecord(previous) || previous.schemaVersion !== 3 ||
+          !sameIdentity(previous, record) || this.hasSymlink(path) ||
+          !lstatSync(path).isFile() || !readFileSync(path).equals(original))
+        throw new Error("Legacy source changed before conversion.");
+      const backup = `${path}.v3.bak`;
+      if (!lstatSync(backup, { throwIfNoEntry: false }))
+        writeFileSync(backup, original, { flag: "wx", flush: true });
+      if (this.hasSymlink(backup) || !lstatSync(backup).isFile() ||
+          !readFileSync(backup).equals(original))
+        throw new Error("Legacy backup differs from exact original bytes.");
+      // Order the backup directory entry before v4 publication, including restart
+      // after a writer died between create and directory flush.
+      if (process.platform !== "win32") {
+        const fd = openSync(this.recordsDir, "r");
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+      }
+    } else if (this.has(record.itemId)) {
+      throw new Error("Cannot restore a legacy receipt over an existing record.");
+    }
+    this.save(record, original ?? null, () => {
+      if (original) {
+        const backup = `${path}.v3.bak`;
+        if (this.hasSymlink(backup) || !lstatSync(backup).isFile() || !readFileSync(backup).equals(original))
+          throw new Error("Legacy backup changed before v4 publication.");
+      }
+    });
+  }
+
+  hasLegacyBackup(itemId: string): boolean {
+    return !!lstatSync(`${this.recordPath(itemId)}.v3.bak`, { throwIfNoEntry: false });
+  }
+
+  /** Conversion checks ownership, not cleanliness or the continued existence of
+   * already removed refs/paths. No inventory-wide failure for unrelated tickets. */
+  checkLegacyOwnership(record: TicketExecutionRecord): { registered: boolean } {
+    this.assertOwnedPath(record);
+    this.validateBranches(record.baseBranch, record.taskBranch);
+    if (record.baseBranch === record.taskBranch) throw new Error("Task is the base branch.");
+    for (const entry of this.worktreeEntries()) {
+      if ((entry.branch === record.taskBranch && !samePath(entry.path, record.path)) ||
+          (samePath(entry.path, record.path) && (entry.locked || entry.branch !== record.taskBranch)))
+        throw new Error("Legacy worktree ownership changed or locked.");
+    }
+    return { registered: !!this.entryForPath(record.path) };
   }
 
   update(
@@ -1345,7 +1402,7 @@ export class TicketWorktrees {
     return own;
   }
 
-  private async readReceipt(task: BuilderTask): Promise<CleanupReceipt> {
+  async readReceipt(task: BuilderTask, conversion = false): Promise<CleanupReceipt> {
     const path = this.receiptPath(task.itemId);
     let r: any;
     try {
@@ -1429,7 +1486,7 @@ export class TicketWorktrees {
     )
       throw new Error("Cleanup receipt identity/path mismatch.");
     await verifyParents(receipt.gitParents);
-    await this.checkCleanupGit(receipt);
+    if (!conversion) await this.checkCleanupGit(receipt);
     this.validateBranches(receipt.taskBranch, receipt.baseBranch);
     if (receipt.taskBranch === receipt.baseBranch)
       throw new Error("Task branch must differ from the base branch.");

@@ -45,7 +45,7 @@ import {
 } from "./ticket-worktree.js";
 import { buildTasksForWave } from "./workflow-prompt.js";
 import type { OwnerLock } from "./owner-lock.js";
-import { assertSupportedState } from "./unsupported-state.js";
+import { assertSafeStateDirectories, assertSupportedState } from "./unsupported-state.js";
 
 export type StatusCallback = (
   msg: string,
@@ -688,7 +688,7 @@ export class BoardLoop {
 
   private async tick(): Promise<void> {
     // Keep unsupported state read-only, including when introduced after startup.
-    assertSupportedState(
+    (this.executor.isolatesLegacyState ? assertSafeStateDirectories : assertSupportedState)(
       this.deps.cwd,
       this.deps.repoRoot ?? this.ticketWorktrees.repoRoot,
     );
@@ -801,7 +801,8 @@ export class BoardLoop {
             (card) =>
               (isTargetIssue(card, repoOwner, repoName, "Task") &&
                 isNeedsDesignTask(card, cfg)) ||
-              (isTargetIssue(card, repoOwner, repoName, "Story") &&
+              (!this.executor.preservesLegacyLane?.("story") &&
+                isTargetIssue(card, repoOwner, repoName, "Story") &&
                 card.closed === false &&
                 !!card.plan &&
                 [
@@ -842,7 +843,7 @@ export class BoardLoop {
       );
 
       // Maintenance never reserves capacity ahead of Ready builders.
-      if (cfg.watchdog.enabled) {
+      if (cfg.watchdog.enabled && !this.executor.preservesLegacyLane?.("watchdog")) {
         try {
           const { Watchdog } = await import("./watchdog.js");
           await new Watchdog({
@@ -882,6 +883,7 @@ export class BoardLoop {
 
   /** One actionable Story per tick; waiting/read-only candidates do not consume the turn. */
   private async processStories(cards: Card[]): Promise<boolean> {
+    if (this.executor.preservesLegacyLane?.("story")) return false;
     const { cfg, meta, botLogin, callback, repoOwner, repoName } = this.deps;
     if (!this.admitNewWork || !this.hasModelSlot()) return false;
     const stories = cards.filter(
@@ -1079,6 +1081,9 @@ export class BoardLoop {
   }
 
   private async processTaskDesignCards(cards: Card[]): Promise<boolean> {
+    // The stopped-upgrade adapter owns old Task questions, including failed lane
+    // writes. Do not let the retiring design executor auto-consume an answer.
+    if (this.executor.isolatesLegacyState) return false;
     const { cfg, meta, botLogin, callback } = this.deps;
     if (!this.hasModelSlot()) return false;
 
@@ -1434,6 +1439,7 @@ export class BoardLoop {
         !isTargetIssue(card, repoOwner, repoName, "Task")
       )
         continue;
+      if (this.executor.recoveryBlocker?.(card.itemId)) continue;
       let claimed = false;
       let record: TicketExecutionRecord | undefined;
       let evidenceBlocker: RepairBlocker | undefined;
@@ -1452,6 +1458,7 @@ export class BoardLoop {
           record.activeRunId ||
           record.launchingAt !== undefined ||
           record.finalization ||
+          record.integration ||
           this.ticketWorktrees.hasCleanupReceipt(card.itemId)
         )
           throw new Error("Missing matching idle v3 record before review.");
@@ -1519,6 +1526,7 @@ export class BoardLoop {
           current.activeRunId ||
           current.launchingAt !== undefined ||
           current.finalization ||
+          current.integration ||
           this.ticketWorktrees.hasCleanupReceipt(latest.itemId)
         )
           throw new Error("Execution record changed during review.");
@@ -1650,7 +1658,9 @@ export class BoardLoop {
         !refs.has(
           `refs/heads/${taskBranch(cfg.branches.task_prefix, card.number!)}`,
         ) &&
-        !this.ticketWorktrees.hasCleanupReceipt(card.itemId)
+        !this.ticketWorktrees.hasCleanupReceipt(card.itemId) &&
+        !this.ticketWorktrees.read(card.itemId)?.integration &&
+        !this.ticketWorktrees.read(card.itemId)?.retry
       ) {
         continue;
       }

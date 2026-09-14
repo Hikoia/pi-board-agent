@@ -78,3 +78,14 @@ export function assertSupportedState(cwd: string, root?: string): void {
     ].join("\n"),
   );
 }
+
+/** Startup may isolate unsupported tickets, but never traverse unsafe state
+ * directories. The strict read-only lint inventory above remains available. */
+export function assertSafeStateDirectories(cwd: string, root = resolveStateRepoRoot(cwd)): void {
+  const errors: string[] = [];
+  const dotpi = join(root, ".pi"), state = join(dotpi, "board-agent");
+  if (stateDirectory(dotpi, errors) && stateDirectory(state, errors))
+    for (const name of ["ticket-worktrees", "cleanup", "repair", "inflight"])
+      stateDirectory(join(state, name), errors);
+  if (errors.length) throw new Error(`Unsafe Board Agent state directories: ${errors.join(", ")}. No files changed.`);
+}

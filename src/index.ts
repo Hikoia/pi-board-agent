@@ -13,7 +13,7 @@ import {
   type ExtensionContext,
   CONFIG_DIR_NAME,
 } from "@earendil-works/pi-coding-agent";
-import { existsSync } from "node:fs";
+import { readdirSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -33,6 +33,7 @@ import {
 import { TicketWorktrees } from "./ticket-worktree.js";
 import {
   assertSupportedState,
+  assertSafeStateDirectories,
   findUnsupportedState,
   resolveStateRepoRoot,
 } from "./unsupported-state.js";
@@ -96,9 +97,13 @@ function configuredStatuses(cfg: ReturnType<typeof loadConfig>): string[] {
 }
 
 function hasRecoveryState(cwd: string, root: string): boolean {
-  assertSupportedState(cwd, root);
+  assertSafeStateDirectories(cwd, root);
   const stateDir = resolve(cwd, CONFIG_DIR_NAME, "board-agent");
   if (!existsSync(stateDir)) return false;
+  if (["cleanup", "repair"].some((name) => {
+    const dir = resolve(stateDir, name);
+    return existsSync(dir) && readdirSync(dir).some((file) => file.endsWith(".json"));
+  })) return true;
   return (loopWorktrees?.cwd === resolve(cwd)
     ? loopWorktrees.store
     : new TicketWorktrees(cwd))
@@ -107,7 +112,8 @@ function hasRecoveryState(cwd: string, root: string): boolean {
       (record) =>
         record.activeRunId !== undefined ||
         record.launchingAt !== undefined ||
-        record.finalization !== undefined,
+        record.finalization !== undefined ||
+        record.schemaVersion === 3 || record.integration !== undefined || record.retry !== undefined,
     );
 }
 
@@ -181,7 +187,7 @@ async function startBoardLoop(
   if (loop?.isStopping())
     throw new Error("Loop cleanup is pending; retry stop before starting again.");
   const root = stateRoot(cwd);
-  assertSupportedState(cwd, root);
+  assertSafeStateDirectories(cwd, root);
   const preflight = await currentRevision(cwd);
   if (!preflight.ok && admitNewWork) {
     saveRuntime(
@@ -220,7 +226,7 @@ async function startBoardLoop(
     validateProjectMetadata(meta, cfg);
     if (generation !== stopGeneration)
       throw new Error("Startup cancelled by stop/shutdown.");
-    assertSupportedState(cwd, root);
+    assertSafeStateDirectories(cwd, root);
     // Promotion is an admission too: validate metadata before using a cached loop.
     if (loop?.isRunning()) {
       if (admitNewWork && !loop.isAdmittingNewWork()) {
@@ -238,7 +244,7 @@ async function startBoardLoop(
       }
       return;
     }
-    ownerLock = acquireOwnerLock(cwd, botLogin, root);
+    ownerLock = acquireOwnerLock(cwd, botLogin, root, true);
     const worktrees = new TicketWorktrees(cwd);
 
     const updateWidget = () => {
@@ -305,6 +311,7 @@ async function startBoardLoop(
     };
 
     const executor = createProductionTicketExecutor({
+      ownerLock,
       cwd,
       worktrees,
       cfg,
@@ -411,7 +418,7 @@ export default function (pi: ExtensionAPI) {
     try {
       // Do this before even the heartbeat write, not only inside recovery discovery.
       const root = stateRoot(ctx.cwd);
-      assertSupportedState(ctx.cwd, root);
+      assertSafeStateDirectories(ctx.cwd, root);
       const cfg = loadContextConfig(ctx);
       validateConfig(cfg);
       const previous = readRuntimeStatus(ctx.cwd);
