@@ -81,7 +81,7 @@ export async function sendTelegram(input: NotifyInput): Promise<boolean> {
   }
 }
 
-/** Build a notifier bound to the config + env (used by loop/watchdog). */
+/** Build a notifier bound to the config + env (used by ticket settlement). */
 export function makeNotifier(cfg: Config) {
   return async (
     event: string,

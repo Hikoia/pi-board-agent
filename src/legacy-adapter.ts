@@ -154,7 +154,6 @@ export function readLegacyRepair(path: string): LegacyRepair {
  * are observed again; v4 files are never replayed. Retired state stays read-only. */
 export class LegacyTicketAdapter {
   private inventoried = false;
-  private readonly retired = new Set<"story" | "watchdog">();
   private readonly sources = new Set<string>();
   private readonly repairFiles = new Set<string>();
   private repairs: LegacyRepair[] = [];
@@ -187,7 +186,6 @@ export class LegacyTicketAdapter {
       ? readdirSync(path).filter((n) => n.endsWith(".json")).map((n) => join(path, n)) : [];
   }
 
-  preservesLane(lane: "story" | "watchdog"): boolean { return this.retired.has(lane); }
   authorityHeld(): boolean {
     try { this.assertOwner(); return true; } catch { return false; }
   }
@@ -425,11 +423,6 @@ export class LegacyTicketAdapter {
     this.canContinue = canContinue;
     this.assertOwner();
     if (!this.inventoried) {
-      for (const [lane, names] of [
-        ["story", ["refine-state.json", "refine-state-unblocked.json"]],
-        ["watchdog", ["watchdog-state.json"]],
-      ] as const)
-        if (names.some((name) => lstatSync(join(this.state, name), { throwIfNoEntry: false }))) this.retired.add(lane);
       for (const path of [...this.files("ticket-worktrees"), ...this.files("cleanup")]) this.sources.add(path);
       for (const path of this.files("repair")) this.repairFiles.add(path);
       this.inventoried = true;

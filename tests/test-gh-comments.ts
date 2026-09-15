@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { listIssueComments, listPrComments } from "../src/gh.js";
+import { listIssueComments } from "../src/gh.js";
 
 const check = (condition: boolean, label: string) => {
   assert.ok(condition, label);
@@ -85,20 +85,4 @@ for (const response of [
   resetMock([response]);
   await assert.rejects(listIssueComments("owner", "repo", 83));
   check(calls().length === 1, "ambiguous/partial issue comment data is not an empty thread or a retry");
-}
-
-const restPage = (start: number, count: number) => Array.from({ length: count }, (_, index) => ({
-  id: start + index, body: "@board-bot clarify", created_at: new Date((start + index) * 1000).toISOString(),
-  user: { login: "maintainer" }, author_association: "COLLABORATOR",
-}));
-resetMock([[restPage(1, 100), restPage(101, 100), restPage(201, 1)]]);
-const prs = await listPrComments("origin-owner", "repo", 7);
-check(calls()[0].includes("--paginate") && calls()[0].includes("--slurp") && calls()[0].some((arg) => arg.includes("repos/origin-owner/repo/issues/7/comments?per_page=100")),
-  "PR mentions delegate every REST Link page to gh with per_page=100 and slurp");
-check(prs.length === 201 && prs.at(-1)?.id === "201" && prs.at(-1)?.authorAssociation === "COLLABORATOR",
-  "PR mention #201 and its trust metadata survive full REST pagination");
-for (const response of [[], [{}], { message: "denied" }, [[{ id: 1 }]], [restPage(1, 1), restPage(1, 1)]]) {
-  resetMock([response]);
-  await assert.rejects(listPrComments("owner", "repo", 7));
-  check(calls().length === 1, "malformed or duplicate REST comments fail closed without replay bootstrap");
 }

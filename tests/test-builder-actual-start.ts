@@ -43,11 +43,7 @@ cfg.max_workers = 1;
 cfg.tick_seconds = 0.01; // Only the latch case uses start(): poll while context is held.
 cfg.safety.require_clean_worktree =
   cfg.context.enabled =
-  cfg.refine.enabled =
-  cfg.review.enabled =
-  cfg.watchdog.enabled =
-  cfg.telegram.enabled =
-    false;
+  cfg.telegram.enabled = false;
 const worktrees = new TicketWorktrees(repo);
 const packageRoot = join(root, "package");
 mkdirSync(packageRoot);

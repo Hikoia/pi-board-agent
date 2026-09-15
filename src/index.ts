@@ -1,7 +1,7 @@
 /**
  * pi-board-agent — Extension entry point.
  *
- * Registers commands: /board-agent run | status | stop | init | lint
+ * Registers commands: /board-agent run | status | stop | init | lint | context
  *
  * Requirements:
  *   pi install git:github.com/Hikoia/pi-board-agent@<FULL_40_CHARACTER_GIT_SHA>
@@ -21,7 +21,6 @@ import { loadConfig, validateConfig, resolveOwner } from "./config.js";
 import {
   getProjectMetadata,
   validateProjectMetadata,
-  validateStatusOptions,
   whoami,
 } from "./gh.js";
 import { createLoopState, BoardLoop, type LoopDeps } from "./loop.js";
@@ -82,18 +81,6 @@ function loadContextConfig(ctx: ExtensionContext) {
   return loadConfig(ctx.cwd, (message) =>
     ctx.ui.notify(`[board-agent] ${message}`, "warning"),
   );
-}
-
-function configuredStatuses(cfg: ReturnType<typeof loadConfig>): string[] {
-  return [
-    cfg.columns.backlog,
-    cfg.columns.ready,
-    cfg.columns.building,
-    cfg.columns.needs_design,
-    cfg.columns.needs_human,
-    cfg.columns.review,
-    cfg.columns.done,
-  ];
 }
 
 function hasRecoveryState(cwd: string, root: string): boolean {
@@ -461,7 +448,7 @@ export default function (pi: ExtensionAPI) {
       mkdirSync(resolve(cwd, CONFIG_DIR_NAME), { recursive: true });
       writeFileSync(dest, template, { encoding: "utf8", flag: "wx" });
       ctx.ui.notify(
-        `Wrote: ${dest} (edit project.number + plan_field)`,
+        `Wrote: ${dest} (edit project.number and matching Status/Type field names)`,
         "info",
       );
     },
@@ -470,7 +457,7 @@ export default function (pi: ExtensionAPI) {
   // ----------- /board-agent lint -----------
   subcommands.set("lint", {
     description:
-      "Check preconditions: revision, config, gh auth, project exists, plan field present",
+      "Check preconditions: revision, config, gh auth, Task Type and required Status options",
     handler: async (_args, ctx) => {
       try {
         const cwd = ctx.cwd;
@@ -500,33 +487,6 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("All checks passed.", "info");
       } catch (err: any) {
         ctx.ui.notify(`Lint failed: ${err.message}`, "error");
-      }
-    },
-  });
-
-  // ----------- /board-agent init-project -----------
-  subcommands.set("init-project", {
-    description:
-      "Initialize the GitHub Project with the standard board (columns, Type, Plan, Board view)",
-    handler: async (_args, ctx) => {
-      try {
-        const cwd = ctx.cwd;
-        assertSupportedState(cwd, stateRoot(cwd));
-        await requireCurrentRevision(ctx);
-        const cfg = loadContextConfig(ctx);
-        validateConfig(cfg);
-        const { projectOwner, repoOwner, repoName } = resolveOwner(cfg, cwd);
-        const { initProject } = await import("./init-project.js");
-        const res = await initProject(projectOwner, cfg.project.number, cfg);
-        const created = res.created.length
-          ? `creati: ${res.created.join(", ")}`
-          : "nessuno (già presenti)";
-        ctx.ui.notify(
-          `Project #${cfg.project.number} (${projectOwner}; repo ${repoOwner}/${repoName}) — campi ${created}; vista "${res.view}" pronta.`,
-          "info",
-        );
-      } catch (err: any) {
-        ctx.ui.notify(`init-project failed: ${err.message}`, "error");
       }
     },
   });
@@ -577,7 +537,7 @@ export default function (pi: ExtensionAPI) {
           cfg.plan_field,
           cfg.type_field,
         );
-        validateStatusOptions(meta, configuredStatuses(cfg));
+        validateProjectMetadata(meta, cfg);
         const { listCards } = await import("./gh.js");
         const cards = await listCards(
           meta.projectId,
@@ -641,7 +601,7 @@ export default function (pi: ExtensionAPI) {
   // ----------- /board-agent run -----------
   subcommands.set("run", {
     description:
-      "Start the autonomous loop (picks Ready cards from the GitHub Project)",
+      "Start the autonomous loop (builds Ready Task Issues, always reviews, then waits for manual close)",
     handler: async (_args, ctx) => {
       try {
         await startBoardLoop(ctx);

@@ -25,7 +25,7 @@ export interface BuilderTask {
 
 export function buildTasksForWave(
   cfg: Config,
-  _planSlug: string,
+  _planSlug: string | undefined,
   cards: Card[],
 ): BuilderTask[] {
   return cards.map((card) => {
@@ -59,7 +59,7 @@ export function extractTaskKey(card: Card): string | undefined {
  */
 export function renderWorkflowSource(input: {
   cfg: Config;
-  planSlug: string;
+  planSlug?: string;
   baseBranch: string;
   tasks: BuilderTask[];
   skillName: string; // procedure label included in the self-contained mission
@@ -95,7 +95,7 @@ export function renderWorkflowSource(input: {
   // subagent to load the board-agent skill and follow it step by step.
   return `
 export const meta = {
-  name: 'board-agent-build-${input.planSlug}',
+  name: 'board-agent-build-${input.planSlug ?? input.tasks[0].issueNumber}',
   description: 'Build one ticket in its persistent worktree',
   phases: [{ title: 'Build' }],
 };
@@ -110,7 +110,7 @@ const result = await agent(
     'You are a board-agent builder running inside the persistent worktree for this ticket. The executor has already verified this worktree is registered and on the expected branch. It may contain a partial dirty diff left by an interrupted builder; preserve it and continue from it.',
     'MINIMALISM: Current acceptance criteria set the scope. Reuse existing code first, then standard-library/native features, then installed dependencies, and write only the minimum new code. Add abstractions, dependencies, configuration, or flexibility only when required now; preserve validation, security, error handling, accessibility, and the smallest relevant regression check.',
     '',
-    'Plan slug: ' + PAYLOAD.planSlug,
+    ...(PAYLOAD.planSlug ? ['Plan slug: ' + PAYLOAD.planSlug] : []),
     'Base branch: ' + PAYLOAD.cfg.base,
     'Base branch (do not modify): ' + t.baseBranch,
     'Task branch (already checked out): ' + t.taskBranch,

@@ -25,7 +25,6 @@ globals.__configStartup = {
     planFieldId: "PLAN", planFieldType: "TEXT", typeFieldId: "TYPE", typeFieldType: "SINGLE_SELECT", typeOptions: { Task: "TASK", Story: "STORY" },
   }),
   listCards: async () => [],
-  initProject: async () => ({ created: [], view: "Board" }),
   createProductionTicketExecutor: () => {
     starts++;
     return {
@@ -48,7 +47,6 @@ const stubs: Record<string, string> = {
   "./gh.js": shim("gh.ts", ["whoami", "getProjectMetadata", "listCards"]),
   "./ticket-executor.js": shim("ticket-executor.ts", ["createProductionTicketExecutor"]),
   "./runtime.js": shim("runtime.ts", ["captureRuntimeIdentity", "checkRuntimeRevisionAsync"]),
-  "./init-project.js": shim("init-project.ts", ["initProject"]),
 };
 const hooks = registerHooks({ resolve(specifier, context, next) {
   if ([entry, new URL("loop.ts", entry).href].includes(context.parentURL ?? "") && stubs[specifier])
@@ -69,7 +67,7 @@ try {
       ? config.replace("  require_clean_worktree: false", `  require_clean_worktree: false\n  skip_closed_issues: ${value}`)
       : config);
     if (source === global) writeFileSync(global, `safety:\n  skip_closed_issues: ${value}\n`);
-    for (const action of ["session_start", "lint", "run", "status", "context", "init-project"]) {
+    for (const action of ["session_start", "lint", "run", "status", "context"]) {
       messages.length = 0;
       await invoke(action);
       assert.ok(!messages.some(({ level }) => level === "error"), JSON.stringify(messages));
@@ -84,8 +82,14 @@ try {
       } else assert.deepEqual(warnings, [], `${action}: defaults must not warn`);
       await command("stop", ctx);
     }
-    console.log(`PASS: production session_start/run/lint/status/context/init-project ${source ? `warn for ${source === global ? "global true" : "project false"}` : "stay quiet for defaults"} through real loadConfig`);
+    console.log(`PASS: production session_start/run/lint/status/context ${source ? `warn for ${source === global ? "global true" : "project false"}` : "stay quiet for defaults"} through real loadConfig`);
   }
+  messages.length = 0;
+  await command("init-project", ctx);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /^Usage: \/board-agent/);
+  assert.ok(!messages[0].message.includes("init-project"));
+  console.log("PASS: retired init-project command is unavailable; no schema-creation command is advertised or invoked");
   writeFileSync(project, config + "auto_start: true\n");
   writeFileSync(global, "safety:\n  skip_closed_issues: false\n");
   messages.length = 0;

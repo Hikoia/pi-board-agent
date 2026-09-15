@@ -244,8 +244,8 @@ try {
         const { BoardLoop, createLoopState } = await import("../src/loop.js");
         let reviews = 0;
         const loop = new BoardLoop({ cwd: f.repo, cfg: { ...cfg,
-          safety: { ...cfg.safety, require_clean_worktree: false }, review: { ...cfg.review, enabled: true },
-          refine: { ...cfg.refine, enabled: false }, watchdog: { ...cfg.watchdog, enabled: false } },
+          safety: { ...cfg.safety, require_clean_worktree: false }, review: { ...cfg.review },
+           },
           repoOwner: "test", repoName: "repo", botLogin: "bot", meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
           listCards: async () => f.all(), callback: () => {}, review: async () => { reviews++; throw new Error("must not review pending integration"); },
         }, createLoopState(), executor, f.store);
@@ -327,6 +327,8 @@ try {
 
   {
     const f = await setup();
+    const previousDesignName = cfg.columns.needs_design;
+    cfg.columns.needs_design = "Old Questions"; // Config provenance, not an executable lane.
     f.card.status = cfg.columns.needs_design;
     const human = { ...f.card, itemId: "HUMAN", number: 990, status: cfg.columns.needs_human };
     const protectedCards = [
@@ -342,7 +344,8 @@ try {
     assert.deepEqual(f.comments, before); assert.deepEqual(protectedCards, originals);
     const writes = [...f.writes]; await f.make().reconcile(f.all()); assert.deepEqual(f.writes, writes);
     assert.equal(f.counts.starts, 0); f.ownerLock.release();
-    console.log("PASS: legacy Task Needs Design maps to Needs Human preserving questions; existing Needs Human and non-target items stay unchanged, no comment-driven resume");
+    cfg.columns.needs_design = previousDesignName;
+    console.log("PASS: legacy Task custom Needs Design name maps to Needs Human preserving questions; existing Needs Human and non-target items stay unchanged, no comment-driven resume");
   }
 
   {
@@ -354,14 +357,11 @@ try {
     f.cards.set(story.itemId, story);
     const { BoardLoop, createLoopState } = await import("../src/loop.js");
     const executor = f.make(), state = createLoopState();
-    const loop = new BoardLoop({ cwd: f.repo, cfg: { ...cfg, safety: { ...cfg.safety, require_clean_worktree: false },
-      refine: { ...cfg.refine, enabled: true }, watchdog: { ...cfg.watchdog, enabled: true } },
+    const loop = new BoardLoop({ cwd: f.repo, cfg: { ...cfg, safety: { ...cfg.safety, require_clean_worktree: false } },
       repoOwner: "test", repoName: "repo", botLogin: "bot", meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
       listCards: async () => f.all(), callback: (m) => f.notices.push(m),
-      refine: async () => { throw new Error("retired Story must not invoke a model"); },
     }, state, executor, f.store);
     await loop.tickNow();
-    assert.equal(executor.preservesLegacyLane("story"), true); assert.equal(executor.preservesLegacyLane("watchdog"), true);
     assert.equal(f.counts.starts, 1, f.notices.join("\n")); assert.equal(story.status, cfg.columns.ready);
     for (const name of retired) assert.equal(readFileSync(join(stateDir, name), "utf8"), `opaque retained ${name}\n`);
     assert.ok(!f.notices.some((m) => /Story #|Watchdog tick failed/.test(m)), f.notices.join("\n"));

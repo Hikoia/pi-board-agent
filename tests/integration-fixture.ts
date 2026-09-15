@@ -9,7 +9,7 @@ const { BoardLoop, createLoopState } = await import("../src/loop.js");
 
 export async function integrationFixture(legacy = false) {
   const f = await fixture(true), cfg = structuredClone(_DEFAULTS);
-  cfg.context.enabled = cfg.refine.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+  cfg.context.enabled = cfg.telegram.enabled = false;
   cfg.safety.require_clean_worktree = false;
   cfg.task_merge_strategy = "squash"; // obsolete input MUST NOT create new squash
   const card: Card = { itemId: f.task.itemId, number: f.task.issueNumber, type: "Task", contentType: "Issue",

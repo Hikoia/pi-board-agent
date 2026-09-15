@@ -73,7 +73,6 @@ export type FinalizeOutcome =
 
 export interface TicketExecutor {
   readonly isolatesLegacyState?: boolean;
-  preservesLegacyLane?(lane: "story" | "watchdog"): boolean;
   /** Display only. Never used to authorize launches, recovery or capacity. */
   readonly observation?: {
     active: readonly ActiveTicketRun[];
@@ -89,7 +88,7 @@ export interface TicketExecutor {
    * synchronously at start. The prepared launch already owns its worker slot. */
   launch(
     card: Card,
-    planSlug: string,
+    planSlug: string | undefined,
     canStartWork?: () => boolean | Promise<boolean>,
     canStartWorkNow?: () => boolean,
   ): Promise<LaunchResult>;
@@ -347,7 +346,6 @@ export class ManagedTicketExecutor implements TicketExecutor {
     if (deps.ownerLock) this.legacy = new LegacyTicketAdapter(deps);
   }
   get isolatesLegacyState(): boolean { return !!this.legacy; }
-  preservesLegacyLane(lane: "story" | "watchdog"): boolean { return this.legacy?.preservesLane(lane) ?? false; }
 
   recoveryBlocker(itemId: string): string | undefined {
     const record = this.deps.worktrees.read(itemId);
@@ -635,12 +633,12 @@ export class ManagedTicketExecutor implements TicketExecutor {
     return summary;
   }
 
-  private eligible(card: Card, expectedPlan: string, requireClaim = false): string | undefined {
+  private eligible(card: Card, expectedPlan: string | undefined, requireClaim = false): string | undefined {
     if (this.stopping) return "executor is stopping";
     const blocked = this.recoveryBlocker(card.itemId); if (blocked) return blocked;
     if (!isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task")) return "not a target Task Issue";
     if (card.closed || !statusIs(card, this.deps.cfg.columns.ready)) return "ticket is not open Ready";
-    if (!card.plan || planSlug(card.plan) !== expectedPlan) return "Plan changed";
+    if ((card.plan ? planSlug(card.plan) : undefined) !== expectedPlan) return "Plan changed";
     if (card.assignees.some((a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase())) return "another assignee is present";
     if (requireClaim && !this.owned(card)) return "claim was not retained";
     const record = this.deps.worktrees.read(card.itemId);
@@ -660,7 +658,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     return fresh;
   }
 
-  async launch(snapshot: Card, expectedPlan: string, canStartWork: () => boolean | Promise<boolean> = () => true,
+  async launch(snapshot: Card, expectedPlan: string | undefined, canStartWork: () => boolean | Promise<boolean> = () => true,
     canStartWorkNow: () => boolean = () => true): Promise<LaunchResult> {
     if (this.stopping) return { status: "skipped", reason: "executor is stopping" };
     this.canResume = canStartWork; this.canResumeNow = canStartWorkNow;

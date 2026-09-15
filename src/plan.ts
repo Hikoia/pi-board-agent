@@ -47,7 +47,3 @@ export function summarizePlans(
   }
   return summaries;
 }
-
-export function isPlanComplete(summary: PlanSummary): boolean {
-  return summary.totalCards > 0 && summary.doneCards === summary.totalCards;
-}

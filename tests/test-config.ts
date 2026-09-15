@@ -54,12 +54,12 @@ try {
   const cfg = loadConfig(cwd);
   check(
     cfg.max_workers === 2 &&
-      cfg.watchdog.respond_to_mentions === false &&
+      !("watchdog" in cfg) && !("refine" in cfg) && !("enabled" in cfg.review) &&
       !("pr" in cfg) &&
       !("builder_tier" in cfg) &&
       !("plan_prefix" in cfg.branches) &&
-      !("interval_seconds" in cfg.watchdog),
-    "0.2.0 defaults omit removed surfaces and disable mention replies",
+      cfg.task_merge_strategy === "merge",
+    "defaults omit retired lanes, always review, and merge new work",
   );
 
   const template = readConfigTemplate();
@@ -72,7 +72,7 @@ try {
   rmSync(file);
   check(
     !/\bpr:|builder_tier|plan_prefix|interval_seconds/.test(template) &&
-      parsedTemplate.watchdog.respond_to_mentions === false,
+      !parsedTemplate.watchdog && !parsedTemplate.refine && !parsedTemplate.columns.needs_design && !("enabled" in parsedTemplate.review),
     "the actual packaged YAML validates as 0.2.0 config",
   );
 
@@ -100,6 +100,97 @@ try {
       `${name}, including null values, fails explicitly in both config scopes`,
     );
   }
+
+  const legacyYaml = `project:
+  number: 1
+models:
+  builder: configured-builder
+  review: configured-review
+  refine: retired-refine
+  watch: retired-watch
+refine:
+  enabled: true
+  timeout_ms: 1234
+  max_tasks: 3
+watchdog:
+  enabled: true
+  fix_rounds_max: 2
+  fix_cooldown_minutes: 4
+  respond_to_mentions: true
+  pr_label: old-pr
+  needs_human_label: old-human
+columns:
+  needs_design: Old Questions
+review:
+  enabled: false
+  timeout_ms: 4321
+task_merge_strategy: squash
+max_workers: 4
+builder_timeout_ms: 1000
+builder_retries: 2
+context:
+  enabled: true
+  max_chars: 1234
+  exclude: [vendor]
+telegram:
+  enabled: false
+  on: [needs_human, ci_fixed]
+`;
+  for (const target of [globalFile, file]) {
+    writeFileSync(target, legacyYaml);
+    const warnings: string[] = [];
+    const normalized = loadConfig(cwd, message => warnings.push(message));
+    validateConfig(normalized);
+    assert.equal(readFileSync(target, "utf8"), legacyYaml, "compatibility never rewrites the user file");
+    for (const key of ["models.refine", "models.watch", "refine", "watchdog", "columns.needs_design", "review.enabled", "task_merge_strategy=squash"])
+      assert.ok(warnings.some(message => message.includes(target) && message.includes(key) && message.includes("retired")), key);
+    assert.equal(warnings.length, 7);
+    assert.deepEqual(normalized.models, { builder: "configured-builder", review: "configured-review" });
+    assert.deepEqual(normalized.review, { timeout_ms: 4321 });
+    assert.equal(normalized.task_merge_strategy, "merge");
+    assert.equal(normalized.columns.needs_design, "Old Questions");
+    assert.ok(!("refine" in normalized) && !("watchdog" in normalized));
+    assert.equal(normalized.max_workers, 4); assert.equal(normalized.builder_timeout_ms, 1000); assert.equal(normalized.builder_retries, 2);
+    assert.deepEqual(normalized.context, { enabled: true, max_chars: 1234, exclude: ["vendor"] });
+    assert.deepEqual(normalized.telegram.on, ["needs_human", "ci_fixed"], "notification subscriptions are not rewritten");
+    rmSync(target);
+  }
+  check(true, "both config scopes warn for each retired surface while preserving configured live controls and exact file bytes");
+  writeFileSync(globalFile, `review:
+  enabled: false
+models:
+  builder: global-builder
+  review: global-review
+`);
+  writeFileSync(file, `project:
+  number: 1
+review:
+  enabled: true
+models:
+  builder: project-builder
+`);
+  const warnings: string[] = [];
+  const layered = loadConfig(cwd, m => warnings.push(m)); validateConfig(layered);
+  assert.deepEqual(layered.models, { builder: "project-builder", review: "global-review" });
+  assert.ok(warnings.some(m => m.includes(globalFile)) && warnings.some(m => m.includes(file)));
+  assert.ok(!("enabled" in layered.review));
+  rmSync(file); rmSync(globalFile);
+  check(true, "review.enabled true and false are ignored per-file before layering without changing model precedence");
+  for (const yaml of [
+    "refine: false", "refine: null", "refine: {enabled: 'true'}", "refine: {timeout_ms: '1'}", "refine: {max_tasks: 13}",
+    "watchdog: []", "watchdog: {enabled: 1}", "watchdog: {fix_rounds_max: -1}", "watchdog: {fix_cooldown_minutes: '1'}",
+    "watchdog: {respond_to_mentions: 'false'}", "watchdog: {pr_label: false}", "watchdog: {needs_human_label: ''}",
+    "models: {refine: 42}", "models: {watch: ''}", "columns: {needs_design: false}", "review: {enabled: 'false'}",
+    "task_merge_strategy: false", "refine: {unknown: 1}", "watchdog: {typo: true}", "models: {design: x}", "columns: {story: x}",
+  ]) {
+    for (const target of [globalFile, file]) {
+      writeFileSync(target, yaml);
+      assert.throws(() => loadConfig(cwd), (error: unknown) => error instanceof ConfigError && error.message.includes(target), yaml);
+      assert.equal(readFileSync(target, "utf8"), yaml);
+      rmSync(target);
+    }
+  }
+  check(true, "retired input types/bounds and unrelated nested unknown keys still fail closed in either scope");
 
   writeFileSync(
     globalFile,
@@ -158,11 +249,7 @@ try {
     ["tick_seconds", 1, Math.floor(2_147_483_647 / 1000)],
     ["builder_timeout_ms", 1, 2_147_483_647],
     ["builder_retries", 0, 10],
-    ["refine.timeout_ms", 1, 2_147_483_647],
-    ["refine.max_tasks", 1, 12],
     ["review.timeout_ms", 1, 2_147_483_647],
-    ["watchdog.fix_rounds_max", 0, 10],
-    ["watchdog.fix_cooldown_minutes", 0, Math.floor(2_147_483_647 / 60_000)],
     ["context.max_chars", 1, 2_147_483_647],
   ];
   const set = (cfg: Config, path: string, value: unknown) => {

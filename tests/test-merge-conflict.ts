@@ -73,7 +73,7 @@ try {
   const worktrees = await import("../src/ticket-worktree.js");
   const store = new worktrees.TicketWorktrees(repo);
   const cfg = structuredClone(_DEFAULTS);
-  cfg.context.enabled = cfg.refine.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+  cfg.context.enabled = cfg.telegram.enabled = false;
   const card: Card = {
     itemId: "ITEM_11", number: 11, contentType: "Issue", type: "Task", title: "T011 accepted work", body: "Acceptance",
     repoOwner: "owner", repoName: "repo", closed: true, status: cfg.columns.done, plan: "demo", assignees: [],

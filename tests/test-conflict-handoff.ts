@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { fixture, git, settle } from "./conflict-handoff-fixture.js";
 
 const f = await fixture();
-f.cfg.review.enabled = true;
 f.cfg.task_merge_strategy = "merge";
 let reviews = 0;
 f.setBuilder(async (prompt) => {

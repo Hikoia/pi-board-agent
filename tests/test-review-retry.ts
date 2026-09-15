@@ -6,7 +6,7 @@ import { fixture, settle } from "./conflict-handoff-fixture.js";
 
 {
   const f = await fixture(false);
-  f.card.closed = false; f.card.status = f.cfg.columns.review; f.cfg.review.enabled = true;
+  f.card.closed = false; f.card.status = f.cfg.columns.review;
   f.store.setReviewedTaskSha(f.card.itemId, f.taskSha);
   let models = 0, scratch = "";
   f.setReview((input) => runReview(input, async (_source, { cwd }) => {

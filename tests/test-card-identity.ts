@@ -4,14 +4,12 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _DEFAULTS, type Config } from "../src/config.js";
-import type { Card, IssueComment } from "../src/gh.js";
+import type { Card } from "../src/gh.js";
 import { isTargetIssue } from "../src/gh.js";
 import {
   BoardLoop,
   createLoopState,
-  processNeedsDesignTask,
   type LoopDeps,
-  type TaskDesignOps,
 } from "../src/loop.js";
 import type { TicketExecutor } from "../src/ticket-executor.js";
 import {
@@ -28,9 +26,7 @@ const check = (ok: boolean, label: string) => {
 const cfg: Config = {
   ..._DEFAULTS,
   context: { ..._DEFAULTS.context, enabled: false },
-  refine: { ..._DEFAULTS.refine, enabled: true },
-  review: { ..._DEFAULTS.review, enabled: true },
-  watchdog: { ..._DEFAULTS.watchdog, enabled: false },
+  review: { ..._DEFAULTS.review },
   safety: { ..._DEFAULTS.safety, require_clean_worktree: false },
 };
 const card = (overrides: Partial<Card> = {}): Card => ({
@@ -90,20 +86,6 @@ const executor: TicketExecutor = {
   activeCount: () => 0,
   shutdown: async () => undefined,
 };
-let designClaims = 0;
-const taskDesignOps: TaskDesignOps = {
-  claim: async () => {
-    designClaims++;
-    return true;
-  },
-  refresh: async (candidate) => ({ ...candidate, assignees: ["bot"] }),
-  release: async () => undefined,
-  listComments: async () => [],
-  design: async () => ({ body: "", summary: "", openQuestions: [] }),
-  updateBody: async () => undefined,
-  comment: async () => undefined,
-  setReady: async () => undefined,
-};
 const deps = (cards: Card[]): LoopDeps => ({
   cwd,
   cfg,
@@ -113,7 +95,6 @@ const deps = (cards: Card[]): LoopDeps => ({
   meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
   callback: () => undefined,
   listCards: async () => cards,
-  taskDesignOps,
 });
 
 const invalid = [
@@ -140,88 +121,18 @@ const invalid = [
 ];
 await new BoardLoop(deps(invalid), createLoopState(), executor).tickNow();
 check(
-  launches === 0 && finalizations === 0 && designClaims === 0,
+  launches === 0 && finalizations === 0,
   "cross-repo, PR, DraftIssue, and untyped cards cause zero mutations",
 );
 
-await new BoardLoop(
-  deps([
-    card({
-      itemId: "WAITING_STORY",
-      number: 41,
-      status: cfg.columns.building,
-      type: "Story",
-    }),
-    card({
-      itemId: "DESIGN",
-      status: cfg.columns.needs_design,
-    }),
-  ]),
-  createLoopState(),
-  executor,
-).tickNow();
-check(
-  designClaims === 1,
-  "a waiting Story does not starve a later exact Needs Design Task",
-);
+await new BoardLoop(deps([
+  card({ itemId: "STORY", type: "Story" }),
+  card({ itemId: "DESIGN", status: cfg.columns.needs_design }),
+  card({ itemId: "BACKLOG", status: cfg.columns.backlog }),
+]), createLoopState(), executor).tickNow();
+check(launches === 0 && finalizations === 0, "Story, Needs Design and manual Backlog never execute a lane");
 
-const gate: IssueComment = {
-  id: "gate",
-  body: "<!-- board-agent-requirements-gate:42 -->",
-  createdAt: "2026-01-01T00:00:00Z",
-  author: "bot",
-  authorAssociation: "MEMBER",
-};
-const decision: IssueComment = {
-  id: "decision",
-  body: "approved",
-  createdAt: "2026-01-01T00:00:01Z",
-  author: "owner",
-  authorAssociation: "OWNER",
-};
-let mutations = 0;
-let releases = 0;
-let staleClaimed = false;
-const staleOps: TaskDesignOps = {
-  ...taskDesignOps,
-  claim: async () => {
-    staleClaimed = true;
-    return true;
-  },
-  refresh: async (candidate) => ({
-    ...candidate,
-    assignees: ["bot"],
-    repoOwner: staleClaimed ? "other" : candidate.repoOwner,
-  }),
-  release: async () => {
-    releases++;
-  },
-  listComments: async () => [gate, decision],
-  design: async () => {
-    mutations++;
-    return { body: "contract", summary: "done", openQuestions: [] };
-  },
-  comment: async () => {
-    mutations++;
-  },
-};
-await processNeedsDesignTask(
-  {
-    card: card({ status: cfg.columns.needs_design }),
-    cfg,
-    cwd,
-    contextDigest: "",
-    botLogin: "bot",
-    callback: () => undefined,
-  },
-  staleOps,
-);
-check(
-  mutations === 0 && releases === 1,
-  "post-claim repository drift is revalidated before Task design mutation",
-);
-
-// Review lane uses the same live board seam, but persists through the real v3 store.
+// Review lane uses the same live board seam, but persists through the real v4 store.
 const reviewDrifts: [string, (card: Card) => void][] = [
   [
     "closed",
@@ -297,7 +208,13 @@ const reviewDrifts: [string, (card: Card) => void][] = [
   ],
 ];
 const reviewRoot = mkdtempSync(join(cwd, "review-"));
+const git = (...args: string[]) => execFileSync("git", args, { cwd: reviewRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+git("init", "-b", "main"); git("config", "user.name", "Offline"); git("config", "user.email", "offline@example.test");
+git("commit", "--allow-empty", "-m", "review identity");
+const reviewedSha = git("rev-parse", "HEAD");
 const reviewWorktrees = new TicketWorktrees(reviewRoot);
+const reviewPath = reviewWorktrees.pathFor("ITEM", 42);
+git("worktree", "add", "-b", "task/issue-42", reviewPath, "main");
 async function reviewCase(
   phase?: "claim" | "model" | "comment",
   drift?: (card: Card) => void,
@@ -307,14 +224,15 @@ async function reviewCase(
   const current = card({ status: cfg.columns.review });
   const worktrees = reviewWorktrees;
   const record: TicketExecutionRecord = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     itemId: "ITEM",
     issueNumber: 42,
     taskKey: "T042",
     plan: "release",
     taskBranch: "task/issue-42",
     baseBranch: cfg.branches.base,
-    path: join(root, ".pi", "worktrees", "ITEM"),
+    path: reviewPath,
+    reviewedTaskSha: reviewedSha,
     createdAt: 1,
   };
   writeFileSync(
@@ -322,7 +240,6 @@ async function reviewCase(
     JSON.stringify(record),
   );
   const events: string[] = [];
-  const reviewedSha = "a".repeat(40);
   const state = createLoopState();
   const loop = new BoardLoop(
     {
@@ -340,6 +257,7 @@ async function reviewCase(
         release: async (original) => {
           assert.equal(original.number, 42);
           events.push("release");
+          current.assignees = [];
         },
         listComments: async () => [],
         comment: async () => {
@@ -392,13 +310,13 @@ for (const phase of ["claim", "model"] as const) {
     const h = await reviewCase(phase, drift);
     assert.deepEqual(
       h.events,
-      phase === "claim" ? ["claim", "release"] : ["claim", "model", "release"],
+      phase === "claim" ? ["claim", ...(["closed", "status"].includes(label) ? ["release"] : [])] : ["claim", "model"],
       `${phase} ${label}`,
     );
     assert.equal(
       h.record?.reviewedTaskSha,
-      undefined,
-      "stale result is not persisted as approval",
+      reviewedSha,
+      "pinned build SHA is retained, but stale result never advances the card",
     );
   }
   console.log(
@@ -407,7 +325,7 @@ for (const phase of ["claim", "model"] as const) {
 }
 for (const [label, drift] of reviewDrifts) {
   const h = await reviewCase("comment", drift);
-  assert.deepEqual(h.events, ["claim", "model", "comment", "release"], label);
+  assert.deepEqual(h.events, ["claim", "model", "comment", ...(label === "status" ? ["release"] : [])], label);
 }
 console.log(
   "PASS: review findings cannot return a stale/replaced Task to Ready",
@@ -417,12 +335,13 @@ console.log(
   assert.deepEqual(h.events, [
     "claim",
     "model",
+    "comment",
     `status:${cfg.columns.done}`,
     "release",
   ]);
   assert.equal(h.record?.reviewedTaskSha, h.reviewedSha);
   console.log(
-    "PASS: the first reviewer-returned origin SHA is persisted before Done and survives store restart without re-pinning",
+    "PASS: the pinned successful build SHA is preserved before Done and survives store restart without re-pinning",
   );
 }
 
@@ -481,11 +400,6 @@ for (const skip_closed_issues of [true, false]) {
   };
   const closedDesign = card({ closed: true, status: cfg.columns.needs_design });
   const config = { ...cfg, safety: { ...cfg.safety, skip_closed_issues } };
-  const closedOps: TaskDesignOps = {
-    claim: noClosedWork, refresh: noClosedWork, release: noClosedWork,
-    listComments: noClosedWork, design: noClosedWork, updateBody: noClosedWork,
-    comment: noClosedWork, setReady: noClosedWork,
-  };
   const loop = new BoardLoop(
     {
       ...deps([
@@ -494,7 +408,7 @@ for (const skip_closed_issues of [true, false]) {
         card({ closed: true, type: "Story" }),
         card({ closed: true, type: "Story", status: cfg.columns.needs_design }),
       ]),
-      cfg: config, taskDesignOps: closedOps, refine: noClosedWork, review: noClosedWork,
+      cfg: config, review: noClosedWork,
       boardOps: { claim: noClosedWork, refresh: noClosedWork, release: noClosedWork, listComments: noClosedWork, comment: noClosedWork, setStatus: noClosedWork },
     },
     createLoopState(),
@@ -502,7 +416,6 @@ for (const skip_closed_issues of [true, false]) {
   );
   try {
     await loop.tickNow();
-    assert.equal(await processNeedsDesignTask({ card: closedDesign, cfg: config, cwd, contextDigest: "", botLogin: "bot", callback: () => {} }, closedOps), "skipped");
     assert.equal(closedCalls, 0);
     assert.equal(launches, before);
   } finally { await loop.stop(); }
@@ -518,7 +431,7 @@ for (const verdict of ["model", "comment"] as const) {
     { reviewedTaskSha: "b".repeat(40) },
   ]) {
     const h = await reviewCase(verdict, undefined, patch);
-    assert.deepEqual(h.events, ["claim", "model", "release"]);
+    assert.deepEqual(h.events, ["claim", "model"]);
   }
 }
 console.log(

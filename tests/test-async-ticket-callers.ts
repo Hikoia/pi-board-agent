@@ -26,7 +26,7 @@ git(repo, "add", "."); git(repo, "commit", "-m", "fixture");
 git(repo, "remote", "add", "origin", origin); git(repo, "push", "origin", "main");
 const cfg = structuredClone(_DEFAULTS);
 cfg.max_workers = 1;
-cfg.context.enabled = cfg.refine.enabled = cfg.review.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+cfg.context.enabled = cfg.telegram.enabled = false;
 const deferred = () => {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => { resolve = done; });

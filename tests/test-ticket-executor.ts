@@ -62,9 +62,7 @@ const cfg: Config = {
   builder_timeout_ms: 21600000,
   builder_retries: 1,
   context: { ..._DEFAULTS.context, enabled: false },
-  refine: { ..._DEFAULTS.refine, enabled: false },
-  review: { ..._DEFAULTS.review, enabled: false },
-  watchdog: { ..._DEFAULTS.watchdog, enabled: false },
+  review: { ..._DEFAULTS.review },
   telegram: { ..._DEFAULTS.telegram, enabled: false },
   safety: { ..._DEFAULTS.safety, require_clean_worktree: false },
 };
@@ -368,7 +366,7 @@ const complete = (itemId: string, result: unknown) => {
   assert.equal(board.cards.get(card.itemId)!.status, cfg.columns.review);
   console.log("PASS: manual Backlog stops/drains/releases without overwriting lane; dirty manual Ready retry reaches pinned Review");
 
-  const reviewCfg = { ...cfg, review: { ...cfg.review, enabled: true } };
+  const reviewCfg = { ...cfg, review: { ...cfg.review } };
   let reviews = 0, verdict: "pass" | "fail" | "error" = "error";
   const loop = new BoardLoop({ cwd: repo, cfg: reviewCfg, repoOwner: "test", repoName: "repo", botLogin: "bot",
     meta: { projectId: "P", statusFieldId: "S", statusOptions: {} }, callback: (m) => notices.push(m), listCards: () => Promise.resolve(board.all()),
@@ -538,7 +536,6 @@ const complete = (itemId: string, result: unknown) => {
 let finalSequence = 0;
 async function finalFixture(
   strategy: Config["task_merge_strategy"] = "squash",
-  aiReview = false,
 ) {
   const dir = join(root, `final-executor-${++finalSequence}`);
   const remote = join(dir, "origin.git");
@@ -557,7 +554,7 @@ async function finalFixture(
   const finalCfg: Config = {
     ...cfg,
     task_merge_strategy: strategy,
-    review: { ...cfg.review, enabled: aiReview },
+    review: { ...cfg.review },
     safety: { ...cfg.safety, require_clean_worktree: true },
   };
   const finalBoard = new FakeBoard();
@@ -636,7 +633,7 @@ async function finalFixture(
 }
 
 {
-  const f = await finalFixture("merge", true);
+  const f = await finalFixture("merge");
   f.card.plan = undefined;
   f.finalBoard.cards.get(f.card.itemId)!.plan = undefined;
   rmSync(
@@ -735,7 +732,7 @@ async function finalFixture(
 
 for (const strategy of ["squash", "merge"] as const) {
   const f = await finalFixture(strategy);
-  assert.equal(_DEFAULTS.review.enabled, false);
+  assert.equal("enabled" in _DEFAULTS.review, false);
   assert.equal(f.store.read(f.card.itemId)!.reviewedTaskSha, undefined);
   const actual = f.make();
   const loop = new BoardLoop(
@@ -864,7 +861,7 @@ for (const strategy of ["squash", "merge"] as const) {
   console.log("PASS: changed Plan/identity is preserved without technical writeback over human state");
 }
 {
-  const f = await finalFixture("merge", true);
+  const f = await finalFixture("merge");
   f.store.setReviewedTaskSha(f.card.itemId, f.taskSha);
   writeFileSync(join(f.record.path, "local-only.txt"), "latest local work\n");
   git(f.record.path, "add", "local-only.txt");

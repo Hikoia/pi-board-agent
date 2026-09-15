@@ -405,7 +405,7 @@ try {
     join(state, "runtime.json"),
     '{"sentinel":"must not change"}\n',
   );
-  for (const action of ["lint", "init-project"]) {
+  for (const action of ["lint"]) {
     const unchanged = inventory(state);
     const messageStart = messages.length;
     if (action === "session_start") await event(action);
@@ -445,22 +445,9 @@ try {
   check(true, "startup isolates retired evidence instead of blocking healthy tickets; explicit run acquires its owner and leaves legacy bytes unchanged");
   rmSync(join(state, "inflight"), { recursive: true });
   for (const [label, patch, error] of [
-    ["missing Plan", { planFieldId: undefined }, /Plan.*TEXT.*SINGLE_SELECT/],
-    ["wrong Plan", { planFieldType: "NUMBER" }, /Plan.*TEXT.*SINGLE_SELECT/],
-    [
-      "unknown Plan type",
-      { planFieldType: undefined },
-      /Plan.*TEXT.*SINGLE_SELECT/,
-    ],
-    [
-      "missing Plan options",
-      { planFieldType: "SINGLE_SELECT", planOptions: undefined },
-      /Plan.*option/,
-    ],
     ["missing Type", { typeFieldId: undefined }, /Type.*SINGLE_SELECT/],
     ["wrong Type", { typeFieldType: "TEXT" }, /Type.*SINGLE_SELECT/],
     ["missing Task", { typeOptions: { Story: "STORY" } }, /Type.*Task/],
-    ["missing Story", { typeOptions: { Task: "TASK" } }, /Type.*Story/],
     ["missing Status", { statusFieldId: "" }, /Status.*SINGLE_SELECT/],
     ["wrong Status", { statusFieldType: "TEXT" }, /Status.*SINGLE_SELECT/],
     [
@@ -547,7 +534,7 @@ try {
     "cached promotion must still reject removed configuration",
   );
   writeFileSync(configFile, configText);
-  metadata = { ...validMetadata, planFieldId: undefined };
+  metadata = { ...validMetadata, typeFieldId: undefined };
   const promotionStart = messages.length;
   await command("run");
   assert.equal(
@@ -557,7 +544,7 @@ try {
   );
   assert.equal(recovery.ticks, 0);
   assert.ok(
-    messages.slice(promotionStart).some((message) => /Plan/.test(message)),
+    messages.slice(promotionStart).some((message) => /Type/.test(message)),
   );
   assert.ok(
     existsSync(recovery.lock.path),
@@ -637,20 +624,19 @@ try {
 
   metadataWait = Promise.resolve();
   for (const refine of [true, false]) {
-    for (const planFieldType of ["TEXT", "SINGLE_SELECT"]) {
+    for (const planFieldType of [undefined, "TEXT", "SINGLE_SELECT"]) {
       metadata = {
         ...validMetadata,
+        planFieldId: planFieldType ? "PLAN" : undefined,
         planFieldType,
         planOptions:
           planFieldType === "SINGLE_SELECT"
             ? { Release: "RELEASE_ID" }
             : undefined,
-        typeOptions: refine
-          ? { Task: "TASK", Story: "STORY" }
-          : { task: "TASK" },
+        typeOptions: { task: "TASK" },
         statusOptions: Object.fromEntries(
           Object.entries(validMetadata.statusOptions).filter(
-            ([name]) => refine || !["Backlog", "Needs Design"].includes(name),
+            ([name]) => !["Backlog", "Needs Design"].includes(name),
           ),
         ),
       };
@@ -669,7 +655,7 @@ try {
       assert.equal(loops.length, count + 1);
       await command("stop");
       console.log(
-        `PASS: lint/run accept ${planFieldType} Plan with refine=${refine}; disabled design does not require Story/Needs Design/Backlog`,
+        `PASS: lint/run accept ${planFieldType} Plan with refine=${refine}; retired refine cannot require Story/Needs Design/Backlog`,
       );
     }
   }

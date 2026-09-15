@@ -63,16 +63,16 @@ else
 fi
 
 STATUS_FIELD="$(ask 'Status field name' "${STATUS_FIELD:-Status}")"
-PLAN_FIELD="$(ask 'Plan field name' "${PLAN_FIELD:-Plan}")"
+PLAN_FIELD="$(ask 'Optional read-only Plan field name' "${PLAN_FIELD:-Plan}")"
 TYPE_FIELD="$(ask 'Type field name' "${TYPE_FIELD:-Kind}")"
 READY_COL="$(ask 'Ready column name' "${READY_COL:-Ready}")"
 DONE_COL="$(ask 'Done column name' "${DONE_COL:-Done}")"
 node -e '
 const names = process.argv.slice(1);
 if (names.some(s => !s || s.trim() !== s || /[\x00-\x1f\x7f]/.test(s))) process.exit(1);
-const statuses = [names[3], names[4], "Backlog", "In Progress", "Needs Design", "Needs Human", "Review"].map(s => s.toLowerCase());
+const statuses = [names[3], names[4], "Backlog", "In Progress", "Needs Human", "Review"].map(s => s.toLowerCase());
 if (new Set(statuses).size !== statuses.length) process.exit(1);
-' "$STATUS_FIELD" "$PLAN_FIELD" "$TYPE_FIELD" "$READY_COL" "$DONE_COL" || err 'Use non-empty single-line field names and seven distinct status names.'
+' "$STATUS_FIELD" "$PLAN_FIELD" "$TYPE_FIELD" "$READY_COL" "$DONE_COL" || err 'Use non-empty single-line field names and six distinct status names.'
 
 CONFIG_PATH="$PWD/.pi/board-agent.yml"
 [[ ! -L "$PWD/.pi" && ! -L "$CONFIG_PATH" ]] || err 'Refusing a symlinked config path.'
@@ -89,10 +89,9 @@ node -e '
 const [owner, number, status_field, plan_field, type_field, ready, done] = process.argv.slice(1);
 console.log(JSON.stringify({
   project: { owner, number: Number(number) },
-  columns: { backlog: "Backlog", ready, building: "In Progress", needs_design: "Needs Design", needs_human: "Needs Human", review: "Review", done },
+  columns: { backlog: "Backlog", ready, building: "In Progress", needs_human: "Needs Human", review: "Review", done },
   status_field, plan_field, type_field,
   builder_timeout_ms: 21600000,
-  watchdog: { respond_to_mentions: false },
   auto_start: false
 }, null, 2));
 ' "$PROJECT_OWNER" "$PROJECT_NUMBER" "$STATUS_FIELD" "$PLAN_FIELD" "$TYPE_FIELD" "$READY_COL" "$DONE_COL" > "$TEMP_CONFIG"

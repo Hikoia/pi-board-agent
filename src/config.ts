@@ -13,6 +13,7 @@ export interface Config {
     building: string;
     review: string;
     done: string;
+    /** Legacy lane name for migration only; never an executable/required status. */
     needs_design: string;
     needs_human: string;
     backlog: string;
@@ -23,21 +24,13 @@ export interface Config {
   max_workers: number;
   tick_seconds: number;
   branches: { base: string; task_prefix: string };
+  /** Legacy squash input is normalized to merge by loadConfig. */
   task_merge_strategy: "squash" | "merge";
   builder_timeout_ms?: number;
   builder_retries: number;
-  models: { builder: string; refine: string; review: string; watch: string };
+  models: { builder: string; review: string };
   context: { enabled: boolean; max_chars: number; exclude: string[] };
-  refine: { enabled: boolean; timeout_ms: number; max_tasks: number };
-  review: { enabled: boolean; timeout_ms: number };
-  watchdog: {
-    enabled: boolean;
-    fix_rounds_max: number;
-    fix_cooldown_minutes: number;
-    respond_to_mentions: boolean;
-    pr_label: string;
-    needs_human_label: string;
-  };
+  review: { timeout_ms: number };
   telegram: {
     enabled: boolean;
     bot_token_env: string;
@@ -66,30 +59,19 @@ const DEFAULTS: Config = {
   max_workers: 2,
   tick_seconds: 90,
   branches: { base: "main", task_prefix: "task/" },
-  task_merge_strategy: "squash",
+  task_merge_strategy: "merge",
   builder_retries: 1,
   models: {
     builder: "deepseek-v4-flash-0731",
-    refine: "deepseek-v4-flash-0731",
     review: "deepseek-v4-flash-0731",
-    watch: "deepseek-v4-flash-0731",
   },
   context: { enabled: true, max_chars: 20_000, exclude: [] },
-  refine: { enabled: true, timeout_ms: 240_000, max_tasks: 12 },
-  review: { enabled: false, timeout_ms: 600_000 },
-  watchdog: {
-    enabled: true,
-    fix_rounds_max: 5,
-    fix_cooldown_minutes: 5,
-    respond_to_mentions: false,
-    pr_label: "board-agent",
-    needs_human_label: "needs-human",
-  },
+  review: { timeout_ms: 600_000 },
   telegram: {
     enabled: true,
     bot_token_env: "TELEGRAM_BOT_TOKEN",
     chat_id_env: "TELEGRAM_CHAT_ID",
-    on: ["ci_fixed", "needs_human", "refine_questions", "refine_done"],
+    on: ["needs_human"],
   },
   auto_start: false,
   safety: { require_clean_worktree: true, skip_closed_issues: true },
@@ -203,8 +185,58 @@ function rejectRemovedKeys(
   const keys = removedKeys(value);
   if (keys.length)
     throw new ConfigError(
-      `${source} uses key(s) removed in 0.2.0: ${keys.join(", ")}. Migration: back up the file and remove those keys. Use models.builder instead of builder_tier, branches.base/task_prefix plus task_merge_strategy instead of plan/PR settings, and tick_seconds for the loop's watchdog schedule.`,
+      `${source} uses key(s) removed in 0.2.0: ${keys.join(", ")}. Migration: back up the file and remove those keys. Use models.builder instead of builder_tier, branches.base/task_prefix plus task_merge_strategy instead of plan/PR settings, and tick_seconds for the polling loop.`,
     );
+}
+
+// Only keys accepted by the retiring runtime are compatibility inputs. They
+// remain strictly typed; unrelated/previously rejected keys still fail closed.
+const COMPAT_SHAPE = {
+  ...DEFAULTS,
+  builder_timeout_ms: 0,
+  models: { ...DEFAULTS.models, refine: "", watch: "" },
+  refine: { enabled: true, timeout_ms: 240_000, max_tasks: 12 },
+  review: { ...DEFAULTS.review, enabled: true },
+  watchdog: {
+    enabled: true, fix_rounds_max: 5, fix_cooldown_minutes: 5,
+    respond_to_mentions: false, pr_label: "board-agent", needs_human_label: "needs-human",
+  },
+};
+
+function normalizeRetiredConfig(
+  overlay: Record<string, any>, path: string, warn?: (message: string) => void,
+): void {
+  const warning = (key: string, effect: string) =>
+    warn?.(`${path}: ${key} is retired. ${effect} Remove this key from the file; the file was not rewritten.`);
+  // Validate retired values before ignoring them, including the old bounds.
+  try {
+    if (overlay.refine?.timeout_ms !== undefined) timerMilliseconds("refine.timeout_ms", overlay.refine.timeout_ms);
+    if (overlay.refine?.max_tasks !== undefined) integer("refine.max_tasks", overlay.refine.max_tasks, 1, 12);
+    if (overlay.watchdog?.fix_rounds_max !== undefined) integer("watchdog.fix_rounds_max", overlay.watchdog.fix_rounds_max, 0, 10);
+    if (overlay.watchdog?.fix_cooldown_minutes !== undefined)
+      integer("watchdog.fix_cooldown_minutes", overlay.watchdog.fix_cooldown_minutes, 0, Math.floor(MAX_TIMER_MS / 60_000));
+    for (const value of [overlay.models?.refine, overlay.models?.watch, overlay.watchdog?.pr_label, overlay.watchdog?.needs_human_label, overlay.columns?.needs_design])
+      if (value !== undefined && (!value || value !== value.trim() || /[\x00-\x1f\x7f]/.test(value)))
+        throw new ConfigError("Retired model/label/lane values must be non-empty, trimmed single-line strings.");
+  } catch (error) { throw new ConfigError(`${path}: ${(error as Error).message}`); }
+  for (const key of ["refine", "watchdog"] as const) if (Object.hasOwn(overlay, key)) {
+    warning(key, `Ignored settings (${Object.keys(overlay[key]).join(", ") || "empty mapping"}); no Story/design/PR operations run.`);
+    delete overlay[key];
+  }
+  for (const key of ["refine", "watch"] as const) if (overlay.models && Object.hasOwn(overlay.models, key)) {
+    warning(`models.${key}`, "Ignored; only configured builder and review models run.");
+    delete overlay.models[key];
+  }
+  if (overlay.columns && Object.hasOwn(overlay.columns, "needs_design"))
+    warning("columns.needs_design", "Kept only as legacy migration provenance for Task questions → Needs Human; not an executable or required status.");
+  if (overlay.review && Object.hasOwn(overlay.review, "enabled")) {
+    warning("review.enabled", "Ignored (true or false); AI review is always enabled.");
+    delete overlay.review.enabled;
+  }
+  if (overlay.task_merge_strategy === "squash") {
+    warning("task_merge_strategy=squash", "Normalized to merge for new integrations; recorded legacy results remain valid.");
+    overlay.task_merge_strategy = "merge";
+  }
 }
 
 /** Warn only for explicit deprecated keys, not merged defaults. */
@@ -216,10 +248,11 @@ export function loadConfig(cwd: string, warn?: (message: string) => void): Confi
     if (!existsSync(path)) continue;
     const overlay = configObject(path);
     rejectRemovedKeys(overlay, path);
-    validateShape(overlay, { ...DEFAULTS, builder_timeout_ms: 0 }, path, true);
+    validateShape(overlay, COMPAT_SHAPE, path, true);
+    normalizeRetiredConfig(overlay, path, warn);
     if (overlay.safety && Object.hasOwn(overlay.safety, "skip_closed_issues"))
       warn?.(
-        `${path}: safety.skip_closed_issues is deprecated and has no effect (true or false). Remove this key from the file. Closed Issues never start builders or design; only closed Done Tasks can be finalized.`,
+        `${path}: safety.skip_closed_issues is deprecated and has no effect (true or false). Remove this key from the file. Closed Issues never start builders; only closed Done Tasks can be finalized.`,
       );
     cfg = deepMerge(cfg, overlay as Partial<Config>);
   }
@@ -258,16 +291,7 @@ export function validateConfig(cfg: Config): void {
   if (cfg.builder_timeout_ms !== undefined)
     timerMilliseconds("builder_timeout_ms", cfg.builder_timeout_ms);
   integer("builder_retries", cfg.builder_retries, 0, 10);
-  timerMilliseconds("refine.timeout_ms", cfg.refine.timeout_ms);
-  integer("refine.max_tasks", cfg.refine.max_tasks, 1, 12);
   timerMilliseconds("review.timeout_ms", cfg.review.timeout_ms);
-  integer("watchdog.fix_rounds_max", cfg.watchdog.fix_rounds_max, 0, 10);
-  integer(
-    "watchdog.fix_cooldown_minutes",
-    cfg.watchdog.fix_cooldown_minutes,
-    0,
-    Math.floor(MAX_TIMER_MS / 60_000),
-  );
   integer("context.max_chars", cfg.context.max_chars, 1, MAX_TIMER_MS);
 
   for (const [name, value] of Object.entries({
@@ -292,8 +316,6 @@ export function validateConfig(cfg: Config): void {
         value,
       ]),
     ),
-    "watchdog.pr_label": cfg.watchdog.pr_label,
-    "watchdog.needs_human_label": cfg.watchdog.needs_human_label,
   })) {
     if (!value || value !== value.trim() || /[\x00-\x1f\x7f]/.test(value))
       throw new ConfigError(
@@ -318,26 +340,23 @@ export function validateConfig(cfg: Config): void {
     cfg.columns.backlog,
     cfg.columns.ready,
     cfg.columns.building,
-    cfg.columns.needs_design,
+    cfg.columns.needs_design, // Migration provenance must not alias a live lane.
     cfg.columns.needs_human,
     cfg.columns.review,
     cfg.columns.done,
   ];
   if (statuses.some((status) => typeof status !== "string" || !status.trim()))
     throw new ConfigError(
-      "config.columns must define all seven board statuses.",
+      "config.columns must define the Task statuses and manual Backlog name.",
     );
   if (
     new Set(statuses.map((status) => status.toLowerCase())).size !==
     statuses.length
   )
     throw new ConfigError("config.columns status names must be distinct.");
-  if (
-    cfg.task_merge_strategy !== "squash" &&
-    cfg.task_merge_strategy !== "merge"
-  )
+  if (cfg.task_merge_strategy !== "merge")
     throw new ConfigError(
-      "config.task_merge_strategy must be 'squash' or 'merge'.",
+      "config.task_merge_strategy must be 'merge' (legacy files normalize 'squash' on load).",
     );
   if (!cfg.branches.base || !cfg.branches.task_prefix)
     throw new ConfigError("config.branches.base and task_prefix are required.");
