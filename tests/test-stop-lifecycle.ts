@@ -6,6 +6,7 @@ import { registerHooks } from "node:module";
 import { join } from "node:path";
 import { _DEFAULTS } from "../src/config.js";
 import type { TicketExecutor } from "../src/ticket-executor.js";
+import { assertOwnerLock } from "../src/owner-lock.js";
 
 const cwd = process.env.TMP_DIR!;
 assert.ok(cwd, "Run via bash tests/run-offline.sh");
@@ -30,6 +31,8 @@ const deferred = () => {
 const turn = () => new Promise<void>((done) => setImmediate(done));
 let read = async () => [];
 let metadataWait = Promise.resolve();
+let migrationWait = Promise.resolve();
+let migrationEntered = () => {};
 let drainWait = Promise.resolve();
 let drainFailure = false;
 let executors = 0;
@@ -64,6 +67,14 @@ globals.__stopTest = {
   createProductionTicketExecutor: (): TicketExecutor => {
     executors++;
     return {
+      migrateLegacy: async (owner, canMigrate) => {
+        assertOwnerLock(owner, cwd);
+        migrationEntered();
+        await migrationWait;
+        if (canMigrate && !canMigrate()) throw new Error("Startup migration cancelled");
+        assertOwnerLock(owner, cwd);
+        return { converted: [], failures: [] };
+      },
       reconcile: async () => summary,
       activeCount: () => 0,
       launch: async () => {
@@ -281,6 +292,21 @@ try {
   console.log(
     "PASS: a tick failure that fully drains clears the module reference and permits a clean restart",
   );
+
+  const migrating = deferred(), migrationGate = deferred();
+  migrationEntered = migrating.resolve;
+  migrationWait = migrationGate.promise;
+  let ticks = 0;
+  read = async () => { ticks++; return []; };
+  const migrationStart = invoke("run");
+  await migrating.promise;
+  assert.ok(existsSync(lock), "conversion runs under exclusive ownership");
+  await invoke("stop");
+  migrationGate.resolve();
+  await migrationStart;
+  assert.equal(ticks, 0, "no executor reconciliation/model can race conversion");
+  assert.equal(existsSync(lock), false);
+  console.log("PASS: startup migration holds the owner before any tick and a stop during conversion prevents late loop/model startup");
 } finally {
   drainFailure = false;
   drainWait = Promise.resolve();

@@ -691,17 +691,19 @@ export class BoardLoop {
     assertSupportedState(
       this.deps.cwd,
       this.deps.repoRoot ?? this.ticketWorktrees.repoRoot,
+      true,
     );
     const blockers = new Map<string, BlockerNotice>();
     try {
       const { cfg, callback, repoOwner, repoName, meta } = this.deps;
-      const cards = await this.fetchCards();
+      let cards = await this.fetchCards();
       if (this.foreground.signal.aborted) return;
       const summary = await this.executor.reconcile(
         cards,
         async () => (await this.revisionAllowsNewWork()) && this.admitNewWork,
         () => this.admissionStillAllowed(),
       );
+      cards = cards.filter((card) => !this.executor.legacyBlocked?.(card.itemId));
       for (const blocker of summary.repairBlockers ?? []) {
         if (
           cards.some(
@@ -1451,7 +1453,7 @@ export class BoardLoop {
           record.taskBranch !== task.taskBranch ||
           record.activeRunId ||
           record.launchingAt !== undefined ||
-          record.finalization ||
+          record.finalization || record.integration ||
           this.ticketWorktrees.hasCleanupReceipt(card.itemId)
         )
           throw new Error("Missing matching idle v3 record before review.");
@@ -1518,7 +1520,7 @@ export class BoardLoop {
           current.reviewedTaskSha !== record.reviewedTaskSha ||
           current.activeRunId ||
           current.launchingAt !== undefined ||
-          current.finalization ||
+          current.finalization || current.integration ||
           this.ticketWorktrees.hasCleanupReceipt(latest.itemId)
         )
           throw new Error("Execution record changed during review.");
@@ -1650,7 +1652,8 @@ export class BoardLoop {
         !refs.has(
           `refs/heads/${taskBranch(cfg.branches.task_prefix, card.number!)}`,
         ) &&
-        !this.ticketWorktrees.hasCleanupReceipt(card.itemId)
+        !this.ticketWorktrees.hasCleanupReceipt(card.itemId) &&
+        !this.ticketWorktrees.read(card.itemId)?.integration
       ) {
         continue;
       }

@@ -346,7 +346,7 @@ const equalRecordBytes = (bytes: Buffer, record: TicketExecutionRecord) => {
 export class TicketWorktrees {
   readonly repoRoot: string;
   private readonly gitCommonDir?: string;
-  private readonly recordsDir: string;
+  readonly recordsDir: string;
   private readonly worktreesDir: string;
   private readonly cleanupDir: string;
   private readonly backupsDir: string;
@@ -401,11 +401,16 @@ export class TicketWorktrees {
     return !!lstatSync(this.receiptPath(itemId), { throwIfNoEntry: false });
   }
 
+  hasCleanupReceipts(): boolean {
+    if (this.hasSymlink(this.cleanupDir)) throw new Error("Symlinked cleanup state.");
+    return readdirSync(this.cleanupDir).some((name) => name.endsWith(".json"));
+  }
+
   private receiptPath(itemId: string): string {
     return join(this.cleanupDir, `${safe(itemId)}.json`);
   }
 
-  private recordPath(itemId: string): string {
+  recordPath(itemId: string): string {
     return join(this.recordsDir, `${safe(itemId)}.json`);
   }
 
@@ -478,7 +483,11 @@ export class TicketWorktrees {
     return mustGit(["rev-parse", "--verify", `${ref}^{commit}`], this.repoRoot);
   }
 
-  private save(record: TicketExecutionRecord, expectedBytes?: Buffer): void {
+  private save(
+    record: TicketExecutionRecord,
+    expectedBytes?: Buffer,
+    beforePublish?: () => void,
+  ): void {
     if (!isTicketExecutionRecord(record))
       throw new Error("Invalid ticket execution record.");
     const path = this.recordPath(record.itemId);
@@ -509,6 +518,7 @@ export class TicketWorktrees {
       } finally {
         closeSync(fd);
       }
+      beforePublish?.();
       assertCurrent();
       renameSync(temporary, path);
       if (process.platform !== "win32") {
@@ -522,6 +532,22 @@ export class TicketWorktrees {
     } finally {
       if (ownsTemporary && existsSync(temporary)) unlinkSync(temporary);
     }
+  }
+
+  /** The owner-held legacy adapter has archived the exact source. No ordinary
+   * update may change schema or bypass a receipt. A missing source is permitted
+   * only for receipt-only recovery (the original ticket was already removed). */
+  publishLegacy(
+    original: TicketExecutionRecord,
+    next: TicketExecutionRecordV4,
+    expectedBytes: Buffer | undefined,
+    assertSource: () => void,
+  ): void {
+    if (original.schemaVersion !== 3 || next.schemaVersion !== 4 ||
+        !isTicketExecutionRecord(original) || !sameIdentity(original, next))
+      throw new Error("Invalid legacy ticket conversion.");
+    assertSource();
+    this.save(next, expectedBytes, assertSource);
   }
 
   update(
@@ -671,7 +697,7 @@ export class TicketWorktrees {
     );
   }
 
-  private assertOwnedPath(record: TicketExecutionRecord): void {
+  assertOwnedPath(record: TicketExecutionRecord): void {
     if (
       !this.isManagedPath(record.path) ||
       !samePath(record.path, this.pathFor(record.itemId, record.issueNumber))
@@ -1383,7 +1409,8 @@ export class TicketWorktrees {
     return own;
   }
 
-  private async readReceipt(task: BuilderTask): Promise<CleanupReceipt> {
+  /** Read-only evidence checks shared with the owner-held legacy adapter. */
+  async readReceipt(task: BuilderTask): Promise<CleanupReceipt> {
     const path = this.receiptPath(task.itemId);
     let r: any;
     try {
@@ -1580,7 +1607,7 @@ export class TicketWorktrees {
     return this.readReceipt(task); // apply the same strict gate on first use and restart
   }
 
-  private async verifyLegacyResult(
+  async verifyLegacyResult(
     old: TicketFinalizationState,
   ): Promise<void> {
     // Prove the recorded merge/squash, not a new merge against today's possibly conflicting base.
@@ -1695,7 +1722,7 @@ export class TicketWorktrees {
       );
   }
 
-  private async checkCleanup(
+  async checkCleanup(
     task: BuilderTask,
     receipt: CleanupReceipt,
   ): Promise<void> {
@@ -1901,7 +1928,7 @@ export class TicketWorktrees {
     );
   }
 
-  private async fetchRequired(...branches: string[]): Promise<void> {
+  async fetchRequired(...branches: string[]): Promise<void> {
     await mustGitAsync(
       [
         "fetch",
@@ -1917,7 +1944,7 @@ export class TicketWorktrees {
     );
   }
 
-  private fetchedSha(branch: string): string {
+  fetchedSha(branch: string): string {
     return mustGit(
       ["rev-parse", "--verify", `refs/remotes/origin/${branch}^{commit}`],
       this.repoRoot,
@@ -1933,7 +1960,7 @@ export class TicketWorktrees {
     return result.stdout.trim().split(/\s+/)[0];
   }
 
-  private isAncestor(ancestor: string, descendant: string): boolean {
+  isAncestor(ancestor: string, descendant: string): boolean {
     return git(
       ["merge-base", "--is-ancestor", ancestor, descendant],
       this.repoRoot,

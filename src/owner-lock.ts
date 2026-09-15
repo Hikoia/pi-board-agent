@@ -73,6 +73,16 @@ function releaseToken(path: string, token: string): void {
   }
 }
 
+/** Migration must retain this exact live owner through the atomic publish. */
+export function assertOwnerLock(lock: OwnerLock, root: string): void {
+  const path = join(root, ".pi", "board-agent", "owner.lock");
+  const current = readOwnerLock(path);
+  if (lock.path !== path || current.token !== lock.record.token ||
+      current.pid !== process.pid ||
+      current.hostname.toLowerCase() !== hostname().toLowerCase())
+    throw new Error("Exclusive Board Agent owner was lost; migration stopped.");
+}
+
 /** Keep non-owner Pi processes from overwriting the active owner's runtime heartbeat. */
 export function ownerLockHeldByOther(
   cwd: string,
@@ -93,7 +103,7 @@ export function acquireOwnerLock(
   botLogin: string,
   root = resolveStateRepoRoot(cwd),
 ): OwnerLock {
-  assertSupportedState(cwd, root);
+  assertSupportedState(cwd, root, true);
   const dir = join(root, ".pi", "board-agent");
   const path = join(dir, "owner.lock");
   mkdirSync(dir, { recursive: true });

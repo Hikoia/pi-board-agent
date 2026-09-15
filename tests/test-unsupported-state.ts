@@ -352,7 +352,7 @@ try {
     validateProjectMetadata: gh.validateProjectMetadata,
     createProductionTicketExecutor: () => {
       executors++;
-      return {};
+      return { migrateLegacy: async () => ({ converted: [], failures: [] }) };
     },
     inspectTicketExecutions: () => ({ active: [], orphans: 0, needsHuman: 0 }),
   };

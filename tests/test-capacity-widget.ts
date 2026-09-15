@@ -29,6 +29,7 @@ globals.__widgetCapacity = {
   ],
   tryClaim: async () => { card.assignees = ["bot"]; return true; }, release: async () => { card.assignees = []; },
   createProductionTicketExecutor: (): TicketExecutor => ({
+    migrateLegacy: async () => ({ converted: [], failures: [] }),
     observation: { active: ["running", "pending", "paused", "missing", "completed"].map((status, i) => ({ itemId: `ITEM_${i}`, runId: `run-${i}`, worktree: cwd, taskKey: `T00${i + 1}`, status })), occupiedSlots: 5 },
     reconcile: async () => ({ active: [], resumed: 0, adopted: 0, needsHuman: 0, orphans: 0, errors: 0 }),
     activeCount: () => 5, // running + pending + paused + unverifiable + launching

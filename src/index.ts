@@ -96,18 +96,19 @@ function configuredStatuses(cfg: ReturnType<typeof loadConfig>): string[] {
 }
 
 function hasRecoveryState(cwd: string, root: string): boolean {
-  assertSupportedState(cwd, root);
-  const stateDir = resolve(cwd, CONFIG_DIR_NAME, "board-agent");
+  assertSupportedState(cwd, root, true);
+  const stateDir = resolve(root, CONFIG_DIR_NAME, "board-agent");
   if (!existsSync(stateDir)) return false;
-  return (loopWorktrees?.cwd === resolve(cwd)
+  const store = loopWorktrees?.cwd === resolve(cwd)
     ? loopWorktrees.store
-    : new TicketWorktrees(cwd))
-    .list()
+    : new TicketWorktrees(cwd);
+  return store.hasCleanupReceipts() || store.list()
     .some(
       (record) =>
+        record.schemaVersion === 3 ||
         record.activeRunId !== undefined ||
         record.launchingAt !== undefined ||
-        record.finalization !== undefined,
+        record.finalization !== undefined || record.integration !== undefined || record.retry !== undefined,
     );
 }
 
@@ -181,7 +182,7 @@ async function startBoardLoop(
   if (loop?.isStopping())
     throw new Error("Loop cleanup is pending; retry stop before starting again.");
   const root = stateRoot(cwd);
-  assertSupportedState(cwd, root);
+  assertSupportedState(cwd, root, true);
   const preflight = await currentRevision(cwd);
   if (!preflight.ok && admitNewWork) {
     saveRuntime(
@@ -220,7 +221,7 @@ async function startBoardLoop(
     validateProjectMetadata(meta, cfg);
     if (generation !== stopGeneration)
       throw new Error("Startup cancelled by stop/shutdown.");
-    assertSupportedState(cwd, root);
+    assertSupportedState(cwd, root, true);
     // Promotion is an admission too: validate metadata before using a cached loop.
     if (loop?.isRunning()) {
       if (admitNewWork && !loop.isAdmittingNewWork()) {
@@ -319,6 +320,14 @@ async function startBoardLoop(
         : undefined,
       sessionId: ctx.sessionManager.getSessionId(),
     });
+    // No manager exists yet. Acquisition rejects a live previous owner (even
+    // this PID); its shutdown retains the lock until all old work is drained.
+    const migration = await executor.migrateLegacy(ownerLock,
+      () => generation === stopGeneration);
+    for (const failure of migration.failures)
+      callback(`Legacy migration preserved ${failure.source}: ${failure.reason}`, "warn");
+    if (generation !== stopGeneration)
+      throw new Error("Startup cancelled by stop/shutdown.");
     const deps: LoopDeps = {
       cwd,
       repoRoot: root,
@@ -411,7 +420,7 @@ export default function (pi: ExtensionAPI) {
     try {
       // Do this before even the heartbeat write, not only inside recovery discovery.
       const root = stateRoot(ctx.cwd);
-      assertSupportedState(ctx.cwd, root);
+      assertSupportedState(ctx.cwd, root, true);
       const cfg = loadContextConfig(ctx);
       validateConfig(cfg);
       const previous = readRuntimeStatus(ctx.cwd);

@@ -8,11 +8,13 @@ import {
 } from "@quintinshaw/pi-dynamic-workflows";
 import { setTimeout as delay } from "node:timers/promises";
 import {
-  ConflictRecovery,
+  LegacyTickets,
   conflictRequestKey,
   type ConflictBoardOps,
   type RepairBlocker,
-} from "./conflict-recovery.js";
+  type LegacyMigrationReport,
+} from "./legacy-tickets.js";
+import type { OwnerLock } from "./owner-lock.js";
 import type { Config } from "./config.js";
 import { planSlug } from "./config.js";
 import { normalizeWaveResults, type WaveOutcome } from "./dispatch.js";
@@ -89,6 +91,9 @@ export interface TicketExecutor {
     canStartWork?: () => boolean | Promise<boolean>,
     canStartWorkNow?: () => boolean,
   ): Promise<ReconcileSummary>;
+  migrateLegacy?(owner: OwnerLock, canMigrate?: () => boolean): Promise<LegacyMigrationReport>;
+  /** Migration failures are isolated from all model/board mutations. */
+  legacyBlocked?(itemId: string): string | undefined;
   repairFor?(card: Card): Promise<RepairRequest | RepairBlocker | undefined>;
   repairForReview?(
     record: TicketExecutionRecord,
@@ -398,9 +403,17 @@ export class ManagedTicketExecutor implements TicketExecutor {
     occupiedSlots: 0,
   };
 
-  private readonly conflicts: ConflictRecovery;
+  private readonly conflicts: LegacyTickets;
   constructor(private readonly deps: TicketExecutorDeps) {
-    this.conflicts = new ConflictRecovery(deps);
+    this.conflicts = new LegacyTickets(deps);
+  }
+
+  migrateLegacy(owner: OwnerLock, canMigrate?: () => boolean) {
+    return this.conflicts.migrate(owner, canMigrate);
+  }
+
+  legacyBlocked(itemId: string): string | undefined {
+    return this.conflicts.blockedReason(itemId);
   }
 
   repairFor(card: Card): Promise<RepairRequest | RepairBlocker | undefined> {
@@ -678,6 +691,12 @@ export class ManagedTicketExecutor implements TicketExecutor {
     card: Card,
     summary: ReconcileSummary,
   ): Promise<TicketExecutionRecord | undefined> {
+    if (record.schemaVersion === 4) {
+      const adopted = this.conflicts.observeLaunch(record);
+      if (adopted) summary.adopted++;
+      else this.deps.callback(`Retained uncertain legacy launch for ${record.itemId}; re-observing without a new builder.`, "warn");
+      return adopted;
+    }
     let manager: TicketWorkflowManager;
     try {
       manager = this.manager(record.path);
@@ -797,6 +816,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     try {
       manager = this.manager(record.path);
     } catch (error: any) {
+      if (record.schemaVersion === 4) throw error; // retain the original run for re-observation
       await this.moveToNeedsHuman(
         record,
         card,
@@ -816,6 +836,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
       !runArgsMatch(run, record) ||
       !this.conflicts.matches(record, run.args)
     ) {
+      if (record.schemaVersion === 4)
+        throw new Error("Original migrated workflow is missing/mismatched; retained for re-observation.");
       await this.moveToNeedsHuman(
         record,
         card,
@@ -929,6 +951,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         });
         return;
       }
+      if (record.schemaVersion === 4) return; // no replacement builder on an uncertain resume
       await this.moveToNeedsHuman(
         record,
         card,
@@ -1078,6 +1101,14 @@ export class ManagedTicketExecutor implements TicketExecutor {
     this.canResume = canStartWork;
     this.canResumeNow = canStartWorkNow;
     this.resumeRevision++;
+    for (const card of cards) {
+      if (this.legacyBlocked(card.itemId) && !this.conflicts.pendingDesign.has(card.itemId)) continue;
+      try { await this.conflicts.mapDesign(card); }
+      catch (error) {
+        summary.errors++;
+        this.deps.callback(`Legacy lane migration failed for ${card.itemId}: ${String(error)}`, "warn");
+      }
+    }
     const repairBlockers = await this.conflicts.reconcile(
       async () => !this.stopping && (await canStartWork()),
       () => !this.stopping && canStartWorkNow(),
@@ -1090,6 +1121,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
 
     for (const original of records) {
       if (this.stopping) break;
+      if (this.legacyBlocked(original.itemId)) continue;
       const snapshot = cardsById.get(original.itemId);
       try {
         // A failed read preserves recovery evidence; confirmed absence or a
@@ -1121,7 +1153,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         // A valid finalization journal owns the ticket until cleanup finishes.
         // Mixed execution/finalization files are unsupported, never migrated here.
         if (
-          original.finalization ||
+          original.finalization || original.integration ||
           this.deps.worktrees.hasCleanupReceipt(original.itemId)
         )
           continue;
@@ -1161,7 +1193,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
           record = await this.recoverLaunching(record, card, summary);
         if (record?.activeRunId)
           await this.reconcileActive(record, card, summary);
-        else if (record && statusIs(card, this.deps.cfg.columns.building)) {
+        else if (record && !record.retry && statusIs(card, this.deps.cfg.columns.building)) {
           await this.moveToNeedsHuman(
             record,
             card,
@@ -1195,6 +1227,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         ) ||
         !statusIs(snapshot, this.deps.cfg.columns.building) ||
         recordIds.has(snapshot.itemId) ||
+        this.legacyBlocked(snapshot.itemId) ||
         this.deps.worktrees.hasCleanupReceipt(snapshot.itemId)
       )
         continue;
@@ -1265,7 +1298,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
       return "claim was not retained";
     const record = this.deps.worktrees.read(card.itemId);
     if (
-      record?.finalization ||
+      record?.finalization || record?.integration ||
+      (record?.retry && record.retry.stage !== "build") ||
       this.deps.worktrees.hasCleanupReceipt(card.itemId)
     )
       return "ticket has a pending finalization; recover it before starting another builder";
@@ -1490,6 +1524,9 @@ export class ManagedTicketExecutor implements TicketExecutor {
       this.deps.callback(`Context generation failed: ${error.message}`, "warn");
     }
 
+    if (record.retry?.stage === "build")
+      context = [context, record.retry.reason].filter(Boolean).join("\n\n");
+
     let script: string;
     try {
       script = renderWorkflowSource({
@@ -1597,6 +1634,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
     canStartWork: () => boolean | Promise<boolean> = () => true,
     canStartWorkNow: () => boolean = () => true,
   ): Promise<FinalizeOutcome> {
+    const blocked = this.legacyBlocked(snapshot.itemId);
+    if (blocked) return { status: "blocked", reason: blocked };
     let card: Card | undefined;
     try {
       card = await this.deps.board.getCard(snapshot.itemId);
@@ -1730,6 +1769,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
         count++;
       } else if (record.activeRunId) {
         try {
+          const blocked = this.legacyBlocked(record.itemId);
+          if (blocked) throw new Error(blocked);
           status =
             this.manager(record.path)
               .list()

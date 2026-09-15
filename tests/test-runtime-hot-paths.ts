@@ -39,6 +39,7 @@ let loop!: BoardLoop, deps!: LoopDeps, loopStore!: TicketWorktrees, executorStor
 let occupied = 0, launches = 0, cards: Card[] = [];
 let observation = { active: [{ itemId: "OBS", taskKey: "T099", runId: "observed", status: "paused", worktree: cwd }], occupiedSlots: 1 };
 const executor: TicketExecutor = {
+  migrateLegacy: async () => ({ converted: [], failures: [] }),
   get observation() { return observation; },
   reconcile: async () => ({ active: observation.active, resumed: 0, adopted: 0, needsHuman: 0, orphans: 0, errors: 0 }),
   activeCount: () => occupied,
