@@ -78,7 +78,7 @@ try {
       const dir = join(cwd, ".pi", "board-agent", "ticket-worktrees");
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, "pvti_3.json"), JSON.stringify({
-        schemaVersion: 3, itemId: card.itemId, issueNumber: 3, taskKey: "T003", plan: "demo",
+        schemaVersion: 4, itemId: card.itemId, issueNumber: 3, taskKey: "T003", plan: "demo",
         taskBranch: "task/issue-3", baseBranch: "main", path: join(cwd, ".pi", "worktrees", "pvti_3"), createdAt: 1,
       }));
     }

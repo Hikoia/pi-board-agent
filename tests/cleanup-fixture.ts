@@ -141,7 +141,10 @@ export async function fixture(lockfiles = false) {
     baseBranch: "main",
   };
   const store = new TicketWorktrees(repo),
-    record = await store.ensure(task, "demo");
+    record = { ...await store.ensure(task, "demo"), schemaVersion: 3 as const };
+  // Historical cleanup/receipt tests intentionally exercise the legacy finalizer.
+  // New ensure/admission now produces v4; do not accidentally migrate this fixture.
+  writeFileSync(store.recordPath(task.itemId), JSON.stringify(record, null, 2));
   writeFileSync(join(record.path, "feature.txt"), "feature\n");
   git(record.path, "add", ".");
   git(record.path, "commit", "-m", "feature");

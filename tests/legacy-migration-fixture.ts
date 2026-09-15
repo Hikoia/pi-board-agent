@@ -55,8 +55,9 @@ export async function fixture() {
       assignees: ["bot"], repoOwner: "owner", repoName: "repo" };
     cards.push(card);
     const task = buildTasksForWave(cfg, "demo", [card])[0];
-    const record = await store.ensure(task, "demo");
+    const record = { ...await store.ensure(task, "demo"), schemaVersion: 3 as const };
     const file = store.recordPath(card.itemId);
+    writeFileSync(file, JSON.stringify(record, null, 2)); // Explicit historical source; ensure now creates v4.
     return { card, task, record, file };
   }
   function journal(record: TicketExecutionRecord, runId: string, status: PersistedRunState["status"] = "paused", repair?: RepairRequest) {

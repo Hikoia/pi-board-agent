@@ -1,6 +1,4 @@
 /** Core polling loop: reconcile durable ticket runs, then fill global worker slots. */
-import { createRunPersistence } from "@quintinshaw/pi-dynamic-workflows";
-import { repairReviewInput } from "./repair.js";
 import type { RepairBlocker } from "./conflict-recovery.js";
 import type { Config } from "./config.js";
 import { planSlug, taskBranch } from "./config.js";
@@ -37,7 +35,9 @@ import {
   runDesign,
   runRefine,
 } from "./refine.js";
-import { renderReviewComment, runReview } from "./review.js";
+import { parseReviewOutput, renderReviewComment, runReview } from "./review.js";
+import { parseDecision, renderDecisionComment } from "./dispatch.js";
+import { pendingTicketWrite, queueTicketWrite, settleTicketWrite } from "./ticket-retry.js";
 import type { TicketExecutor } from "./ticket-executor.js";
 import {
   TicketWorktrees,
@@ -720,7 +720,8 @@ export class BoardLoop {
       }
       if (this.foreground.signal.aborted) return;
       // Closed/Done is durable recovery, not a new admission (also on dirty/revision latch).
-      await this.processClosedDoneCards(cards, blockers);
+      const attemptedItemIds = new Set(summary.attemptedItemIds ?? []);
+      await this.processClosedDoneCards(cards, blockers, attemptedItemIds);
       if (!(await this.revisionAllowsNewWork()) || !this.admitNewWork) return;
       if (cards.length === 0) {
         callback("No cards on the board yet.");
@@ -736,23 +737,13 @@ export class BoardLoop {
         return;
       }
 
-      const reviewCandidates = cards.filter(
-        (card) =>
-          (card.status ?? "").toLowerCase() ===
-            cfg.columns.review.toLowerCase() &&
-          !!card.plan &&
-          card.closed === false &&
-          isTargetIssue(card, repoOwner, repoName, "Task"),
-      );
-      const readyCandidates = cards.filter(
-        (card) =>
-          isTargetIssue(card, repoOwner, repoName, "Task") &&
-          (card.status ?? "").toLowerCase() ===
-            cfg.columns.ready.toLowerCase() &&
-          !!card.plan &&
-          card.closed === false,
-      );
-      const attemptedItemIds = new Set<string>();
+      const reviewCandidates = cards.filter((card) =>
+        !attemptedItemIds.has(card.itemId) && card.closed === false && isTargetIssue(card, repoOwner, repoName, "Task") &&
+        (card.status?.toLowerCase() === cfg.columns.review.toLowerCase() ||
+          (card.status?.toLowerCase() === cfg.columns.ready.toLowerCase() && this.ticketWorktrees.read(card.itemId)?.retry?.stage === "review")));
+      const readyCandidates = cards.filter((card) =>
+        isTargetIssue(card, repoOwner, repoName, "Task") && card.status?.toLowerCase() === cfg.columns.ready.toLowerCase() &&
+        card.closed === false && (!this.ticketWorktrees.read(card.itemId)?.retry || this.ticketWorktrees.read(card.itemId)?.retry?.stage === "build"));
       const launchReady = async (
         limit: number,
         reserved = 0,
@@ -768,27 +759,10 @@ export class BoardLoop {
           if (!this.hasModelSlot(reserved)) break;
           if (attemptedItemIds.has(card.itemId)) continue;
           attemptedItemIds.add(card.itemId);
-          if (!card.plan) continue;
-          let repair;
-          try {
-            repair = await this.executor.repairFor?.(card);
-          } catch (error) {
-            repair = {
-              status: "blocked" as const,
-              reason: error instanceof Error ? error.message : String(error),
-            };
-          }
-          if (repair && "status" in repair) {
-            this.recordRepairBlocker(blockers, card.itemId, repair);
-            continue;
-          }
           const result = await this.executor.launch(
-            card,
-            planSlug(card.plan),
-            async () =>
-              (await this.revisionAllowsNewWork()) && this.admitNewWork,
+            card, card.plan ? planSlug(card.plan) : undefined,
+            async () => (await this.revisionAllowsNewWork()) && this.admitNewWork,
             () => this.admissionStillAllowed(),
-            repair,
           );
           if (result.status !== "launched") continue;
           blockers.delete(card.itemId);
@@ -837,7 +811,7 @@ export class BoardLoop {
           ((await this.processTaskDesignCards(cards)) ||
             (await this.processStories(cards)));
         if (!ranPrimary && cfg.review.enabled)
-          await this.processReviewCards(reviewCandidates);
+          await this.processReviewCards(reviewCandidates, attemptedItemIds);
       }
       await launchReady(
         Math.max(0, cfg.max_workers - this.executor.activeCount()),
@@ -1426,179 +1400,107 @@ export class BoardLoop {
     ).length;
   }
 
-  private async processReviewCards(reviewCards: Card[]): Promise<void> {
-    const { cfg, callback, repoOwner, repoName } = this.deps;
+  private async processReviewCards(reviewCards: Card[], attemptedItemIds: Set<string>): Promise<void> {
+    const { cfg, callback, repoOwner, repoName, botLogin } = this.deps;
     const board = this.boardOps();
+    const writeBoard = {
+      getCard: async (itemId: string) => board.refresh(reviewCards.find((c) => c.itemId === itemId)!),
+      setStatus: async (itemId: string, status: string) => board.setStatus(reviewCards.find((c) => c.itemId === itemId)!, status),
+      listComments: async (card: Card) => (await board.listComments(card)).filter((c) => c.author?.toLowerCase() === botLogin.toLowerCase()).map((c) => c.body),
+      comment: async (card: Card, body: string) => { if (!(await board.comment(card, body))) throw new Error("Failed to post review result."); },
+      release: (card: Card) => board.release(card),
+    };
     for (const card of reviewCards) {
-      if (
-        !card.plan ||
-        card.closed ||
-        !isTargetIssue(card, repoOwner, repoName, "Task")
-      )
-        continue;
+      if (card.closed || attemptedItemIds.has(card.itemId) || !isTargetIssue(card, repoOwner, repoName, "Task")) continue;
       let claimed = false;
       let record: TicketExecutionRecord | undefined;
-      let evidenceBlocker: RepairBlocker | undefined;
       try {
         await this.currentCard(card, false);
         claimed = true;
         if (!(await board.claim(card))) continue;
         const fresh = await this.currentCard(card);
-        const task = buildTasksForWave(cfg, planSlug(card.plan), [fresh])[0];
+        const task = buildTasksForWave(cfg, card.plan ? planSlug(card.plan) : "", [fresh])[0];
         record = this.ticketWorktrees.read(card.itemId);
-        if (
-          !record ||
-          record.issueNumber !== fresh.number ||
-          record.plan !== planSlug(card.plan) ||
-          record.taskBranch !== task.taskBranch ||
-          record.activeRunId ||
-          record.launchingAt !== undefined ||
-          record.finalization || record.integration ||
-          this.ticketWorktrees.hasCleanupReceipt(card.itemId)
-        )
-          throw new Error("Missing matching idle v3 record before review.");
-        const readRepair = async (current: Card) => {
-          if (this.executor.repairForReview) {
-            const repair = await this.executor.repairForReview(
-              record!,
-              current,
-            );
-            if (repair && "status" in repair) {
-              evidenceBlocker = repair;
-              throw new Error(repair.reason);
-            }
-            return repair;
-          }
-          const run = record!.lastRunId
-            ? createRunPersistence(record!.path).load(record!.lastRunId)
-            : null;
-          const repair = run ? repairReviewInput(run) : undefined;
-          if (
-            repair &&
-            ((run!.args as any).itemId !== record!.itemId ||
-              (run!.args as any).issueNumber !== record!.issueNumber ||
-              (run!.args as any).taskKey !== record!.taskKey)
-          )
-            throw new Error(
-              "Repair review run does not match the ticket record.",
-            );
-          return repair;
+        if (!record || record.schemaVersion !== 4 || record.issueNumber !== fresh.number ||
+            record.plan !== (card.plan ? planSlug(card.plan) : undefined) || record.taskBranch !== task.taskBranch ||
+            record.activeRunId || record.launchingAt !== undefined || record.finalization || record.integration ||
+            pendingTicketWrite(record) || this.ticketWorktrees.hasCleanupReceipt(card.itemId))
+          throw new StaleCardError("Missing matching idle v4 ticket before review.");
+        const assertRecord = () => {
+          if (JSON.stringify(this.ticketWorktrees.read(card.itemId)) !== JSON.stringify(record))
+            throw new StaleCardError("Execution record changed during review.");
         };
-        const repair = await readRepair(fresh);
+        attemptedItemIds.add(card.itemId);
         callback(`AI reviewing task "${fresh.title}" on ${task.taskBranch}…`);
-        const review = await this.runForeground(
-          { kind: "review", label: task.taskKey },
-          () =>
-            (this.deps.review ?? runReview)({
-              cwd: this.deps.cwd,
-              taskKey: task.taskKey,
-              title: fresh.title,
-              body: fresh.body,
-              issueNumber: task.issueNumber,
-              baseBranch: record!.baseBranch,
-              taskBranch: task.taskBranch,
-              model: cfg.models.review,
-              timeoutMs: cfg.review.timeout_ms,
-              ...(repair ? { repair } : {}),
-              signal: this.foreground.signal,
-              canStartWork: () => this.revisionAllowsNewWork(),
-              canStartWorkNow: () => this.admissionStillAllowed(),
-            }),
-        );
+        const review = await this.runForeground({ kind: "review", label: task.taskKey }, () =>
+          (this.deps.review ?? runReview)({
+            cwd: this.deps.cwd, taskKey: task.taskKey, title: fresh.title, body: fresh.body,
+            issueNumber: task.issueNumber, baseBranch: record!.baseBranch, taskBranch: task.taskBranch,
+            model: cfg.models.review, timeoutMs: cfg.review.timeout_ms,
+            taskSha: record!.retry?.stage === "review" ? record!.reviewedTaskSha : undefined,
+            onPinnedTaskSha: async (sha) => {
+              await this.currentCard(fresh); assertRecord();
+              if (!this.admissionStillAllowed()) throw new StaleCardError("Review admissions stopped.");
+              record = this.ticketWorktrees.setReviewedTaskSha(card.itemId, sha);
+            },
+            signal: this.foreground.signal,
+            canStartWork: async () => { await this.currentCard(fresh); assertRecord(); return true; },
+            canStartWorkNow: () => this.admissionStillAllowed(),
+          }));
         if (!review) return;
         const latest = await this.currentCard(fresh);
-        const current = this.ticketWorktrees.read(latest.itemId);
-        if (
-          !current ||
-          current.issueNumber !== record.issueNumber ||
-          current.plan !== record.plan ||
-          current.path !== record.path ||
-          current.baseBranch !== record.baseBranch ||
-          current.taskBranch !== record.taskBranch ||
-          current.createdAt !== record.createdAt ||
-          current.lastRunId !== record.lastRunId ||
-          current.reviewedTaskSha !== record.reviewedTaskSha ||
-          current.activeRunId ||
-          current.launchingAt !== undefined ||
-          current.finalization || current.integration ||
-          this.ticketWorktrees.hasCleanupReceipt(latest.itemId)
-        )
-          throw new Error("Execution record changed during review.");
-        if (JSON.stringify(await readRepair(latest)) !== JSON.stringify(repair))
-          throw new Error("Repair evidence changed during review.");
-        if (!this.admissionStillAllowed())
-          throw new StaleCardError("Review admissions stopped.");
-        if (review.verdict === "pass") {
-          // Preserve the FIRST fresh origin task SHA returned by the isolated reviewer.
-          // Never fetch/re-pin here: a newer commit was not reviewed.
-          this.ticketWorktrees.setReviewedTaskSha(
-            latest.itemId,
-            review.taskSha,
-          );
-          await this.currentCard(latest);
-          await board.setStatus(latest, cfg.columns.done);
-          callback(
-            `AI review passed for "${latest.title}" at ${review.taskSha} → ${cfg.columns.done}. Validate ${current.path}, then close issue #${latest.number} to merge.`,
-          );
-          return;
-        }
-        const retryStatus = repair
-          ? cfg.columns.needs_human
-          : cfg.columns.ready;
-        const id = await board.comment(
-          latest,
-          renderReviewComment(review, !!repair),
-        );
-        if (!id) throw new Error("Failed to post AI review findings.");
-        await this.currentCard(latest);
-        await board.setStatus(latest, retryStatus);
-        callback(
-          `AI review found ${review.findings.length} blocking issue(s) in "${latest.title}". → ${retryStatus}`,
-          "warn",
-        );
+        assertRecord();
+        const parsed = parseReviewOutput(review);
+        if (!parsed) throw new Error("Review returned malformed output.");
+        record = this.ticketWorktrees.setReviewedTaskSha(latest.itemId, review.taskSha);
+        const decision = parsed.verdict === "needs_decision" ? parseDecision(parsed as unknown as Record<string, unknown>) : undefined;
+        const pass = parsed.verdict === "pass";
+        record = queueTicketWrite(this.ticketWorktrees, record, pass ? "review" : "build", {
+          card: latest, retry: !pass,
+          reason: decision ? decision.question : pass ? parsed.summary || "Review passed" : renderReviewComment(parsed),
+          status: pass ? cfg.columns.done : decision ? cfg.columns.needs_human : cfg.columns.ready,
+          ...(pass ? {} : { comment: decision ? renderDecisionComment(decision) : renderReviewComment(parsed) }),
+        });
+        await settleTicketWrite(this.ticketWorktrees, record, writeBoard, botLogin);
+        claimed = false;
+        callback(pass
+          ? `AI review passed for "${latest.title}" at ${review.taskSha} → ${cfg.columns.done}. Validate ${record.path}, then close issue #${latest.number} to merge.`
+          : `AI review ${parsed.verdict} for "${latest.title}" at ${review.taskSha}.`);
       } catch (error) {
-        let disposition = "Leaving status unchanged.";
-        if (evidenceBlocker && record && this.executor.repairForReview) {
+        const reason = error instanceof Error ? error.message : String(error);
+        // A model/setup failure retries review, not a successful build. Once
+        // output is recorded, only its I/O is retried, never the model.
+        if (record && !(error instanceof StaleCardError) && !pendingTicketWrite(record)) {
           try {
-            const confirm = async () => {
-              const fresh = await this.currentCard(card);
-              const blocker = await this.executor.repairForReview!(
-                record!,
-                fresh,
-              );
-              if (
-                !blocker ||
-                !("status" in blocker) ||
-                !this.admissionStillAllowed()
-              )
-                throw new Error("Repair Review quarantine authority changed.");
-              return fresh;
-            };
-            const fresh = await confirm();
-            const id = await board.comment(
-              fresh,
-              `## ⚠️ Needs human input\n\n${evidenceBlocker.reason}\n\nPreserve the repair run and worktree. Restore/inspect its evidence before retrying. Only an explicit maintainer move to Ready starts an ordinary retry.`,
-            );
-            if (!id)
-              throw new Error("Failed to post repair Review evidence blocker.");
-            await confirm();
-            await board.setStatus(fresh, cfg.columns.needs_human);
-            disposition = `→ ${cfg.columns.needs_human}.`;
-          } catch {
-            /* Unknown/changed authority never permits fallback writeback. */
-          }
+            const current = await this.currentCard(card);
+            if (JSON.stringify(this.ticketWorktrees.read(card.itemId)) !== JSON.stringify(record)) throw new StaleCardError("Review record changed.");
+            record = queueTicketWrite(this.ticketWorktrees, record, "review", {
+              card: current, status: cfg.columns.ready, retry: true, reason,
+              comment: `## Review infrastructure failure\n\n${reason}\n\nRetry review of the original commit; no new builder is needed.`,
+            });
+            await settleTicketWrite(this.ticketWorktrees, record, writeBoard, botLogin);
+            claimed = false;
+          } catch (writeError) { callback(`Review writeback deferred: ${String(writeError)}`, "warn"); }
         }
-        callback(
-          `AI review failed for "${card.title}": ${error instanceof Error ? error.message : String(error)}. ${disposition}`,
-          "warn",
-        );
+        callback(`AI review failed for "${card.title}": ${reason}. State retained.`, "warn");
       } finally {
-        if (claimed)
-          await board
-            .release(card)
-            .catch((error) =>
-              callback(`Review claim release failed: ${String(error)}`, "warn"),
-            );
+        // Pending writeback owns release until its drain and preceding I/O finish.
+        if (claimed && !(record && pendingTicketWrite(record))) {
+          try {
+            if (record) {
+              record = queueTicketWrite(this.ticketWorktrees, record, "review", {
+                card, status: card.status!, retry: !!record.retry,
+                reason: record.retry?.reason ?? "Review admission deferred; release the stopped invocation's claim.",
+              });
+              await settleTicketWrite(this.ticketWorktrees, record, writeBoard, botLogin);
+            } else {
+              const fresh = await board.refresh(card);
+              if (fresh && isTargetIssue(fresh, repoOwner, repoName, "Task") && fresh.itemId === card.itemId &&
+                  fresh.number === card.number && fresh.assignees.some((a) => a.toLowerCase() === botLogin.toLowerCase()))
+                await board.release(fresh);
+            }
+          } catch (error) { callback(`Review claim release deferred: ${String(error)}`, "warn"); }
+        }
       }
       return;
     }
@@ -1626,12 +1528,16 @@ export class BoardLoop {
   private async processClosedDoneCards(
     cards: Card[],
     blockers: Map<string, BlockerNotice>,
+    attemptedItemIds: Set<string>,
   ): Promise<void> {
     const { cfg, callback, repoOwner, repoName } = this.deps;
     const candidates = cards.filter(
       (card) =>
         card.closed === true &&
-        (card.status ?? "").toLowerCase() === cfg.columns.done.toLowerCase() &&
+        (card.status?.toLowerCase() === cfg.columns.done.toLowerCase() ||
+          (card.status?.toLowerCase() === cfg.columns.ready.toLowerCase() &&
+            ["integrate", "cleanup"].includes(this.ticketWorktrees.read(card.itemId)?.retry?.stage ?? ""))) &&
+        !attemptedItemIds.has(card.itemId) &&
         isTargetIssue(card, repoOwner, repoName, "Task"),
     );
     if (!candidates.length || this.foreground.signal.aborted) return;
@@ -1653,10 +1559,12 @@ export class BoardLoop {
           `refs/heads/${taskBranch(cfg.branches.task_prefix, card.number!)}`,
         ) &&
         !this.ticketWorktrees.hasCleanupReceipt(card.itemId) &&
-        !this.ticketWorktrees.read(card.itemId)?.integration
+        !this.ticketWorktrees.read(card.itemId)?.integration &&
+        !this.ticketWorktrees.read(card.itemId)?.retry
       ) {
         continue;
       }
+      attemptedItemIds.add(card.itemId);
       const outcome = await this.executor.finalizeClosed(
         card,
         async () => (await this.revisionAllowsNewWork()) && this.admitNewWork,

@@ -78,7 +78,7 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
     writeFileSync(
       join(dir, "item_103.json"),
       JSON.stringify({
-        schemaVersion: 3,
+        schemaVersion: 4,
         itemId: "ITEM_103",
         issueNumber: 103,
         taskKey: "T103",

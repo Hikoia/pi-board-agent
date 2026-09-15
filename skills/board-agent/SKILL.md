@@ -15,9 +15,12 @@ a human later closes the Issue to approve integration into the configured base.
 - The current branch is the supplied task branch.
 - `origin` is the target GitHub repository.
 - The base branch and main checkout are not yours to change.
-- A resumed ticket may contain a partial dirty diff owned by this same record.
-  Preserve and continue it; never reset, stash, overwrite, or discard it merely
-  to obtain a clean status.
+- A resumed ticket may contain a partial dirty diff or `MERGE_HEAD` owned by
+  this same record. Inspect both and continue the interrupted work on the
+  original branch; never reset, stash, overwrite, or discard it to get clean.
+- On a merge-conflict retry, merge the specified base into this task, preserve
+  useful edits from both branches, resolve conflicts, test, commit and push.
+  It must pass review and receive renewed manual close approval.
 - The worktree remains after the run for AI review and human validation.
 
 ## Minimal implementation
@@ -79,7 +82,7 @@ accessibility, and the smallest relevant regression check.
    git push -u origin task/issue-<issue-number>
    ```
 
-   Do not merge, close the Issue, delete refs/worktrees, or force-push. Report
+   Do not merge into the base, close the Issue, delete refs/worktrees, or force-push. Report
    success only after the exact task branch is pushed and clean.
 
 6. **Return one outcome object**
@@ -97,22 +100,37 @@ accessibility, and the smallest relevant regression check.
    }
    ```
 
-   Failure:
+   Technical failure (including tests, tools, timeout, missing telemetry):
 
    ```json
    {
      "taskKey": "T001",
      "itemId": "PVTI_xxx",
      "status": "failure",
-     "error": "The deployment target is not specified.",
-     "attempted": "Checked the ticket, repository docs, and deployment configuration.",
-     "limitations": "Choosing a target would change infrastructure without authorization.",
-     "workaround": "Specify staging or production; staging is the lower-risk option.",
-     "humanAction": "Reply with the approved deployment target, then move the card to Ready."
+     "error": "The integration test failed: expected 200, received 500.",
+     "attempted": "Ran the existing endpoint regression test. Partial changes are preserved."
    }
    ```
 
-Include every failure field. If no safe workaround exists, say so plainly.
+   Only a real missing product, requirement, cost or authorization choice may
+   return `needs_decision`. Include a concrete question, missing context, at
+   least two viable options and a recommendation:
+
+   ```json
+   {
+     "taskKey": "T001",
+     "itemId": "PVTI_xxx",
+     "status": "needs_decision",
+     "question": "Should this deploy to staging or production?",
+     "context": "The ticket requests deployment without identifying the authorized environment.",
+     "options": ["Deploy to staging for validation", "Deploy to production after approval"],
+     "recommendation": "Use staging first to validate without affecting production."
+   }
+   ```
+
+A decision pauses this ticket only. A trusted maintainer must reply AND manually
+move the card to Ready. A reply alone never triggers a run. Technical failures,
+merge conflicts and retry exhaustion remain technical retries, not decisions.
 
 ## Guardrails
 
@@ -120,7 +138,7 @@ Include every failure field. If no safe workaround exists, say so plainly.
 - Leave the base branch, main checkout, Issue state, and Project fields alone.
 - Keep the Issue open and the worktree available.
 - Never delete branches/worktrees or force-push.
-- Treat vague acceptance criteria and merge conflicts as failures requiring
-  human input.
+- Report incomplete decision output as a technical failure; never invent a
+  product decision to explain a tool or test failure.
 - Modify `.pi/`, `.specify/`, or `.claude/` only when the ticket explicitly
   requires it.

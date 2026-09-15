@@ -826,6 +826,11 @@ export class TicketWorktrees {
         clean: false,
         reason: `dirty worktree: ${record.path}`,
       };
+    if (requireClean) {
+      const merge = git(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], record.path);
+      if (merge.ok || merge.status !== 1)
+        return { ok: false, clean: false, reason: "unfinished or unreadable MERGE_HEAD" };
+    }
     return { ok: true, clean };
   }
 
@@ -984,7 +989,7 @@ export class TicketWorktrees {
   /** Create or resume the one persistent worktree owned by an Issue. */
   async ensure(
     task: BuilderTask,
-    plan: string,
+    plan?: string,
   ): Promise<TicketExecutionRecord> {
     if (this.hasCleanupReceipt(task.itemId))
       throw new Error(
@@ -1026,14 +1031,14 @@ export class TicketWorktrees {
     await this.fetchRequired(task.baseBranch);
     if (this.registeredPathForBranch(task.taskBranch))
       throw new Error(
-        `${task.taskBranch} is already checked out without a v3 ticket record.`,
+        `${task.taskBranch} is already checked out without a ticket record.`,
       );
     if (
       branchSha(task.taskBranch, this.repoRoot) ||
       (await this.remoteSha(task.taskBranch))
     )
       throw new Error(
-        `${task.taskBranch} already exists without a v3 ticket record.`,
+        `${task.taskBranch} already exists without a ticket record.`,
       );
 
     const path = this.pathFor(task.itemId, task.issueNumber);
@@ -1055,7 +1060,7 @@ export class TicketWorktrees {
     );
 
     const record: TicketExecutionRecord = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       itemId: task.itemId,
       issueNumber: task.issueNumber,
       taskKey: task.taskKey,

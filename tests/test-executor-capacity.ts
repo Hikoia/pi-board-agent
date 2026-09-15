@@ -142,7 +142,7 @@ try {
     assert.equal(starts, index < 2 ? 3 : 4, "new work waits until occupancy falls BELOW the cap");
   }
   assert.equal(executor.activeCount(), 1);
-  assert.equal(stops, 0);
+  assert.equal(stops, 3, "terminal outcomes drain before releasing their execution slots");
   console.log("PASS: excess recovered builders resume within retained slots without eviction; new admissions wait until enough slots drain");
 } finally {
   contextRelease.resolve();

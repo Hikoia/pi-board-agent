@@ -1,5 +1,6 @@
 import {
   WorkflowErrorCode,
+  workflowProjectPaths,
   type PersistedRunState,
 } from "@quintinshaw/pi-dynamic-workflows";
 import assert from "node:assert/strict";
@@ -17,6 +18,7 @@ import { join } from "node:path";
 import { _DEFAULTS, type Config } from "../src/config.js";
 import type { Card } from "../src/gh.js";
 import { BoardLoop, createLoopState, type LoopDeps } from "../src/loop.js";
+import { pendingTicketWrite } from "../src/ticket-retry.js";
 import { acquireOwnerLock } from "../src/owner-lock.js";
 import {
   ManagedTicketExecutor,
@@ -436,19 +438,32 @@ const complete = (itemId: string, result: unknown) => {
     board.failReleaseOnce.add(card.itemId);
     const before = recordFor(card.itemId);
     const result = await executor.reconcile(board.all());
+    if (mode === "missing-run" || mode === "launch-window") {
+      assert.equal(result.errors, mode === "missing-run" ? 1 : 0);
+      assert.equal(board.cards.get(card.itemId)!.status, cfg.columns.building);
+      assert.deepEqual(recordFor(card.itemId), before, "missing/ambiguous run is retained, not guessed or quarantined");
+      assert.equal(state.starts, starts);
+      assert.equal(board.comments.get(card.itemId)?.length ?? 0, 0);
+      // Explicit fixture teardown; production retains this uncertain association.
+      for (const run of state.runs.values()) await new FakeManager(state, false).stopAndWait(run.runId);
+      await executor.shutdown(); worktrees.clearExecution(card.itemId); state.runs.clear();
+      board.cards.delete(card.itemId); board.comments.delete(card.itemId); board.failReleaseOnce.delete(card.itemId);
+      continue;
+    }
     assert.equal(result.errors, 1, mode);
     assert.equal(
       board.cards.get(card.itemId)!.status,
       mode === "success" || mode === "foreign-run"
         ? cfg.columns.review
-        : cfg.columns.needs_human,
+        : cfg.columns.ready,
       mode,
     );
     assert.deepEqual(
-      recordFor(card.itemId),
-      before,
+      { ...recordFor(card.itemId), retry: undefined },
+      { ...before, retry: undefined },
       `failed release retains association: ${mode}`,
     );
+    assert.ok(pendingTicketWrite(recordFor(card.itemId)));
     assert.deepEqual(board.cards.get(card.itemId)!.assignees, ["bot"], mode);
     const comments = [...(board.comments.get(card.itemId) ?? [])];
     assert.equal(comments.length, 1, mode);
@@ -456,8 +471,6 @@ const complete = (itemId: string, result: unknown) => {
     // Subsequent contract drift / manual Done must not reopen settlement or
     // demand another comment read before the already-required release.
     board.cards.get(card.itemId)!.plan = "maintainer-edited";
-    if (mode === "launch-window")
-      board.cards.get(card.itemId)!.status = cfg.columns.done;
     const expectedStatus = board.cards.get(card.itemId)!.status;
     if (mode === "foreign-run") {
       const run = runFor(card.itemId);
@@ -474,6 +487,12 @@ const complete = (itemId: string, result: unknown) => {
       return listComments.call(board, candidate);
     };
     try {
+      if (mode === "foreign-run") {
+        assert.equal((await executor.reconcile(board.all())).errors, 1);
+        assert.ok(pendingTicketWrite(recordFor(card.itemId)));
+        assert.equal(state.stops, stops, "unknown/foreign run is not drained or released as ours");
+        state.runs.get(record.activeRunId!)!.args = { itemId: card.itemId, issueNumber: card.number, taskKey: record.taskKey };
+      }
       const retry = await executor.reconcile(board.all());
       assert.equal(retry.errors, 0, `retry is cleanup only: ${mode}`);
       assert.equal(board.cards.get(card.itemId)!.status, expectedStatus, mode);
@@ -492,21 +511,7 @@ const complete = (itemId: string, result: unknown) => {
         0,
         `no builder resume during cleanup: ${mode}`,
       );
-      if (mode === "foreign-run") {
-        assert.equal(
-          state.stops,
-          stops,
-          "cleanup must not stop a run with foreign arguments",
-        );
-        assert.equal(state.runs.get(record.activeRunId!)!.status, "paused");
-      } else {
-        assert.ok(
-          [...state.runs.values()].every(
-            (run) => run.status !== "running" && run.status !== "paused",
-          ),
-          mode,
-        );
-      }
+      assert.ok([...state.runs.values()].every((run) => run.status !== "running" && run.status !== "paused"), mode);
     } catch (error) {
       console.error(`FAIL: partial settlement ${mode}`, error);
       failures.push(error);
@@ -538,7 +543,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   let executor = makeExecutor();
   const orphanSummary = await executor.reconcile(board.all());
   if (
-    board.cards.get(orphan78.itemId)?.status === cfg.columns.needs_human &&
+    board.cards.get(orphan78.itemId)?.status === cfg.columns.building &&
     orphanSummary.orphans === 2
   ) {
     console.log(
@@ -548,7 +553,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   await board.setStatus(corrupt76.itemId, cfg.columns.ready);
   const corruptRelaunch = await executor.launch(corrupt76, "demo");
   if (
-    corruptRelaunch.status === "needs-human" &&
+    corruptRelaunch.status === "skipped" &&
     readFileSync(
       join(repo, ".pi", "board-agent", "ticket-worktrees", "pvti_76.json"),
       "utf8",
@@ -581,7 +586,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     builderScript.includes("git status --short") &&
     builderScript.includes("git diff") &&
     builderScript.includes("the persistent worktree for this ticket") &&
-    builderScript.includes("Only pull") &&
+    builderScript.includes("Only when there is no MERGE_HEAD") &&
     builderScript.includes("Never reset, stash, overwrite, or discard") &&
     builderScript.includes("clean, committed, and pushed")
   )
@@ -604,7 +609,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   const branchCollision = board.add("PVTI_790", 79);
   board.cards.get(branchCollision.itemId)!.title = "T079 duplicate branch";
   if (
-    (await executor.launch(branchCollision, "demo")).status === "needs-human"
+    (await executor.launch(branchCollision, "demo")).status === "skipped"
   ) {
     console.log("PASS: two tickets cannot share one task branch/worktree");
   } else fail("FAIL: duplicate task branch ownership");
@@ -790,10 +795,10 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   ).join("\n");
   if (
     board.cards.get(completedDirty.itemId)?.status ===
-      cfg.columns.needs_human &&
+      cfg.columns.ready &&
     !recordFor(completedDirty.itemId).activeRunId &&
     completedDirtyComment.includes(
-      `board-agent-run:${completedDirtyRecord.activeRunId}:malformed`,
+      "board-agent-write:",
     ) &&
     completedDirtyComment.includes("dirty worktree") &&
     existsSync(join(completedDirtyPath, "completed-dirty.txt"))
@@ -832,14 +837,13 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   await executor.reconcile(board.all());
   const timedOutRecord = recordFor(timedOut.itemId);
   if (
-    timedOutSummary.needsHuman === 1 &&
-    board.cards.get(timedOut.itemId)?.status === cfg.columns.needs_human &&
+    timedOutSummary.needsHuman === 0 &&
+    board.cards.get(timedOut.itemId)?.status === cfg.columns.ready &&
     !timedOutRecord.activeRunId &&
     timedOutRecord.lastRunId === timedOutRunId &&
-    timedOutComment.includes(`board-agent-run:${timedOutRunId}:malformed`) &&
+    timedOutComment.includes("board-agent-write:") &&
     timedOutComment.includes("Builder agent timed out after 7200000 ms.") &&
-    timedOutComment.includes("preserve useful changes") &&
-    timedOutComment.includes("address the reported blocker before retrying") &&
+    timedOutComment.includes("preserving partial changes") &&
     !timedOutComment.includes("RAW provider timeout details") &&
     !timedOutComment.includes("dirty worktree") &&
     !timedOutComment.includes("leave the expected task branch clean") &&
@@ -907,16 +911,16 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
         ? "Builder agent timed out."
         : "persisted builder result is malformed";
       return (
-        board.cards.get(itemId)?.status === cfg.columns.needs_human &&
-        comment.includes(`board-agent-run:${runId}:malformed`) &&
-        comment.includes(`**Problem**\n${expectedProblem}\n`) &&
+        board.cards.get(itemId)?.status === cfg.columns.ready &&
+        comment.includes("board-agent-write:") &&
+        comment.includes(expectedProblem) &&
         !comment.includes("RAW") &&
         !comment.includes("timed out after")
       );
     },
   );
   if (
-    malformedAgentSummary.needsHuman === malformedAgentCases.length &&
+    malformedAgentSummary.needsHuman === 0 &&
     malformedAgentSummary.errors === 0 &&
     malformedAgentGuardsPassed
   ) {
@@ -989,13 +993,12 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   };
   await executor.reconcile(board.all());
   if (
-    malformedIdentity.every(
-      (card) =>
-        board.cards.get(card.itemId)?.status === cfg.columns.needs_human,
-    )
+    malformedIdentity.slice(0, 2).every((card) => board.cards.get(card.itemId)?.status === cfg.columns.ready) &&
+    board.cards.get(malformedIdentity[2].itemId)?.status === cfg.columns.building &&
+    recordFor(malformedIdentity[2].itemId).activeRunId === wrongArgsRun.runId
   ) {
     console.log(
-      "PASS: multiple results, wrong branch, and mismatched run args remain quarantined",
+      "PASS: malformed results retry technically; mismatched run arguments retain their original association",
     );
   } else fail("FAIL: malformed persisted result guards");
 
@@ -1011,13 +1014,12 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   stateFor(missingRecord.path).runs.delete(missingRecord.activeRunId!);
   await executor.reconcile(board.all());
   if (
-    terminalCards.every(
-      (card) =>
-        board.cards.get(card.itemId)?.status === cfg.columns.needs_human,
-    )
+    terminalCards.slice(0, 3).every((card) => board.cards.get(card.itemId)?.status === cfg.columns.ready) &&
+    board.cards.get(terminalCards[3].itemId)?.status === cfg.columns.building &&
+    recordFor(terminalCards[3].itemId).activeRunId === missingRecord.activeRunId
   ) {
     console.log(
-      "PASS: failed, aborted, malformed, and missing runs all require human",
+      "PASS: technical terminal errors retry; missing run stays occupied for re-observation, never Needs Human",
     );
   } else fail("FAIL: terminal failure policy");
 
@@ -1027,12 +1029,11 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     {
       taskKey: "T894",
       itemId: explained.itemId,
-      status: "failure",
-      error: "Deployment target is missing.",
-      attempted: "Checked repository configuration.",
-      limitations: "Choosing a target would be unsafe.",
-      workaround: "Select staging or production.",
-      humanAction: "Reply with the approved target.",
+      status: "needs_decision",
+      question: "Deployment target is missing.",
+      context: "Checked repository configuration. Choosing a target would be unsafe.",
+      options: ["Select staging", "Select production"],
+      recommendation: "Use staging first; reply with the approved target.",
     },
   ]);
   const explainedPath = recordFor(explained.itemId).path;
@@ -1048,9 +1049,9 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     blockerComment.includes("Deployment target is missing.") &&
     blockerComment.includes("Checked repository configuration.") &&
     blockerComment.includes("Choosing a target would be unsafe.") &&
-    blockerComment.includes("Select staging or production.") &&
-    blockerComment.includes("Reply with the approved target.") &&
-    blockerComment.includes("manually move this Project card to `Ready`") &&
+    blockerComment.includes("Select staging") && blockerComment.includes("Select production") &&
+    blockerComment.includes("reply with the approved target.") &&
+    blockerComment.includes("manually move this card to `Ready`") &&
     !blockerComment.includes("dirty worktree") &&
     readFileSync(join(explainedPath, "README.md"), "utf8") ===
       "base\nstructured partial\n" &&
@@ -1058,7 +1059,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
       "keep me\n"
   )
     console.log(
-      "PASS: dirty builder failure preserves work and actionable details",
+      "PASS: a complete builder decision preserves dirty work and actionable options/context",
     );
   else fail("FAIL: dirty builder failure human guidance");
 
@@ -1088,7 +1089,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   ).join("\n");
   if (
     board.cards.get(wrongBranchFailure.itemId)?.status ===
-      cfg.columns.needs_human &&
+      cfg.columns.ready &&
     !recordFor(wrongBranchFailure.itemId).activeRunId &&
     [
       "Build prerequisites are missing.",
@@ -1130,6 +1131,10 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     taskKey: "T090",
   });
   stateFor(adoptingRecord.path).runs.set(adoptedRun.runId, adoptedRun);
+  const journalDir = workflowProjectPaths(adoptingRecord.path).runsDir;
+  mkdirSync(journalDir, { recursive: true });
+  writeFileSync(join(journalDir, `${adoptedRun.runId}.json`), JSON.stringify(adoptedRun));
+  await board.claim(adopting);
   executor = makeExecutor(true);
   const adoptedSummary = await executor.reconcile(board.all());
   if (
@@ -1152,25 +1157,28 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   const unstartedSummary = await executor.reconcile(board.all());
   const unstartedAfter = recordFor(unstarted.itemId);
   if (
-    board.cards.get(unstarted.itemId)?.status === cfg.columns.ready &&
-    !unstartedAfter.launchingAt &&
+    board.cards.get(unstarted.itemId)?.status === cfg.columns.building &&
+    unstartedAfter.launchingAt !== undefined &&
     unstartedSummary.needsHuman === 0
   ) {
-    console.log("PASS: proven zero-side-effect launch crash returns to Ready");
+    console.log("PASS: zero matching persisted runs retains an uncertain launch window, never another builder");
   } else fail("FAIL: zero-side-effect launch recovery");
 
   const incident = board.add("PVTI_911", 911, cfg.columns.building);
   const incidentTask = buildTasksForWave(cfg, "demo", [incident])[0];
   const incidentRecord = await worktrees.ensure(incidentTask, "demo");
   worktrees.clearExecution(incidentRecord.itemId, "run-incident-a");
+  await board.claim(incident);
   await executor.reconcile(board.all());
   const firstIncidentComments =
     board.comments.get(incident.itemId)?.length ?? 0;
+  await board.claim(incident);
   await board.setStatus(incident.itemId, cfg.columns.building);
   await executor.reconcile(board.all());
   const repeatedIncidentComments =
     board.comments.get(incident.itemId)?.length ?? 0;
   worktrees.clearExecution(incident.itemId, "run-incident-b");
+  await board.claim(incident);
   await board.setStatus(incident.itemId, cfg.columns.building);
   await executor.reconcile(board.all());
   const incidentComments = board.comments.get(incident.itemId) ?? [];
@@ -1179,12 +1187,8 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     firstIncidentComments === 1 &&
     repeatedIncidentComments === 1 &&
     nextIncidentComments === 2 &&
-    incidentComments.some((comment) =>
-      comment.includes(":run-incident-a:needs-human -->"),
-    ) &&
-    incidentComments.some((comment) =>
-      comment.includes(":run-incident-b:needs-human -->"),
-    )
+    incidentComments.every((comment) => comment.includes("board-agent-write:")) &&
+    new Set(incidentComments).size === 2
   ) {
     console.log("PASS: recovery comments deduplicate per run lineage");
   } else fail("FAIL: recovery comment run lineage");
@@ -1205,7 +1209,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   const retainedAfterMutationFailure = !!recordFor(flaky.itemId).activeRunId;
   await executor.reconcile(board.all());
   const flakyMarkers = (board.comments.get(flaky.itemId) ?? []).filter(
-    (comment) => comment.includes("board-agent-run:"),
+    (comment) => comment.includes("board-agent-write:"),
   );
   if (
     retainedAfterMutationFailure &&
@@ -1225,7 +1229,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   if (
     removedRun.status === "aborted" &&
     !recordFor(removed.itemId).activeRunId &&
-    removedSummary.orphans === 1
+    removedSummary.orphans === 2 // Removed run plus the preserved, still-In-Progress orphan78.
   ) {
     console.log(
       "PASS: a removed Project item stops only its run and frees the global slot",
@@ -1395,10 +1399,11 @@ async function finalFixture(
   finalBoard.cards.get(card.itemId)!.closed = true;
   card.closed = true;
   const store = new TicketWorktrees(checkout);
-  const record = await store.ensure(
+  const record = { ...await store.ensure(
     buildTasksForWave(finalCfg, "demo", [card])[0],
     "demo",
-  );
+  ), schemaVersion: 3 as const };
+  writeFileSync(store.recordPath(card.itemId), JSON.stringify(record)); // Historical finalizer fixture (T004 supplies v4).
   writeFileSync(join(record.path, "accepted.txt"), "approved exact content\n");
   git(record.path, "add", "accepted.txt");
   git(record.path, "commit", "-m", "accepted change");
@@ -1849,8 +1854,8 @@ for (const strategy of ["squash", "merge"] as const) {
     actual,
     f.store,
   );
-  await assert.rejects(loop.tickNow(), /Unsupported pre-0.2.0/);
-  assert.equal(boardReads, 0);
+  await loop.tickNow(); // T002 isolates v3 conversion failures per ticket instead of stopping all board reads.
+  assert.equal(boardReads, 1);
   assert.equal(f.store.read(f.card.itemId), undefined);
   assert.equal(readFileSync(file, "utf8"), before);
   assert.equal(f.finalBoard.cards.get(f.card.itemId)!.status, cfg.columns.done);

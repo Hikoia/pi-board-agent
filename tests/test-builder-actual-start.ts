@@ -7,6 +7,7 @@ import type { PersistedRunState } from "@quintinshaw/pi-dynamic-workflows";
 import { _DEFAULTS } from "../src/config.js";
 import type { Card } from "../src/gh.js";
 import { BoardLoop, createLoopState } from "../src/loop.js";
+import { pendingTicketWrite } from "../src/ticket-retry.js";
 import {
   ManagedTicketExecutor,
   type TicketBoardAdapter,
@@ -334,10 +335,11 @@ async function check(change: string, patch?: Partial<Card>) {
         /fresh read unavailable/,
       );
       assert.deepEqual(
-        worktrees.read(original.itemId),
-        record,
-        "failed fresh read retains exact launch evidence",
+        { ...worktrees.read(original.itemId), retry: undefined },
+        { ...record, retry: undefined },
+        "failed fresh read retains launch identity and records unstarted I/O settlement",
       );
+      assert.ok(pendingTicketWrite(worktrees.read(original.itemId)!));
       assert.equal(
         executor.activeCount(),
         1,
@@ -363,10 +365,11 @@ async function check(change: string, patch?: Partial<Card>) {
     } else if (change === "release-error") {
       assert.match(error?.message ?? "", /claim release unavailable/);
       assert.deepEqual(
-        worktrees.read(original.itemId),
-        record,
-        "release failure retains exact launch evidence",
+        { ...worktrees.read(original.itemId), retry: undefined },
+        { ...record, retry: undefined },
+        "release failure retains launch identity and an I/O-only settlement",
       );
+      assert.ok(pendingTicketWrite(worktrees.read(original.itemId)!));
       assert.deepEqual(card, before);
       assert.equal(executor.activeCount(), 1);
       assert.deepEqual(writes, []);

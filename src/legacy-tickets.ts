@@ -215,13 +215,16 @@ export class LegacyTickets {
       return run.runId !== record.lastRunId && args?.itemId === record.itemId &&
         args?.issueNumber === record.issueNumber && args?.taskKey === record.taskKey &&
         (!Object.hasOwn(args, "repair") || isRepairRequest(args.repair)) &&
-        this.matches(record, args, run.runId) &&
+        // Published v4 observes the original journal, never replays a legacy
+        // requested/queued/consumed ledger as new-run authorization.
+        (record.schemaVersion === 4 || this.matches(record, args, run.runId)) &&
         Date.parse(run.startedAt) >= (record.launchingAt ?? 0) - 1000;
     });
   }
 
-  /** Re-observe, don't clear/quarantine an uncertain migrated launch. The caller
-   * opens a manager only AFTER unique persisted matching and v4 publication. */
+  /** Re-observe an uncertain launch using strict on-disk journal reading. The
+   * caller opens a manager only AFTER unique persisted matching; published v4
+   * never needs a legacy ledger to authorize this observation. */
   observeLaunch(record: TicketExecutionRecord): TicketExecutionRecord | undefined {
     const matches = this.launchMatches(record, this.runs(record));
     if (matches.length !== 1) return undefined;
