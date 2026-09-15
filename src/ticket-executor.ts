@@ -467,14 +467,20 @@ export class ManagedTicketExecutor implements TicketExecutor {
       Date.parse(run.startedAt) >= (record.launchingAt ?? 0) - 1000);
   }
 
+  private async stopActiveRun(record: TicketExecutionRecord): Promise<void> {
+    const manager = this.manager(record.path);
+    const run = manager.list().find((r) => r.runId === record.activeRunId);
+    // A no-op stop for a missing run is not proof that the original drained.
+    if (!run || !runArgsMatch(run, record))
+      throw new Error("Original workflow is missing/mismatched; retained before drain.");
+    await manager.stopAndWait(run.runId);
+    if (JSON.stringify(this.deps.worktrees.read(record.itemId)) !== JSON.stringify(record))
+      throw new Error("Execution record changed while draining.");
+  }
+
   private async settle(record: TicketExecutionRecord): Promise<void> {
     await settleTicketWrite(this.deps.worktrees, record, this.deps.board, this.deps.botLogin, async () => {
-      if (record.activeRunId) {
-        const manager = this.manager(record.path);
-        const run = manager.list().find((r) => r.runId === record.activeRunId);
-        if (run && !runArgsMatch(run, record)) throw new Error("Run arguments changed before drain; writeback retained.");
-        await manager.stopAndWait(record.activeRunId);
-      }
+      if (record.activeRunId) await this.stopActiveRun(record);
     });
   }
 
@@ -495,10 +501,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
     this.deps.callback(`"${card.title}": ${reason}`, success ? "info" : "warn");
   }
 
-  private async stopForManualState(record: TicketExecutionRecord, card: Card, manager: TicketWorkflowManager): Promise<void> {
-    const runs = record.activeRunId ? manager.list().filter((r) => r.runId === record.activeRunId) : this.matchingLaunchRuns(record, manager);
-    if (record.activeRunId) await manager.stopAndWait(record.activeRunId);
-    else for (const run of runs) await manager.stopAndWait(run.runId);
+  private async stopForManualState(record: TicketExecutionRecord, card: Card): Promise<void> {
+    await this.stopActiveRun(record);
     // Drain yields: release only a freshly matching Issue, never a replacement.
     const fresh = await this.deps.board.getCard(record.itemId);
     if (JSON.stringify(this.deps.worktrees.read(record.itemId)) !== JSON.stringify(record))
@@ -507,23 +511,27 @@ export class ManagedTicketExecutor implements TicketExecutor {
         fresh.itemId === record.itemId && fresh.number === record.issueNumber &&
         fresh.assignees.some((a) => a.toLowerCase() === this.deps.botLogin.toLowerCase()))
       await this.deps.board.release(fresh);
-    this.deps.worktrees.clearExecution(record.itemId, record.activeRunId ?? (runs.length === 1 ? runs[0].runId : undefined));
+    if (JSON.stringify(this.deps.worktrees.read(record.itemId)) !== JSON.stringify(record))
+      throw new Error("Execution record changed while releasing.");
+    this.deps.worktrees.clearExecution(record.itemId, record.activeRunId);
     this.deps.callback(`Stopped stale execution ${record.itemId}; preserved manual status ${card.status ?? "unknown"}.`, "warn");
   }
 
   private async reconcileActive(record: TicketExecutionRecord, card: Card, summary: ReconcileSummary): Promise<void> {
     const manager = this.manager(record.path);
     if (!this.ownsExecutionCard(record, card) || !statusIs(card, this.deps.cfg.columns.building)) {
-      await this.stopForManualState(record, card, manager);
+      await this.stopForManualState(record, card);
       return;
     }
     const run = manager.list().find((r) => r.runId === record.activeRunId);
     if (!run || !runArgsMatch(run, record))
       throw new Error("Original workflow is missing/mismatched; retained for re-observation.");
     const results = run.status === "completed" ? normalizeWaveResults(run.result) : [];
+    const result = results.length === 1 && results[0].itemId === record.itemId && results[0].taskKey === record.taskKey
+      ? results[0] : undefined;
     const structural = this.deps.worktrees.check(record, false);
     if (!structural.ok) {
-      const failure = results.length === 1 && results[0].status === "failure" ? results[0] : undefined;
+      const failure = result?.status === "failure" ? result : undefined;
       await this.outcome(record, card, { ...failure, taskKey: record.taskKey, itemId: record.itemId, status: "failure",
         error: [failure?.error, structural.reason].filter(Boolean).join("; ") });
       return;
@@ -538,7 +546,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         status: run.status, worktree: record.path });
       return;
     }
-    let outcome: WaveOutcome = results.length === 1 ? { ...results[0], itemId: record.itemId, taskKey: record.taskKey } : {
+    let outcome: WaveOutcome = result ?? {
       itemId: record.itemId, taskKey: record.taskKey, status: "failure",
       error: completedAgentTimeoutReason(run) ?? run.error ?? (run.status === "completed" ? "persisted builder result is malformed" : `workflow ended as ${run.status}`),
     };
@@ -555,18 +563,17 @@ export class ManagedTicketExecutor implements TicketExecutor {
     record: TicketExecutionRecord,
     summary: ReconcileSummary,
   ): Promise<void> {
-    const manager = this.manager(record.path);
-    const runs = record.activeRunId
-      ? manager.list().filter((run) => run.runId === record.activeRunId)
-      : this.matchingLaunchRuns(record, manager);
-    for (const run of runs) {
-      if (!runArgsMatch(run, record)) throw new Error("Orphan run identity changed; retained before drain.");
-      await manager.stopAndWait(run.runId);
+    if (!record.activeRunId) {
+      const observed = this.conflicts.observeLaunch(record);
+      if (!observed) {
+        this.deps.callback(`Retained uncertain launch for withdrawn ticket ${record.itemId}; re-observing.`, "warn");
+        return;
+      }
+      record = observed;
+      summary.adopted++;
     }
-    this.deps.worktrees.clearExecution(
-      record.itemId,
-      record.activeRunId ?? (runs.length === 1 ? runs[0].runId : undefined),
-    );
+    await this.stopActiveRun(record);
+    this.deps.worktrees.clearExecution(record.itemId, record.activeRunId);
     summary.orphans++;
     this.deps.callback(
       `Stopped orphaned ticket run ${record.activeRunId ?? record.itemId}; its Project item is gone or no longer matches the ticket and worktree was preserved.`,
@@ -613,6 +620,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
         // replacement target stops only the local run, never mutates a snapshot.
         const card = await this.deps.board.getCard(original.itemId);
         if (this.stopping) break;
+        if (original.activeRunId || original.launchingAt !== undefined || pendingTicketWrite(original))
+          summary.attemptedItemIds!.push(original.itemId);
         if (
           !card ||
           !isTargetIssue(
@@ -643,8 +652,6 @@ export class ManagedTicketExecutor implements TicketExecutor {
         )
           continue;
 
-        if (original.activeRunId || original.launchingAt !== undefined || pendingTicketWrite(original))
-          summary.attemptedItemIds!.push(original.itemId);
         if (pendingTicketWrite(original)) {
           await this.settle(original);
           continue;
@@ -794,7 +801,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
 
     // Only fresh identity/ownership can authorize releasing our claim. Never
     // restore Ready or post a blocker against a changed contract/human state.
-    if (record?.activeRunId) await this.manager(record.path).stopAndWait(record.activeRunId);
+    if (record?.activeRunId) await this.stopActiveRun(record);
     if (card && sameTarget && card.assignees.includes(this.deps.botLogin)) {
       try { await this.deps.board.release(card); }
       catch (error) {

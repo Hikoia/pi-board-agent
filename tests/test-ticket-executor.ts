@@ -311,8 +311,12 @@ const complete = (itemId: string, result: unknown) => {
         ];
         if (mode !== "untracked") {
           state.runs.set(run.runId, run);
-          if (mode === "launching") worktrees.beginLaunch(tracked.itemId);
-          else worktrees.setActiveRun(tracked.itemId, run.runId);
+          if (mode === "launching") {
+            worktrees.beginLaunch(tracked.itemId);
+            const runsDir = workflowProjectPaths(record.path).runsDir;
+            mkdirSync(runsDir, { recursive: true });
+            writeFileSync(join(runsDir, `${run.runId}.json`), JSON.stringify(run));
+          } else worktrees.setActiveRun(tracked.itemId, run.runId);
         }
         board.cards.delete(tracked.itemId);
         board.cards.delete(untracked.itemId);
@@ -355,6 +359,8 @@ const complete = (itemId: string, result: unknown) => {
           console.error(`FAIL: fresh reconcile ${label}`, error);
           failures.push(error);
         }
+        if (mode === "launching")
+          rmSync(join(workflowProjectPaths(record.path).runsDir, `${run.runId}.json`));
       }
     }
   }
@@ -929,9 +935,9 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     );
   } else fail("FAIL: malformed timeout metadata guards");
 
-  const trustedIdentity = board.add("PVTI_37", 37);
-  await executor.launch(trustedIdentity, "demo");
-  complete(trustedIdentity.itemId, [
+  const mismatchedEcho = board.add("PVTI_37", 37);
+  await executor.launch(mismatchedEcho, "demo");
+  complete(mismatchedEcho.itemId, [
     {
       taskKey: "37",
       itemId: "37",
@@ -942,13 +948,15 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   ]);
   await executor.reconcile(board.all());
   if (
-    board.cards.get(trustedIdentity.itemId)?.status === cfg.columns.review &&
-    !recordFor(trustedIdentity.itemId).activeRunId
+    board.cards.get(mismatchedEcho.itemId)?.status === cfg.columns.ready &&
+    recordFor(mismatchedEcho.itemId).retry?.stage === "build" &&
+    recordFor(mismatchedEcho.itemId).retry?.reason.includes("malformed") &&
+    !recordFor(mismatchedEcho.itemId).activeRunId
   )
     console.log(
-      "PASS: persisted run identity overrides incorrect echoed identity",
+      "PASS: persisted run identity cannot relabel a mismatched builder result as success",
     );
-  else fail("FAIL: trusted persisted run identity");
+  else fail("FAIL: mismatched builder-result identity");
 
   const malformedIdentity = [855, 856, 857].map((number) =>
     board.add(`PVTI_${number}`, number),

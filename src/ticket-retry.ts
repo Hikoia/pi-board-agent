@@ -91,6 +91,7 @@ export async function settleTicketWrite(
     const card = await fresh();
     if (allowed(card)) return card;
     if (target(card) && hasBot(card)) await board.release(card);
+    sameRecord();
     finish(true);
     return undefined;
   };

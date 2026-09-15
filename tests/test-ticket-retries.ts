@@ -1,7 +1,7 @@
 // Real loop/executor/store/Git; all board/model I/O is offline and deterministic.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { workflowProjectPaths, type PersistedRunState } from "@quintinshaw/pi-dynamic-workflows";
 import { _DEFAULTS } from "../src/config.js";
@@ -65,7 +65,7 @@ function fixture() {
     setStatus: async (c, status) => board.setStatus(c.itemId, status),
   }, review: async (input) => { reviews++; return reviewImpl(input); } }, createLoopState(), executor, store);
   const record = () => store.read(card.itemId)!;
-  return { cfg, card, store, board, events, comments, notices, runs, executor, loop, record,
+  return { cfg, card, store, board, manager, events, comments, notices, runs, executor, loop, record,
     starts: () => starts, reviews: () => reviews, drains: () => drains,
     failAt: (step: string) => { failAt = step; failOnce = true; },
     review: (fn: typeof reviewImpl) => { reviewImpl = fn; },
@@ -237,4 +237,147 @@ for (const stage of ["integrate", "cleanup"] as const) {
   assert.equal(readFileSync(oldLedger, "utf8"), "old ledger remains read-only");
   await f.loop.stop(); f.store.clearExecution(f.card.itemId);
   console.log("PASS: v4 uncertain launch reobserves only a unique original persisted run, without reading old repair authority");
+}
+
+for (const field of ["itemId", "taskKey"]) {
+  for (const status of ["success", "needs_decision"]) {
+    const f = fixture(); await f.loop.tickNow();
+    f.complete({ status, branch: f.record().taskBranch, ...decision, [field]: "WRONG_IDENTITY" });
+    await f.loop.tickNow();
+    assert.equal(f.card.status, f.cfg.columns.ready);
+    assert.equal(f.record().retry?.stage, "build");
+    assert.match(f.record().retry!.reason, /malformed/);
+    assert.equal(f.reviews(), 0); assert.equal(f.starts(), 1);
+    assert.ok(f.comments.every((c) => !c.body.includes(decision.question)));
+    await f.loop.stop();
+    console.log(`PASS: ${status} with mismatched ${field} is a technical failure, never another ticket's success/decision`);
+  }
+}
+
+for (const pending of [false, true]) {
+  for (const evidence of ["missing", "mismatched"]) {
+    for (const withdrawal of ["manual", "missing", "retyped"]) {
+      const f = fixture(); await f.loop.tickNow();
+      if (pending) {
+        f.complete({ status: "failure", error: "failed tests" }); f.failAt("drain");
+        await f.loop.tickNow(); assert.ok(pendingTicketWrite(f.record()));
+      }
+      const record = f.record(), run = structuredClone(f.runs[0]);
+      if (evidence === "missing") f.runs.length = 0;
+      else f.runs[0].args = { ...(run.args as object), itemId: "WRONG_TICKET" };
+      const getCard = f.board.getCard;
+      let visible = withdrawal !== "missing";
+      f.board.getCard = async (id) => visible ? getCard(id) : undefined;
+      f.card.status = "Backlog";
+      if (withdrawal === "retyped") f.card.type = "Story";
+      const card = structuredClone(f.card), events = f.events.length;
+      await f.loop.tickNow();
+      assert.deepEqual(f.record(), record); assert.deepEqual(f.card, card);
+      assert.equal(f.executor.activeCount(), 1); assert.equal(f.drains(), 0);
+      assert.ok(f.events.slice(events).every((step) => step === "read"), "no release/status/comment before observed drain");
+      visible = true; f.card.type = "Task"; f.card.status = f.cfg.columns.ready;
+      await f.loop.tickNow();
+      assert.deepEqual(f.record(), record); assert.equal(f.starts(), 1); assert.equal(f.drains(), 0);
+      f.runs.splice(0, f.runs.length, run);
+      // Ready matches the pending failure's intended status. Keep an explicit
+      // human withdrawal at settlement to test cancellation, not successful I/O.
+      if (pending) f.card.status = "Backlog";
+      const manualStatus = f.card.status;
+      for (const step of ["drain", "release"]) {
+        f.failAt(step); await f.loop.tickNow();
+        assert.deepEqual(f.record(), record, `failed ${step} retains the original association/writeback`);
+        assert.equal(f.starts(), 1); assert.equal(f.card.status, manualStatus);
+      }
+      await f.loop.tickNow();
+      assert.equal(f.record().activeRunId, undefined); assert.equal(f.record().retry, undefined);
+      assert.equal(f.starts(), 1, "drain/release settlement cannot relaunch in the same tick");
+      assert.equal(f.card.status, manualStatus); assert.equal(f.comments.length, 0); assert.equal(f.reviews(), 0);
+      f.card.status = f.cfg.columns.ready; await f.loop.tickNow(); assert.equal(f.starts(), 2);
+      await f.loop.stop(); f.store.clearExecution(f.card.itemId);
+      console.log(`PASS: ${pending ? "pending writeback" : "active run"} ${evidence} during ${withdrawal} withdrawal retains identity/slot until observed drain and release`);
+    }
+  }
+}
+
+for (const evidence of ["unpersisted", "ambiguous", "corrupt"]) {
+  const f = fixture();
+  const record = await f.store.ensure(buildTasksForWave(f.cfg, "", [f.card])[0]);
+  f.store.beginLaunch(f.card.itemId);
+  f.card.status = f.cfg.columns.building; f.card.assignees = ["bot"]; f.card.type = "Story";
+  const launching = f.record();
+  const run: PersistedRunState = { runId: `withdrawn-${evidence}`, workflowName: "original", script: "return 'original';", args: { itemId: record.itemId, issueNumber: record.issueNumber, taskKey: record.taskKey }, status: "running", phases: [], agents: [], logs: [], startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  const dir = workflowProjectPaths(record.path).runsDir; mkdirSync(dir, { recursive: true });
+  f.runs.push(run);
+  if (evidence !== "unpersisted") writeFileSync(join(dir, `${run.runId}.json`), JSON.stringify(run));
+  if (evidence === "ambiguous") {
+    const extra = { ...run, runId: "ambiguous" }; f.runs.push(extra);
+    writeFileSync(join(dir, "ambiguous.json"), JSON.stringify(extra));
+  }
+  if (evidence === "corrupt") writeFileSync(join(dir, "corrupt.json"), "{");
+  for (const type of ["Story", "Task"]) {
+    f.card.type = type; f.card.status = f.cfg.columns.ready;
+    await f.loop.tickNow();
+    assert.deepEqual(f.record(), launching); assert.equal(f.executor.activeCount(), 1);
+    assert.equal(f.drains(), 0); assert.equal(f.starts(), 0);
+  }
+  // Resolve only the fixture's uncertain observation; production must retain it.
+  f.card.type = "Story"; f.runs.splice(1);
+  if (evidence !== "unpersisted") rmSync(join(dir, `${evidence}.json`));
+  writeFileSync(join(dir, `${run.runId}.json`), JSON.stringify(run));
+  f.failAt("drain"); await f.loop.tickNow();
+  assert.equal(f.record().activeRunId, run.runId); assert.equal(f.executor.activeCount(), 1);
+  await f.loop.tickNow();
+  assert.equal(f.record().activeRunId, undefined); assert.equal(f.record().launchingAt, undefined);
+  assert.equal(f.record().lastRunId, run.runId); assert.equal(f.drains(), 1); assert.equal(f.starts(), 0);
+  assert.equal(f.card.type, "Story"); assert.equal(f.card.status, f.cfg.columns.ready);
+  assert.ok(f.events.every((step) => ["read", "drain"].includes(step)), "retyped card receives no remote writes");
+  f.card.type = "Task"; await f.loop.tickNow(); assert.equal(f.starts(), 1);
+  await f.loop.stop(); f.store.clearExecution(f.card.itemId);
+  console.log(`PASS: withdrawn ${evidence} launch retains its slot until unique persisted observation and successful original drain`);
+}
+
+for (const cut of ["manual-drain", "manual-release", "missing-drain", "pending-release"]) {
+  const f = fixture(); await f.loop.tickNow();
+  if (cut === "pending-release") {
+    f.complete({ status: "failure", error: "failed tests" }); f.failAt("drain");
+    await f.loop.tickNow(); assert.ok(pendingTicketWrite(f.record()));
+  }
+  const runId = f.record().activeRunId;
+  f.card.status = "Backlog";
+  if (cut === "missing-drain") f.card.type = "Story";
+  const replace = async () => { await Promise.resolve(); f.store.setActiveRun(f.card.itemId, "replacement-run"); };
+  if (cut.endsWith("release")) f.board.release = replace;
+  else f.manager.stopAndWait = async (id) => { assert.equal(id, runId); await replace(); };
+  await f.loop.tickNow();
+  assert.equal(f.record().activeRunId, "replacement-run", "yielded withdrawal cannot clear a replacement association");
+  assert.equal(f.executor.activeCount(), 1); assert.equal(f.starts(), 1);
+  assert.equal(f.card.status, "Backlog"); assert.equal(f.comments.length, 0); assert.equal(f.reviews(), 0);
+  await f.loop.stop(); f.store.clearExecution(f.card.itemId);
+  console.log(`PASS: ${cut} withdrawal preserves an execution record replaced across its await`);
+}
+
+{
+  const f = fixture(); await f.loop.tickNow();
+  f.complete({ status: "success", branch: f.record().taskBranch, itemId: "WRONG_TICKET", taskKey: "WRONG_TASK" });
+  await f.loop.tickNow();
+  assert.equal(f.card.status, f.cfg.columns.ready, "a mismatched builder result is malformed, not success for this ticket");
+  assert.equal(f.record().retry?.stage, "build");
+  assert.equal(f.reviews(), 0);
+  await f.loop.stop();
+  console.log("PASS: mismatched builder-result identity fails technically without being relabeled as success");
+}
+
+{
+  const f = fixture();
+  await f.store.ensure(buildTasksForWave(f.cfg, "", [f.card])[0]);
+  f.store.beginLaunch(f.card.itemId);
+  f.card.status = f.cfg.columns.building; f.card.assignees = ["bot"];
+  f.card.type = "Story";
+  await f.loop.tickNow();
+  assert.ok(f.record().launchingAt !== undefined, "a withdrawn ticket does not prove an uncertain launch is drained");
+  f.card.type = "Task"; f.card.status = f.cfg.columns.ready;
+  await f.loop.tickNow();
+  assert.equal(f.starts(), 0, "restoring Ready must not duplicate an unobserved original launch");
+  await f.loop.stop();
+  console.log("PASS: withdrawal retains an uncertain launch until its original execution can be observed and drained");
 }
