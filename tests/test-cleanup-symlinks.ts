@@ -80,11 +80,23 @@ try {
   {
     const f = await integrationFixture(); const outside = join(f.repo, ".pi/native-target"); mkdirSync(outside);
     writeFileSync(join(outside, "keep.txt"), "keep\n");
-    symlinkSync(outside, join(f.record.path, "ignored/native-link"), process.platform === "win32" ? "junction" : "dir");
-    await f.tick();
+    const outsideRepo = join(outside, "repo"); mkdirSync(outsideRepo); git(outsideRepo, "init");
+    const externalHead = readFileSync(join(outsideRepo, ".git/HEAD"));
+    for (const [name, target] of [["native-link", outside], ["repo-link", outsideRepo], ["dangling-link", join(outside, "missing")]])
+      symlinkSync(target, join(f.record.path, "ignored", name), process.platform === "win32" ? "junction" : "dir");
+    calls.length = 0; await f.tick();
     assert.equal(readFileSync(join(outside, "keep.txt"), "utf8"), "keep\n", "external target must survive even a native partial removal");
+    assert.deepEqual(readFileSync(join(outsideRepo, ".git/HEAD")), externalHead);
+    assert.equal(existsSync(join(outside, "missing")), false);
     assert.equal(existsSync(f.record.path), false, f.notices.join("\n"));
+    assert.equal(existsSync(f.admin), false); assert.equal(existsSync(f.recordFile), false);
+    assert.equal(await f.store.remoteSha(f.task.taskBranch), undefined);
+    assert.equal(f.store.localBranchSha(f.task.taskBranch), undefined);
+    assert.equal(f.card.closed, true); assert.equal(f.card.status, f.cfg.columns.done);
+    assert.ok(calls.some((a) => a[0] === "clean" && a[1] === "-fdX" && a.length === 2));
+    assert.ok(calls.some((a) => a[0] === "worktree" && a[1] === "remove" && a.length === 3));
     assert.equal(existsSync(f.receipt), false);
-    console.log("PASS: new integration uses native worktree removal for ignored child links without snapshots or deleting external targets");
+    assert.equal(existsSync(join(f.repo, ".pi/board-agent/cleanup-backups")), false);
+    console.log("PASS: ignored ordinary/repository/dangling child links complete native cleanup; external data/Git survive with no snapshots");
   }
 } finally { dispose(); }

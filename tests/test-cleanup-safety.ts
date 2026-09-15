@@ -10,7 +10,8 @@ try {
     await assert.rejects(f.finish(), pattern);
     assert.equal(f.tip(), f.base); assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
     assert.ok(existsSync(f.record.path)); assert.ok(existsSync(f.recordFile));
-    assert.ok(!calls.some((a) => ["push", "commit-tree", "update-ref"].includes(a[0])));
+    assert.ok(!calls.some((a) => ["push", "commit-tree", "update-ref", "clean"].includes(a[0])));
+    assert.deepEqual(readFileSync(join(f.record.path, "ignored/cache.bin")), Buffer.from([0, 1, 2, 255]));
   };
   writeFileSync(join(f.record.path, "feature.txt"), "user edit"); await kept(/Dirty/);
   writeFileSync(join(f.record.path, "feature.txt"), "feature\n");
@@ -23,9 +24,11 @@ try {
   await kept(/status/); writeFileSync(join(f.admin, "index"), index);
   for (const nested of ["dotgit", "bare"]) {
     const dir = join(f.record.path, "ignored", nested); mkdirSync(dir);
-    if (nested === "dotgit") mkdirSync(join(dir, ".git"));
-    else { mkdirSync(join(dir, "objects")); mkdirSync(join(dir, "refs")); writeFileSync(join(dir, "HEAD"), "ref: refs/heads/main"); }
-    await kept(/Nested Git/); rmSync(dir, { recursive: true }); // fixture reset only
+    git(f.repo, "init", ...(nested === "bare" ? ["--bare"] : []), dir);
+    writeFileSync(join(dir, "keep.txt"), "nested repository data\n");
+    await kept(/Nested Git/);
+    assert.equal(readFileSync(join(dir, "keep.txt"), "utf8"), "nested repository data\n");
+    rmSync(dir, { recursive: true }); // fixture reset only
   }
   const outside = join(f.repo, ".pi/external"); git(f.repo, "worktree", "move", f.record.path, outside);
   symlinkSync(outside, f.record.path, "junction"); await kept(/unmanaged|mismatched/i);

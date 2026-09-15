@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { fixture, calls, faults, root, dispose } from "./cleanup-fixture.js";
+import { integrationFixture } from "./integration-fixture.js";
+import { calls, faults, git, root, dispose } from "./cleanup-fixture.js";
 
 try {
-  const f = await fixture(true);
+  const f = await integrationFixture();
   if (process.platform !== "win32") {
     calls.length = 0;
     assert.ok(await f.finish());
@@ -29,7 +30,8 @@ try {
     let child: ReturnType<typeof spawn> | undefined;
     let closed: Promise<void> | undefined;
     faults.beforeGit = async (args) => {
-      if (args[0] !== "worktree" || args[1] !== "remove") return;
+      if (args[0] !== "clean") return;
+      assert.deepEqual(args, ["clean", "-fdX"], "only ignored files are authorized for discard");
       faults.beforeGit = undefined;
       assert.ok(
         !!f.store.read(f.task.itemId)?.integration,
@@ -77,10 +79,10 @@ try {
         assert.ok(error instanceof Error);
         assert.match(
           error.message,
-          /git worktree remove .*failed/s,
+          /git clean -fdX failed/s,
           "failure must come from REAL Git, not an injected error",
         );
-        console.log(`Real locked Git removal diagnostic: ${error.message}`);
+        console.log(`Real locked Git preparation diagnostic: ${error.message}`);
         return true;
       });
       assert.ok(child, "real exclusive lock was acquired");
@@ -89,16 +91,36 @@ try {
       assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
       assert.ok(existsSync(path));
       assert.ok(existsSync(f.recordFile));
-      await assert.rejects(f.finish(), /EBUSY|EACCES|EPERM|worktree|cleanup/i);
+      const registered = () => {
+        assert.ok(existsSync(join(f.record.path, ".git")));
+        assert.ok(existsSync(f.admin));
+        assert.ok(git(f.repo, "worktree", "list", "--porcelain").includes(`branch refs/heads/${f.task.taskBranch}`));
+        assert.equal(git(f.origin, "rev-parse", `refs/heads/${f.task.taskBranch}`), f.taskSha);
+        assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
+        assert.ok(!calls.some((a) => a[0] === "worktree" && a[1] === "remove"));
+      };
+      registered();
+      calls.length = 0;
+      await f.tick(); // Real caller keeps CLOSED approval and retries only cleanup on Ready.
+      registered();
+      assert.equal(f.card.closed, true);
+      assert.equal(f.card.status, f.cfg.columns.ready);
+      assert.equal(f.store.read(f.task.itemId)!.retry?.stage, "cleanup");
       assert.deepEqual(f.store.read(f.task.itemId)!.integration, integration);
       assert.equal(f.tip(), integrated);
       writeFileSync(release, "release");
       await closed;
       calls.length = 0;
-      assert.equal(await f.finish(), integrated);
+      await f.tick();
+      assert.equal(f.card.closed, true);
+      assert.equal(f.card.status, f.cfg.columns.done);
       assert.equal(f.tip(), integrated);
+      assert.ok(calls.some((a) => a[0] === "worktree" && a[1] === "remove" && a.length === 3));
+      assert.equal(await f.store.remoteSha(f.task.taskBranch), undefined);
       assert.ok(
-        !calls.some((args) => ["merge-tree", "commit-tree"].includes(args[0])),
+        !calls.some((args) => ["merge-tree", "commit-tree"].includes(args[0]) ||
+          (args[0] === "push" && args.some((a) => a.endsWith(":refs/heads/main")))),
+        "cleanup does not repeat integration or the base push",
       );
       assert.equal(existsSync(f.record.path), false);
       assert.equal(existsSync(f.admin), false);
@@ -106,7 +128,7 @@ try {
       assert.equal(existsSync(f.recordFile), false);
       assert.equal(existsSync(f.receipt), false);
       console.log(
-        "PASS: real Windows FileShare.None lock makes real Git removal fail; locked retry preserves evidence; release/restart completes native cleanup without reintegration",
+        "PASS: real Windows FileShare.None lock fails ignored Git preparation with registration/record/both refs retained; CLOSED Ready retry and release/restart complete native cleanup without reintegration",
       );
     } finally {
       writeFileSync(release, "release");

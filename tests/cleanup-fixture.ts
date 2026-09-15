@@ -66,6 +66,7 @@ globals.__cleanupGit = (
   options: ProcessOptions = {},
 ) => {
   calls.push(args);
+  if (args[0] === "clean") assert.deepEqual(args, ["clean", "-fdX"], "only ignored cleanup with one force flag");
   assert.ok(
     !(args[0] === "worktree" && ["prune", "unlock"].includes(args[1])),
     "never prune/unlock",

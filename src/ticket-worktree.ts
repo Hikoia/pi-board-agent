@@ -980,17 +980,39 @@ export class TicketWorktrees {
     record = this.saveFinalization(record, integration, "cleanup");
     const legacyPaths = legacyResidual && this.hasCleanupReceipt(task.itemId) && !this.entryForPath(record.path)
       ? await legacyResidual.paths(record) : new Set<string>();
-    const cleanupGuard = async () => {
+    const cleanupGuard = async (links?: string[]) => {
       // Every destructive step observes remote ancestry, ownership and approval.
       const base = await observe();
       if (!this.isAncestor(integration.resultSha, base))
         throw new Error(`Pushed result ${integration.resultSha} is not on origin/${task.baseBranch}.`);
-      await this.checkFinalizationWorktree(record!, integration.taskSha, true, legacyPaths);
+      await this.checkFinalizationWorktree(record!, integration.taskSha, true, legacyPaths, links);
       await guard();
     };
     const remote = await this.remoteSha(task.taskBranch);
+    if (remote && remote !== integration.taskSha) throw new Error(`Remote ${task.taskBranch} moved; cleanup refused.`);
+    if (this.entryForPath(record.path) && lstatSync(record.path, { throwIfNoEntry: false })) {
+      await cleanupGuard();
+      // Git for Windows can unregister a worktree even when removal fails on an
+      // ignored OS-locked file. Fail here instead, with registration and refs intact.
+      // One -f, ONLY ignored files; nested repositories were rejected by the guard.
+      await mustGitAsync(["clean", "-fdX"], record.path);
+      const links: string[] = [];
+      await cleanupGuard(links);
+      // Git clean skips Windows junctions to repositories. Unlink only remaining
+      // ignored links, never their targets or a replacement file/directory.
+      for (const path of links) {
+        const args = ["check-ignore", "--quiet", "--", relative(record.path, path)];
+        const ignored = git(args, record.path);
+        if (!ignored.ok) {
+          if (ignored.status === 1 && !ignored.timedOut) continue;
+          throw processFailure("git", args, ignored);
+        }
+        if (this.hasSymlink(dirname(path)) || !lstatSync(path, { throwIfNoEntry: false })?.isSymbolicLink())
+          throw new Error(`Ignored link changed before cleanup: ${path}`);
+        unlinkSync(path);
+      }
+    }
     if (remote) {
-      if (remote !== integration.taskSha) throw new Error(`Remote ${task.taskBranch} moved; cleanup refused.`);
       await cleanupGuard();
       await mustGitAsync(["push", "origin", `--force-with-lease=refs/heads/${task.taskBranch}:${integration.taskSha}`,
         `:refs/heads/${task.taskBranch}`], this.repoRoot);
@@ -1122,7 +1144,7 @@ export class TicketWorktrees {
     return record;
   }
 
-  private async checkFinalizationWorktree(record: TicketExecutionRecord, taskSha: string, cleanup: boolean, legacyPaths = new Set<string>()): Promise<void> {
+  private async checkFinalizationWorktree(record: TicketExecutionRecord, taskSha: string, cleanup: boolean, legacyPaths = new Set<string>(), links?: string[]): Promise<void> {
     const entries = this.worktreeEntries();
     this.checkOwnership(record, entries);
     const local = this.localBranchSha(record.taskBranch);
@@ -1185,7 +1207,7 @@ export class TicketWorktrees {
       }
     }
     if (mustGit(["ls-files", "--others", "--exclude-standard"], record.path)) throw new Error(`Dirty worktree: ${record.path}`);
-    await this.checkNestedGit(record.path);
+    await this.checkNestedGit(record.path, true, links);
   }
 
   private async checkGitLocks(path: string): Promise<void> {
@@ -1196,14 +1218,15 @@ export class TicketWorktrees {
 
   /** Metadata only, no content hashes, receipts or copies. Native removal may
    * discard ignored files, but never a nested repository or an external target. */
-  private async checkNestedGit(path: string, root = true): Promise<void> {
+  private async checkNestedGit(path: string, root = true, links?: string[]): Promise<void> {
     const names = await readdir(path);
     if ((!root && names.some((n) => n.toLowerCase() === ".git")) ||
         ["HEAD", "objects", "refs"].every((n) => names.includes(n))) throw new Error(`Nested Git identity: ${path}`);
     for (const name of names) {
       if (root && name === ".git") continue;
       const child = join(path, name), stat = await lstat(child);
-      if (stat.isDirectory() && !stat.isSymbolicLink()) await this.checkNestedGit(child, false);
+      if (stat.isSymbolicLink()) links?.push(child);
+      else if (stat.isDirectory()) await this.checkNestedGit(child, false, links);
     }
   }
 

@@ -1,35 +1,29 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { integrationFixture } from "./integration-fixture.js";
-import { calls, faults, git, dispose } from "./cleanup-fixture.js";
+import { calls, faults, dispose } from "./cleanup-fixture.js";
+import { cleanupBoundaryChecks } from "./cleanup-boundary-checks.js";
 try {
-  for (const race of ["dirty", "lock", "local", "base"] as const) {
-    const f = await integrationFixture(); let result = "";
-    const file = join(f.record.path, "feature.txt");
+  await cleanupBoundaryChecks("remote deletion");
+  {
+    const f = await integrationFixture();
+    const unknown = join(f.record.path, "new-user-data.txt");
     faults.afterGit = (a, r) => {
-      if (a[0] !== "push" || !a.some((s) => s.startsWith(":refs/heads/task/"))) return;
-      assert.ok(r.ok); faults.afterGit = undefined; result = f.tip();
-      if (race === "dirty") writeFileSync(file, "new uncommitted user code\n");
-      if (race === "lock") writeFileSync(join(f.admin, "index.lock"), "new operation");
-      if (race === "local") {
-        const newer = git(f.repo, "commit-tree", `${f.taskSha}^{tree}`, "-p", f.taskSha, "-m", "new local work");
-        git(f.repo, "update-ref", `refs/heads/${f.task.taskBranch}`, newer, f.taskSha);
-      }
-      if (race === "base") git(f.origin, "update-ref", "refs/heads/main", f.base);
+      if (a[0] !== "worktree" || a[1] !== "remove") return;
+      assert.ok(r.ok); faults.afterGit = undefined;
+      assert.equal(existsSync(f.admin), false);
+      mkdirSync(f.record.path); writeFileSync(unknown, "late external data\n");
     };
+    await f.tick(); const result = f.tip();
+    assert.equal(f.store.read(f.task.itemId)?.retry?.stage, "cleanup");
     calls.length = 0; await f.tick();
-    assert.ok(result); assert.ok(existsSync(f.record.path), f.notices.join("\n"));
-    assert.ok(!calls.some((a) => a[0] === "worktree" && a[1] === "remove"));
-    assert.ok(existsSync(f.recordFile)); assert.equal(f.card.closed, true); assert.equal(f.card.status, f.cfg.columns.ready);
-    if (race === "dirty") { assert.equal(readFileSync(file, "utf8"), "new uncommitted user code\n"); writeFileSync(file, "feature\n"); }
-    if (race === "lock") unlinkSync(join(f.admin, "index.lock"));
-    if (race === "local") git(f.repo, "update-ref", `refs/heads/${f.task.taskBranch}`, f.taskSha);
-    if (race === "base") git(f.origin, "update-ref", "refs/heads/main", result);
-    calls.length = 0; await f.tick();
-    assert.equal(existsSync(f.record.path), false, f.notices.join("\n"));
-    assert.ok(!calls.some((a) => ["merge-tree", "commit-tree"].includes(a[0])));
-    console.log(`PASS: ${race} race during remote deletion await blocks native removal; cleanup-only retry preserves code/locks/refs/approval and never remerges`);
+    assert.equal(readFileSync(unknown, "utf8"), "late external data\n");
+    assert.ok(existsSync(f.recordFile)); assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
+    assert.equal(f.tip(), result); assert.equal(f.card.closed, true); assert.equal(f.card.status, f.cfg.columns.ready);
+    assert.ok(!calls.some((a) => ["clean", "merge-tree", "commit-tree", "update-ref", "worktree"].includes(a[0]) &&
+      !(a[0] === "worktree" && a[1] === "list")));
+    console.log("PASS: late external data after actual native removal stays unregistered and preserved with record/local ref; no preprocessing, reintegration or invented recovery evidence");
   }
   {
     const f = await integrationFixture();
