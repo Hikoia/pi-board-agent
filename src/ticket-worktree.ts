@@ -93,10 +93,6 @@ export class MergeConflictError extends Error {
 
 export class TicketStateChangedError extends Error {}
 
-export class IntegrationBaseAdvancedError extends Error {
-  constructor(readonly baseSha: string, readonly taskSha: string, reason: string) { super(reason); }
-}
-
 const SHA = /^[0-9a-f]{40}$/i;
 const RECORD_FIELDS = new Set([
   "schemaVersion",
@@ -902,6 +898,7 @@ export class TicketWorktrees {
     _strategy: Config["task_merge_strategy"], // legacy config is merge-only here
     assertCurrent: () => Promise<void> = async () => {},
     legacyResidual?: (record: TicketExecutionRecord, remove: boolean, guard: () => Promise<void>) => Promise<void>,
+    legacyApproval?: (record: TicketExecutionRecord) => string | undefined,
   ): Promise<string | undefined> {
     this.validateBranches(task.baseBranch, task.taskBranch);
     if (task.baseBranch === task.taskBranch) throw new Error("Task branch must differ from the base branch.");
@@ -928,20 +925,19 @@ export class TicketWorktrees {
       record = this.update(task.itemId, (r) => ({ ...r, ...patch }));
     };
     const taskPresent = async () => {
-      const expected = record!.integration?.taskSha ?? record!.reviewedTaskSha;
+      const expected = record!.reviewedTaskSha ?? legacyApproval?.(record!);
       if (!expected || this.localBranchSha(task.taskBranch) !== expected ||
-          (record!.reviewedTaskSha && record!.reviewedTaskSha !== expected))
-        throw new Error("Reviewed task SHA must match the original local task tip.");
+          (record!.integration && record!.integration.taskSha !== expected))
+        throw new Error("Reviewed or original legacy-approved task SHA must match the original local task tip.");
       if (await this.remoteSha(task.taskBranch) !== expected)
-        throw new Error("Remote task SHA differs from the reviewed task; work retained.");
+        throw new Error("Remote task SHA differs from the approved task; work retained.");
       await guard();
+      if (this.localBranchSha(task.taskBranch) !== expected) throw new Error("Approved local task tip changed; work retained.");
       const check = this.check(record!, true);
       if (!check.ok) throw new Error(check.reason ?? "Unsafe task worktree.");
+      return expected;
     };
-    let baseSha = await observe();
-    if (!record.integration) {
-      await taskPresent();
-      const taskSha = record.reviewedTaskSha!;
+    const prepare = async (baseSha: string, taskSha: string) => {
       let resultSha = baseSha;
       if (!this.isAncestor(taskSha, baseSha)) {
         const tree = await this.resultTree({ baseSha, taskSha });
@@ -952,10 +948,16 @@ export class TicketWorktrees {
         );
         if (!SHA.test(resultSha)) throw new Error("git commit-tree returned no result commit.");
       }
-      await guard();
-      save({ integration: { baseSha, taskSha, resultSha }, retry: { stage: "integrate", reason: "Prepared result; observe origin/base before push or cleanup." } });
+      if (await taskPresent() !== taskSha) throw new Error("Approved task changed during integration preparation.");
+      return { baseSha, taskSha, resultSha };
+    };
+    const preparedRetry = { stage: "integrate" as const, reason: "Prepared result; observe origin/base before push or cleanup." };
+    let baseSha = await observe();
+    if (!record.integration) {
+      const taskSha = await taskPresent();
+      save({ integration: await prepare(baseSha, taskSha), retry: preparedRetry });
     }
-    const integration = record.integration!;
+    let integration = record.integration!;
     baseSha = await observe(); // also before retrying a recorded/ambiguous push
     if (!this.isAncestor(integration.resultSha, baseSha)) {
       if (record.retry?.stage === "cleanup" || this.hasCleanupReceipt(task.itemId))
@@ -964,19 +966,38 @@ export class TicketWorktrees {
       if (baseSha !== integration.baseSha) {
         if (!this.isAncestor(integration.baseSha, baseSha))
           throw new Error("Remote base history was rewritten; prepared integration retained.");
-        // Dedicated checked supersession, never an update() exemption. Fresh
-        // remote observation proved this result is not integrated. Preserve the
-        // original work and require a new build/review/manual-close cycle.
-        const reason = `Base advanced to ${baseSha} before prepared result ${integration.resultSha} was confirmed. Merge this base into original task ${integration.taskSha}; resolve, test, push, review, and obtain renewed manual close approval.`;
-        await guard();
-        const loaded = this.load(this.recordPath(task.itemId))!;
-        if (JSON.stringify(loaded.record) !== JSON.stringify(record)) throw new Error("Integration record changed before supersession.");
-        record = { ...record, integration: undefined, reviewedTaskSha: undefined, retry: { stage: "build", reason } };
-        this.save(record, loaded.bytes);
-        throw new IntegrationBaseAdvancedError(baseSha, integration.taskSha, reason);
+        // A rejected push retries Git, not the successful builder. Only this
+        // checked path may replace progress; ordinary update() stays immutable.
+        const supersede = async (patch: Partial<TicketExecutionRecord>) => {
+          await taskPresent();
+          if (await observe() !== baseSha)
+            throw new Error("Remote base changed during preparation; previous integration retained for observation.");
+          const previous = record!;
+          const check = () => {
+            this.assertFinalizationRecord(task, previous);
+            if (previous.retry?.stage === "cleanup" || this.hasCleanupReceipt(task.itemId))
+              throw new Error("Confirmed/receipted cleanup cannot be superseded.");
+          };
+          check();
+          const loaded = this.load(this.recordPath(task.itemId))!;
+          const next = { ...previous, ...patch };
+          this.save(next, loaded.bytes, check);
+          record = next;
+        };
+        let replacement: TicketIntegrationState;
+        try { replacement = await prepare(baseSha, integration.taskSha); }
+        catch (error) {
+          if (!(error instanceof MergeConflictError)) throw error;
+          const reason = `Merge conflict with base ${baseSha}: merge into original task ${integration.taskSha}, resolve, test, push, review, and obtain renewed manual close approval.\n\n${error.diagnostic}`;
+          await supersede({ integration: undefined, reviewedTaskSha: undefined, retry: { stage: "build", reason } });
+          throw error;
+        }
+        await supersede({ integration: replacement, retry: preparedRetry });
+        integration = replacement;
       }
       await guard();
-      await mustGitAsync(["push", "origin", `${integration.resultSha}:refs/heads/${task.baseBranch}`], this.repoRoot);
+      if (!this.isAncestor(integration.resultSha, baseSha))
+        await mustGitAsync(["push", "origin", `${integration.resultSha}:refs/heads/${task.baseBranch}`], this.repoRoot);
     }
     baseSha = await observe();
     if (!this.isAncestor(integration.resultSha, baseSha))

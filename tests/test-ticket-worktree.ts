@@ -153,18 +153,15 @@ async function fixture() {
   git(f.repo, "add", ".");
   git(f.repo, "commit", "-m", "base advances");
   git(f.repo, "push", "origin", "main");
-  await assert.rejects(() => f.finish(), /Base advanced/);
-  assert.equal(f.store.read(f.task.itemId)!.retry?.stage, "build");
-  git(f.record.path, "merge", "--no-edit", "origin/main");
-  git(f.record.path, "push", "origin", f.task.taskBranch);
-  f.store.setReviewedTaskSha(f.task.itemId, git(f.record.path, "rev-parse", "HEAD"));
-  f.store.update(f.task.itemId, (r) => ({ ...r, retry: undefined })); // successful renewed review settlement
+  const advanced = f.tip();
+  assert.equal(f.store.read(f.task.itemId)!.reviewedTaskSha, f.taskSha);
   const result = await f.finish();
   assert.equal(f.tip(), result);
+  assert.equal(git(f.repo, "show", "-s", "--format=%P", result!), `${advanced} ${f.taskSha}`);
   assert.equal(git(f.repo, "show", "origin/main:later.txt"), "later base work");
   assert.equal(git(f.repo, "show", "origin/main:feature.txt"), "feature");
   console.log(
-    "PASS: rejected pushes retain prepared progress; base advance returns to original build and renewed review before merging",
+    "PASS: rejected pushes retain prepared progress; nonconflicting base advance retries ordinary integration with the unchanged approved task",
   );
 }
 {

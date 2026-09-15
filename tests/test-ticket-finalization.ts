@@ -48,38 +48,24 @@ try {
   }
   {
     const f = await fixture(); calls.length = 0;
-    const advanced = git(f.repo, "commit-tree", `${f.base}^{tree}`, "-p", f.base, "-m", "concurrent base advance");
+    writeFileSync(join(f.repo, "concurrent.txt"), "independent base change\n"); git(f.repo, "add", "concurrent.txt"); git(f.repo, "commit", "-m", "concurrent base advance");
+    const advanced = git(f.repo, "rev-parse", "HEAD");
     faults.beforeGit = (args) => { if (basePush(args)) { faults.beforeGit = undefined; git(f.repo, "push", "origin", `${advanced}:refs/heads/main`); } };
     await f.finish(); const prepared = f.recordNow().integration!;
     assert.equal(f.tip(), advanced); assert.equal(f.card.closed, true); assert.equal(f.recordNow().retry?.stage, "integrate");
-    const raw = readFileSync(f.recordFile);
     faults.beforeGit = (args) => { if (args[0] === "fetch") throw new Error("offline cannot observe base"); };
     await f.finish(); assert.deepEqual(f.recordNow().integration, prepared); assert.equal(existsSync(f.record.path), true);
-    faults.beforeGit = undefined; f.failClaim(true);
-    await f.finish(); assert.equal(f.recordNow().integration, undefined); assert.equal(f.recordNow().retry?.stage, "build");
-    assert.equal(f.card.closed, true, "failed claim retains unsettled build handoff");
-    f.failClaim(false); await f.finish();
-    assert.equal(f.card.closed, false); assert.equal(f.card.status, f.cfg.columns.ready); assert.equal(f.recordNow().reviewedTaskSha, undefined);
-    assert.equal(f.recordNow().path, f.record.path); assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
-    assert.equal(calls.filter((a) => a[0] === "commit-tree").length, 1); assert.equal(calls.filter(remoteDelete).length, 0);
-    assert.match(f.comments.join("\n"), /renewed manual close/); assert.notDeepEqual(readFileSync(f.recordFile), raw);
-    const fresh = { ...f.card, status: f.cfg.columns.done, closed: true }; Object.assign(f.card, fresh);
-    // A bypassed build/review cannot reuse the old acceptance.
-    const result = await f.finish(); assert.notEqual(result.status, "finalized"); assert.ok(f.store.has(f.task.itemId));
-    // Emulate the successful original builder + renewed review, not a second
-    // finalizer-created worktree or a fresh branch. Done stays open until close.
-    git(f.record.path, "merge", "--no-edit", advanced);
-    git(f.record.path, "push", "origin", f.task.taskBranch);
-    const renewed = git(f.record.path, "rev-parse", "HEAD");
-    f.store.setReviewedTaskSha(f.task.itemId, renewed);
-    f.store.update(f.task.itemId, (r) => ({ ...r, retry: undefined }));
-    f.card.status = f.cfg.columns.done; f.card.closed = false;
-    await f.loop.tickNow(); assert.equal(f.tip(), advanced); assert.ok(f.store.has(f.task.itemId));
-    f.card.closed = true;
+    faults.beforeGit = (args) => {
+      if (!basePush(args)) return;
+      assert.equal(f.recordNow().reviewedTaskSha, f.taskSha);
+      assert.deepEqual(f.recordNow().integration, { baseSha: advanced, taskSha: f.taskSha, resultSha: args.find((s) => s.endsWith(":refs/heads/main"))!.split(":")[0] });
+    };
     const accepted = await f.finish(); assert.equal(accepted.status, "finalized", JSON.stringify(accepted));
-    assert.equal(git(f.repo, "show", "-s", "--format=%P", f.tip()), `${advanced} ${renewed}`);
-    await f.loop.stop(); f.noNewEvidence();
-    console.log("PASS: base-advance rejected push retains prepared result until fresh observation, then original build/renewed-review/manual-close completes; failed claim cannot reintegrate");
+    assert.equal(git(f.repo, "show", "-s", "--format=%P", f.tip()), `${advanced} ${f.taskSha}`);
+    assert.equal(f.card.closed, true); assert.equal(f.events.includes("reopen"), false);
+    assert.equal(calls.filter((a) => a[0] === "commit-tree").length, 2); assert.equal(calls.filter(basePush).length, 2);
+    assert.equal(f.starts(), 0); assert.equal(f.reviews(), 0); f.noNewEvidence();
+    console.log("PASS: nonconflicting rejected push retains prepared result while observation fails, then atomically prepares/pushes an ordinary merge with unchanged approval and no builder/review/reopen");
   }
   {
     const f = await fixture();
@@ -91,6 +77,37 @@ try {
     assert.match(f.comments.join("\n"), /MERGE_HEAD/); assert.equal(calls.filter((a) => a[0] === "commit-tree" || a[0] === "push").length, 0);
     assert.equal(f.recordNow().path, f.record.path); f.noNewEvidence();
     console.log("PASS: genuine merge-tree conflict reopens Ready with original-branch diagnostics and renewed review/close, without a result commit or push");
+  }
+  {
+    const f = await fixture();
+    writeFileSync(join(f.record.path, "base.txt"), "task side\n"); git(f.record.path, "add", "."); git(f.record.path, "commit", "-m", "approved task"); git(f.record.path, "push", "origin", f.task.taskBranch);
+    const taskSha = git(f.record.path, "rev-parse", "HEAD"); f.store.setReviewedTaskSha(f.task.itemId, taskSha);
+    writeFileSync(join(f.repo, "base.txt"), "base side\n"); git(f.repo, "add", "base.txt"); git(f.repo, "commit", "-m", "concurrent conflict");
+    const advanced = git(f.repo, "rev-parse", "HEAD"); calls.length = 0;
+    faults.beforeGit = (args) => { if (basePush(args)) { faults.beforeGit = undefined; git(f.repo, "push", "origin", `${advanced}:refs/heads/main`); } };
+    await f.finish(); assert.ok(f.recordNow().integration); assert.equal(f.recordNow().retry?.stage, "integrate");
+    f.failClaim(true); await f.finish();
+    assert.equal(f.recordNow().integration, undefined); assert.equal(f.recordNow().retry?.stage, "build");
+    assert.equal(f.recordNow().reviewedTaskSha, undefined); assert.equal(f.card.closed, true);
+    f.failClaim(false); await f.finish();
+    assert.equal(f.card.closed, false); assert.equal(f.card.status, f.cfg.columns.ready);
+    assert.equal(f.store.localBranchSha(f.task.taskBranch), taskSha); assert.equal(f.recordNow().path, f.record.path);
+    assert.equal(calls.filter((a) => a[0] === "commit-tree").length, 1); assert.equal(calls.filter(remoteDelete).length, 0);
+    assert.match(f.comments.join("\n"), /renewed manual close/);
+    f.card.status = f.cfg.columns.done; f.card.closed = true;
+    assert.notEqual((await f.finish()).status, "finalized", "closing again cannot bypass the required build/review");
+    // Emulate conflict resolution in the original branch, then renewed review.
+    assert.throws(() => git(f.record.path, "merge", "--no-edit", advanced));
+    writeFileSync(join(f.record.path, "base.txt"), "task and base resolved\n"); git(f.record.path, "add", "base.txt"); git(f.record.path, "commit", "-m", "resolve conflict"); git(f.record.path, "push", "origin", f.task.taskBranch);
+    const renewed = git(f.record.path, "rev-parse", "HEAD"); f.store.setReviewedTaskSha(f.task.itemId, renewed);
+    f.store.update(f.task.itemId, (r) => ({ ...r, retry: undefined }));
+    f.card.status = f.cfg.columns.done; f.card.closed = false;
+    await f.loop.tickNow(); assert.equal(f.tip(), advanced); assert.ok(f.store.has(f.task.itemId));
+    f.card.closed = true;
+    const accepted = await f.finish(); assert.equal(accepted.status, "finalized", JSON.stringify(accepted));
+    assert.equal(git(f.repo, "show", "-s", "--format=%P", f.tip()), `${advanced} ${renewed}`);
+    await f.loop.stop(); f.noNewEvidence();
+    console.log("PASS: only an actual new conflict after rejection clears prepared progress for original build/renewed review/manual close; failed claim retains the reopen handoff");
   }
   for (const step of ["remote", "local", "worktree", "done", "lost-done"] as const) {
     const f = await fixture(); calls.length = 0;

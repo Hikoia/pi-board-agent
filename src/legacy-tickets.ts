@@ -409,6 +409,28 @@ export class LegacyTickets {
     return report;
   }
 
+  /** v3 allowed human-approved Done without AI review. Only the exact original
+   * execution archived by migration may use that approval; a later v4 build or
+   * a new ticket must pass review. The caller still checks fresh closed approval
+   * and the exact clean local/remote task before preparing or pushing anything. */
+  approvedTaskSha(record: TicketExecutionRecord): string | undefined {
+    if (record.schemaVersion !== 4 || record.reviewedTaskSha || record.activeRunId ||
+        record.launchingAt !== undefined || (record.retry && ["build", "review"].includes(record.retry.stage))) return undefined;
+    const { worktrees } = this.deps;
+    const path = join(worktrees.repoRoot, ".pi", "board-agent", "legacy-v3", basename(worktrees.recordPath(record.itemId)));
+    if (!lstatSync(path, { throwIfNoEntry: false })) return undefined;
+    const original: unknown = JSON.parse(this.bytes(path).toString("utf8"));
+    if (!isTicketExecutionRecord(original) || original.schemaVersion !== 3 ||
+        original.activeRunId || original.launchingAt !== undefined || original.reviewedTaskSha) return undefined;
+    const { schemaVersion: _oldVersion, finalization, ...source } = original;
+    const { schemaVersion: _version, integration, retry: _retry, ...current } = record;
+    if (!equal(source, current)) return undefined; // includes original lastRunId, createdAt, path and branch ownership
+    worktrees.assertOwnedPath(original);
+    const check = worktrees.check(original, true);
+    if (!check.ok) throw new Error(check.reason ?? "Unsafe original legacy worktree.");
+    return finalization?.taskSha ?? integration?.taskSha ?? worktrees.localBranchSha(original.taskBranch);
+  }
+
   /** Conversion and verified legacy residual evidence only. */
   private async readReceipt(task: BuilderTask): Promise<CleanupReceipt> {
     const path = join(this.deps.worktrees.repoRoot, ".pi", "board-agent", "cleanup", basename(this.deps.worktrees.recordPath(task.itemId)));

@@ -11,6 +11,7 @@ function adapter(f: Awaited<ReturnType<typeof fixture>>) {
 try {
   for (const integrated of [false, true]) {
     const f = await fixture(true);
+    f.store.update(f.task.itemId, (r) => ({ ...r, reviewedTaskSha: undefined }));
     const result = git(f.repo, "commit-tree", `${f.taskSha}^{tree}`, "-p", f.base, "-m", "old squash");
     f.store.update(f.task.itemId, (r) => ({ ...r, finalization: { baseSha: f.base, taskSha: f.taskSha, targetBranch: "main", resultSha: result } }));
     if (integrated) {
@@ -20,12 +21,52 @@ try {
     }
     const owner = acquireOwnerLock(f.repo, "bot");
     try {
+      const raw = readFileSync(f.recordFile);
       assert.deepEqual((await adapter(f).migrate(owner)).failures, []); calls.length = 0;
+      assert.equal(f.recordNow().reviewedTaskSha, undefined, "historical approval is not a fabricated AI review");
+      assert.deepEqual(readFileSync(join(f.repo, ".pi", "board-agent", "legacy-v3", f.recordFile.split(/[\\/]/).at(-1)!)), raw);
       const outcome = await f.finish(); assert.equal(outcome.status, "finalized", JSON.stringify(outcome));
       assert.equal(f.store.has(f.task.itemId), false); assert.equal(calls.filter((a) => a[0] === "commit-tree" || a[0] === "merge-tree").length, 0);
       assert.equal(git(f.repo, "show", "-s", "--format=%P", result), f.base, "old squash consumed, never recreated");
       assert.equal(git(f.repo, "merge-base", "--is-ancestor", result, "origin/main"), "");
-      console.log(`PASS: converted ${integrated ? "already-integrated advanced-base" : "unpushed"} legacy squash finishes exact recorded result without a new merge/squash`);
+      console.log(`PASS: converted ${integrated ? "already-integrated advanced-base" : "unpushed"} legacy squash without optional old review finishes exact recorded result without a new merge/squash or forged review marker`);
+    } finally { owner.release(); }
+  }
+  {
+    const f = await fixture(true);
+    f.store.update(f.task.itemId, (r) => ({ ...r, reviewedTaskSha: undefined }));
+    const owner = acquireOwnerLock(f.repo, "bot");
+    try {
+      assert.deepEqual((await adapter(f).migrate(owner)).failures, []);
+      // Same item/branch/path is not enough: a new execution cannot inherit the
+      // archived v3 task's no-review exception, even if manually closed Done.
+      f.store.update(f.task.itemId, (r) => ({ ...r, lastRunId: "new-v4-build-without-review" }));
+      calls.length = 0; assert.notEqual((await f.finish()).status, "finalized");
+      assert.equal(f.tip(), f.base); assert.equal(f.recordNow().integration, undefined);
+      assert.equal(f.recordNow().reviewedTaskSha, undefined); assert.equal(existsSync(f.record.path), true);
+      assert.equal(calls.filter((a) => a[0] === "commit-tree" || a[0] === "push").length, 0);
+      console.log("PASS: historical v3 approval cannot authorize a new unreviewed v4 execution on the same owned branch/worktree");
+    } finally { owner.release(); }
+  }
+  {
+    const f = await fixture(true);
+    const resultSha = git(f.repo, "commit-tree", `${f.taskSha}^{tree}`, "-p", f.base, "-m", "old unconfirmed squash");
+    f.store.update(f.task.itemId, (r) => ({ ...r, reviewedTaskSha: undefined,
+      finalization: { baseSha: f.base, taskSha: f.taskSha, targetBranch: "main", resultSha } }));
+    const advanced = git(f.repo, "commit-tree", `${f.base}^{tree}`, "-p", f.base, "-m", "later nonconflicting base");
+    git(f.repo, "push", "origin", `${advanced}:refs/heads/main`);
+    const owner = acquireOwnerLock(f.repo, "bot");
+    try {
+      assert.deepEqual((await adapter(f).migrate(owner)).failures, []);
+      assert.equal(f.recordNow().integration?.resultSha, resultSha); assert.equal(f.recordNow().retry?.stage, "integrate");
+      calls.length = 0;
+      faults.beforeGit = (a) => { if (a[0] === "push") assert.equal(f.recordNow().reviewedTaskSha, undefined); };
+      const outcome = await f.finish(); assert.equal(outcome.status, "finalized", JSON.stringify(outcome));
+      assert.equal(git(f.repo, "show", "-s", "--format=%P", f.tip()), `${advanced} ${f.taskSha}`);
+      assert.equal(calls.filter((a) => a[0] === "commit-tree").length, 1);
+      assert.equal(f.card.closed, true); assert.equal(f.events.includes("reopen"), false);
+      assert.equal(f.starts(), 0); assert.equal(f.reviews(), 0);
+      console.log("PASS: unconfirmed legacy squash on an advanced base retries as one ordinary merge of the original approved task, without a forged review marker or renewed model/close cycle");
     } finally { owner.release(); }
   }
   for (const fullyRemoved of [false, true]) {

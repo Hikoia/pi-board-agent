@@ -34,7 +34,7 @@ import {
   type ProjectMetadata,
 } from "./gh.js";
 import {
-  MergeConflictError, IntegrationBaseAdvancedError, TicketStateChangedError,
+  MergeConflictError, TicketStateChangedError,
   TicketWorktrees,
   type TicketExecutionRecord,
   type TicketWorktreeRecord,
@@ -1086,7 +1086,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
           throw new FinalizationWithdrawn("Fresh approval, claim, execution or admission changed; work retained.");
       };
       const resultSha = await this.deps.worktrees.finalizeAccepted(task, this.deps.cfg.task_merge_strategy,
-        assertCurrent, (r, remove, guard) => this.conflicts.cleanupResidual(r, remove, guard));
+        assertCurrent, (r, remove, guard) => this.conflicts.cleanupResidual(r, remove, guard),
+        (r) => this.conflicts.approvedTaskSha(r));
       if (!resultSha) return { status: "skipped", reason: "no local task branch" };
       await assertCurrent();
       if (!statusIs(expected, this.deps.cfg.columns.done)) await this.deps.board.setStatus(expected.itemId, this.deps.cfg.columns.done);
@@ -1103,7 +1104,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         if (!record || record.schemaVersion !== 4 || !sameOwner(record) || pendingTicketWrite(record))
           return { status: "blocked", reason };
         const conflict = error instanceof MergeConflictError;
-        const buildRetry = conflict || error instanceof IntegrationBaseAdvancedError || record.retry?.stage === "build";
+        const buildRetry = conflict || record.retry?.stage === "build";
         if (buildRetry && record.integration)
           return { status: "blocked", reason: "Prepared integration must be observed on fresh origin/base before a build retry." };
         const stage = buildRetry ? "build" : record.retry?.stage === "cleanup" ? "cleanup" : "integrate";
@@ -1127,7 +1128,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         const pending = queueTicketWrite(this.deps.worktrees, record, stage, {
           card: current, status: this.deps.cfg.columns.ready, reason: detail, retry: true,
           ...(buildRetry ? { reopen: true as const } : {}),
-          comment: `## ${buildRetry ? `${conflict ? "Merge conflict" : "Base advanced"} — build retry` : `${stage} retry`}\n\n${detail}`,
+          comment: `## ${buildRetry ? "Merge conflict — build retry" : `${stage} retry`}\n\n${detail}`,
         });
         await this.settle(pending);
         return { status: "skipped", reason: detail };

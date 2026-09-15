@@ -22,6 +22,26 @@ try {
     assert.equal(f.store.has(f.task.itemId), false); f.noNewEvidence();
     console.log(`PASS: ${cut} failure retains retry; push cannot precede atomic save and record deletion cannot precede fresh Project Done`);
   }
+  {
+    const f = await fixture();
+    const advanced = git(f.repo, "commit-tree", `${f.base}^{tree}`, "-p", f.base, "-m", "base advance");
+    faults.beforeGit = (a) => { if (basePush(a)) { faults.beforeGit = undefined; git(f.repo, "push", "origin", `${advanced}:refs/heads/main`); } };
+    await f.finish(); const prepared = f.recordNow().integration!; calls.length = 0;
+    faults.beforeSyncFs = (op, path, destination) => {
+      if (op === "renameSync" && destination === f.recordFile) {
+        const next = JSON.parse(readFileSync(path, "utf8"));
+        if (next.integration?.resultSha !== prepared.resultSha) throw new Error("offline supersession publication failure");
+      }
+    };
+    await f.finish(); assert.deepEqual(f.recordNow().integration, prepared);
+    assert.equal(f.recordNow().reviewedTaskSha, f.taskSha); assert.equal(f.recordNow().retry?.stage, "integrate");
+    assert.equal(calls.filter(basePush).length, 0); assert.equal(f.card.closed, true);
+    faults.beforeSyncFs = undefined;
+    assert.equal((await f.finish()).status, "finalized");
+    assert.equal(git(f.repo, "show", "-s", "--format=%P", f.tip()), `${advanced} ${f.taskSha}`);
+    assert.equal(f.starts(), 0); assert.equal(f.reviews(), 0);
+    console.log("PASS: failed atomic supersession retains the rejected result and original approval, never pushes the unpublished replacement, and retries integration only");
+  }
   for (const cut of ["remote-lease", "local-cas", "remote-reappears"] as const) {
     const f = await fixture(); calls.length = 0;
     const newer = git(f.repo, "commit-tree", `${f.taskSha}^{tree}`, "-p", f.taskSha, "-m", "concurrent retained work");
@@ -52,7 +72,12 @@ try {
     const f = await fixture(); f.store.update(f.task.itemId, (r) => ({ ...r, reviewedTaskSha: undefined }));
     calls.length = 0; await f.finish(); assert.equal(f.tip(), f.base); assert.ok(f.store.has(f.task.itemId));
     assert.equal(calls.filter((a) => a[0] === "commit-tree" || a[0] === "push").length, 0);
-    console.log("PASS: closed Done without exact review SHA cannot integrate even with legacy review config disabled");
+    const tree = git(f.repo, "merge-tree", "--write-tree", f.base, f.taskSha);
+    const resultSha = git(f.repo, "commit-tree", tree, "-p", f.base, "-p", f.taskSha, "-m", "unreviewed prepared result");
+    f.store.update(f.task.itemId, (r) => ({ ...r, integration: { baseSha: f.base, taskSha: f.taskSha, resultSha } }));
+    await f.finish(); assert.equal(f.tip(), f.base); assert.ok(f.store.has(f.task.itemId));
+    assert.equal(calls.filter((a) => a[0] === "commit-tree" || a[0] === "push").length, 0);
+    console.log("PASS: new v4 closed Done without exact review cannot prepare or push an unconfirmed result, even with legacy review config disabled");
   }
   {
     const f = await fixture();
@@ -74,12 +99,18 @@ try {
     const f = await fixture();
     faults.beforeGit = (a) => { if (deleting(a)) throw new Error("offline deletion retry"); };
     await f.finish(); const integration = f.recordNow().integration!;
-    if (step === "rewrite") { faults.beforeGit = undefined; git(f.origin, "update-ref", "refs/heads/main", f.base, integration.resultSha); }
+    if (step === "rewrite") {
+      faults.beforeGit = undefined;
+      const other = git(f.repo, "commit-tree", `${f.base}^{tree}`, "-p", f.base, "-m", "rewritten to a different safe descendant");
+      git(f.origin, "fetch", f.repo, other); // transfer the fixture object before rewriting the bare ref
+      git(f.origin, "update-ref", "refs/heads/main", other, integration.resultSha);
+    }
     else faults.beforeGit = (a) => { if (a[0] === step) throw new Error(`offline ${step} observation failure`); };
     calls.length = 0; await f.finish();
     assert.ok(f.store.has(f.task.itemId)); assert.equal(existsSync(f.record.path), true); assert.deepEqual(f.recordNow().integration, integration);
     assert.equal(calls.filter(deleting).length, 0);
-    console.log(`PASS: ${step} cannot authorize cleanup from stale tracking refs or recorded integration alone`);
+    assert.equal(calls.filter((a) => a[0] === "merge-tree" || a[0] === "commit-tree" || basePush(a)).length, 0);
+    console.log(`PASS: ${step} cannot authorize cleanup from stale tracking refs or supersede a previously confirmed result`);
   }
   {
     const f = await fixture();
