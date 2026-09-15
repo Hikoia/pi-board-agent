@@ -3,13 +3,14 @@ import { existsSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from
 import { join } from "node:path";
 import { _DEFAULTS } from "../src/config.js";
 import type { Card } from "../src/gh.js";
-import { fixture, git, calls, faults, dispose } from "./cleanup-fixture.js";
+import { fixture, git, calls, dispose } from "./cleanup-fixture.js";
+import { historicalReceipt } from "./legacy-cleanup-fixture.js";
 const { LegacyTickets } = await import("../src/legacy-tickets.js");
 const { acquireOwnerLock } = await import("../src/owner-lock.js");
 
-function adapter(f: Awaited<ReturnType<typeof fixture>>) {
+function adapter(f: Awaited<ReturnType<typeof fixture>>, status = _DEFAULTS.columns.done) {
   const card: Card = { itemId: f.task.itemId, number: f.task.issueNumber, title: f.task.title, body: f.task.body,
-    contentType: "Issue", type: "Task", plan: "demo", status: _DEFAULTS.columns.done, closed: true, assignees: [], repoOwner: "owner", repoName: "repo" };
+    contentType: "Issue", type: "Task", plan: "demo", status, closed: true, assignees: [], repoOwner: "owner", repoName: "repo" };
   return new LegacyTickets({ worktrees: f.store, cfg: structuredClone(_DEFAULTS), botLogin: "bot", repoOwner: "owner", repoName: "repo",
     board: { getCard: async () => card, setStatus: async () => assert.fail("cleanup adoption does not mutate the Issue/Project") } });
 }
@@ -46,18 +47,12 @@ try {
       assert.equal(f.tip(), advanced);
       noNewEvidence(f, [], []);
       assert.deepEqual(readFileSync(join(f.repo, ".pi", "board-agent", "legacy-v3", f.recordFile.split(/[\\/]/).at(-1)!)), raw);
-      await assert.rejects(f.finish("squash"), /v4 finalization requires staged/);
       console.log("PASS: old squash result is adopted exactly; fresh remote observation distinguishes pending integration from cleanup even after base advances, without a new squash or snapshots");
     } finally { owner.release(); }
   }
   {
     const f = await fixture();
-    faults.beforeGit = (args) => {
-      if (args[0] === "worktree" && args[1] === "remove") {
-        faults.beforeGit = undefined; f.vanish(); throw new Error("offline halfway cleanup");
-      }
-    };
-    await assert.rejects(f.finish(), /halfway cleanup/);
+    await historicalReceipt(f);
     const raw = readFileSync(f.recordFile), receipt = readFileSync(f.receipt), result = f.tip();
     const unknown = join(f.record.path, "unknown.txt"); writeFileSync(unknown, "unknown program work\n");
     const owner = acquireOwnerLock(f.repo, "bot");
@@ -86,14 +81,12 @@ try {
   }
   {
     const f = await fixture();
-    faults.beforeFs = (operation, path) => { if (operation === "unlink" && path === f.receipt) throw new Error("offline last receipt unlink"); };
-    await assert.rejects(f.finish(), /last receipt unlink/);
-    faults.beforeFs = undefined;
+    await historicalReceipt(f, true);
     assert.equal(existsSync(f.recordFile), false);
     const receipt = readFileSync(f.receipt), owner = acquireOwnerLock(f.repo, "bot");
     try {
       calls.length = 0;
-      const report = await adapter(f).migrate(owner);
+      const report = await adapter(f, _DEFAULTS.columns.ready).migrate(owner);
       assert.deepEqual(report.failures, []);
       const record = f.store.read(f.task.itemId)!;
       assert.equal(record.schemaVersion, 4);

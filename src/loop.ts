@@ -1536,7 +1536,9 @@ export class BoardLoop {
         card.closed === true &&
         (card.status?.toLowerCase() === cfg.columns.done.toLowerCase() ||
           (card.status?.toLowerCase() === cfg.columns.ready.toLowerCase() &&
-            ["integrate", "cleanup"].includes(this.ticketWorktrees.read(card.itemId)?.retry?.stage ?? ""))) &&
+            // A closed build retry can only finish its interrupted reopen/Ready
+            // handoff here, never launch a model or reuse old merge approval.
+            ["build", "integrate", "cleanup"].includes(this.ticketWorktrees.read(card.itemId)?.retry?.stage ?? ""))) &&
         !attemptedItemIds.has(card.itemId) &&
         isTargetIssue(card, repoOwner, repoName, "Task"),
     );

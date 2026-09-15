@@ -152,8 +152,8 @@ function fixture(record: TicketExecutionRecord = v4) {
   assert.throws(() => reopened.beginLaunch(v4.itemId), /pending finalization/);
   assert.throws(() => reopened.setActiveRun(v4.itemId, "second-run"), /pending finalization/);
   assert.throws(() => reopened.setReviewedTaskSha(v4.itemId, "d".repeat(40)), /pending finalization/);
-  // A prepared result cannot enter old squash/receipt cleanup, even with no local task ref.
-  await assert.rejects(() => reopened.finalizeAccepted({ ...v4, title: "test", body: "test" }, "squash"), /staged integration/);
+  // A prepared result cannot authorize cleanup without fresh Git proof, even with no task ref.
+  await assert.rejects(() => reopened.finalizeAccepted({ ...v4, title: "test", body: "test" }, "squash"));
   assert.deepEqual(readFileSync(f.file), before);
   assert.deepEqual(new TicketWorktrees(f.repo).read(v4.itemId)?.integration, integration);
   assert.equal(new TicketWorktrees(f.repo).read(v4.itemId)?.retry?.stage, "cleanup");

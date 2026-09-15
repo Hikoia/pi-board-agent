@@ -14,6 +14,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as syncFs from "node:fs";
 import { registerHooks } from "node:module";
 import { join } from "node:path";
 import type { BuilderTask } from "../src/workflow-prompt.js";
@@ -36,10 +37,16 @@ export const calls: string[][] = [];
 
 export const faults: {
   beforeGit?: (args: string[], options: ProcessOptions) => void | Promise<void>;
+  afterGit?: (args: string[], options: ProcessOptions) => void | Promise<void>;
+  beforeSyncFs?: (operation: string, path: string, ...args: any[]) => void;
   beforeFs?: (operation: string, path: string) => void | Promise<void>;
   afterFs?: (operation: string, path: string) => void | Promise<void>;
 } = {};
 const globals = globalThis as any;
+globals.__cleanupSyncFs = (op: "unlinkSync" | "renameSync", path: string, ...args: any[]) => {
+  faults.beforeSyncFs?.(op, String(path), ...args);
+  return (syncFs[op] as any)(path, ...args);
+};
 globals.__cleanupFs = async (
   operation: "unlink" | "link" | "open" | "readdir" | "readlink",
   path: string,
@@ -72,13 +79,19 @@ globals.__cleanupGit = (
   if (mode === "sync") return runProcessSync(command, args, options);
   return (async () => {
     await faults.beforeGit?.(args, options);
-    return runProcess(command, args, options);
+    const result = await runProcess(command, args, options);
+    await faults.afterGit?.(args, options);
+    return result;
   })();
 };
 const worktreeUrl = new URL("../src/ticket-worktree.ts", import.meta.url).href;
 const runnerUrl = new URL("../src/process-runner.ts", import.meta.url).href;
 const hooks = registerHooks({
   resolve(specifier, context, next) {
+    if (context.parentURL === worktreeUrl && specifier === "node:fs")
+      return { url: `data:text/javascript,${encodeURIComponent(`export * from 'node:fs';
+        export const unlinkSync = (...args) => globalThis.__cleanupSyncFs('unlinkSync', ...args);
+        export const renameSync = (...args) => globalThis.__cleanupSyncFs('renameSync', ...args);`)}`, shortCircuit: true };
     if (
       context.parentURL === worktreeUrl &&
       specifier === "./process-runner.js"
@@ -232,8 +245,9 @@ export function legacy(
 }
 
 export function dispose() {
-  faults.beforeGit = faults.beforeFs = faults.afterFs = undefined;
+  faults.beforeGit = faults.afterGit = faults.beforeFs = faults.afterFs = faults.beforeSyncFs = undefined;
   hooks.deregister();
+  delete globals.__cleanupSyncFs;
   delete globals.__cleanupGit;
   delete globals.__cleanupFs;
 }
