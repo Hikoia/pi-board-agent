@@ -319,6 +319,9 @@ try {
       this.promotions++;
       this.admissions = true;
     }
+    disableAdmissions() {
+      this.admissions = false;
+    }
     async tickNow() {
       this.ticks++;
     }

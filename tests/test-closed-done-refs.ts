@@ -108,10 +108,10 @@ try {
       createManager,
     });
     const state = createLoopState();
-    let revisionChecks = 0;
+    let heartbeats = 0;
     const loop = new BoardLoop({ cwd: repo, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo",
       meta: { projectId: "P", statusFieldId: "S", statusOptions: {} }, callback, listCards: async () => structuredClone(cards),
-      revisionCheck: async () => { revisionChecks++; return { ok: true }; },
+      onTick: () => { heartbeats++; },
     }, state, executor, store);
     const branch = (number: number) => `${prefix}issue-${number}`;
     const addBranch = async (number: number) => {
@@ -121,7 +121,7 @@ try {
       return sha;
     };
     const tip = () => git(origin, "rev-parse", "refs/heads/main");
-    return { repo, origin, base, cfg, cards, reads, notices, board, store, executor, state, loop, branch, addBranch, tip, revisionChecks: () => revisionChecks };
+    return { repo, origin, base, cfg, cards, reads, notices, board, store, executor, state, loop, branch, addBranch, tip, heartbeats: () => heartbeats };
   }
 
   {
@@ -227,7 +227,7 @@ try {
       assert.equal(f.tip(), f.base);
       assert.equal(f.store.localBranchSha(f.branch(1)), accepted);
       assert.equal(f.state.tickCount, 1);
-      assert.equal(f.revisionChecks(), 1, "failed refs blocks this lane, not the rest of the tick");
+      assert.equal(f.heartbeats(), 1, "failed refs blocks this lane, not the rest of the tick");
       assert.equal(f.notices.length, 1);
       assert.equal(f.notices[0].level, "warn");
       assert.match(f.notices[0].message, /finalization blocked.*refs.*controlled refs failure/i);

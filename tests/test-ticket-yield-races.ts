@@ -48,7 +48,7 @@ function fixture() {
   const executor = new ManagedTicketExecutor({ cwd: repo, cfg, worktrees: store, board, botLogin: 'bot', repoOwner: 'owner', repoName: 'repo', callback: s => notices.push(s), createManager: () => {
     return { start: (_source: string, args: any) => { starts++; run = { runId: `audit-run-${number}`, status: 'running', args }; return run.runId; }, list: () => run ? [run] : [], resume: async () => false, pauseAndWait: async () => { if (run) run.status = 'paused'; }, stopAndWait: async () => { if (run) run.status = 'aborted'; }, dispose() {} };
   } });
-  const loop = new BoardLoop({ cwd: repo, cfg, botLogin: 'bot', repoOwner: 'owner', repoName: 'repo', meta: { projectId: 'P', statusFieldId: 'S', statusOptions: {} }, callback: s => notices.push(s), listCards: async () => [structuredClone(card)], revisionCheck: async () => ({ ok: true }) }, createLoopState(), executor, store);
+  const loop = new BoardLoop({ cwd: repo, cfg, botLogin: 'bot', repoOwner: 'owner', repoName: 'repo', meta: { projectId: 'P', statusFieldId: 'S', statusOptions: {} }, callback: s => notices.push(s), listCards: async () => [structuredClone(card)] }, createLoopState(), executor, store);
   return { failRead: (v = true) => readError = v, missing: () => missing = true, failRelease: (v = true) => releaseError = v, cfg, card, board, store, executor, loop, writes, notices, starts: () => starts, task: buildTasksForWave(cfg, 'demo', [card])[0] };
 }
 const reached = async (barrier: Promise<void>, operation: Promise<unknown>) => Promise.race([barrier, operation.then(() => { throw new Error('Barrier not reached'); })]);

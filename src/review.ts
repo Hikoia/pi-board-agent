@@ -29,7 +29,7 @@ export interface ReviewInput {
   executionKey?: string;
   onResult?(review: CompletedReview): Promise<void>;
   signal?: AbortSignal;
-  /** The caller has reserved a slot. Observe revision after Git preparation,
+  /** The caller has reserved a slot. Revalidate the ticket after Git preparation,
    * then check local admission synchronously just before execution. */
   canStartWork?: () => boolean | Promise<boolean>;
   canStartWorkNow?: () => boolean;

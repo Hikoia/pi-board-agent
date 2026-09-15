@@ -30,6 +30,8 @@ const deferred = () => {
 const turn = () => new Promise<void>((done) => setImmediate(done));
 let read = async () => [];
 let metadataWait = Promise.resolve();
+let revisionWait = Promise.resolve();
+let revisionEntered: (() => void) | undefined;
 let drainWait = Promise.resolve();
 let drainFailure = false;
 let executors = 0;
@@ -80,13 +82,17 @@ globals.__stopTest = {
     };
   },
   captureRuntimeIdentity: () => ({ loadedRevision: "a".repeat(40) }),
-  checkRuntimeRevisionAsync: () => ({
-    ok: true,
-    expectedRevision: "a".repeat(40),
-    loadedRevision: "a".repeat(40),
-    diskRevision: "a".repeat(40),
-    dirty: false,
-  }),
+  checkRuntimeRevisionAsync: async () => {
+    revisionEntered?.();
+    await revisionWait;
+    return {
+      ok: true,
+      expectedRevision: "a".repeat(40),
+      loadedRevision: "a".repeat(40),
+      diskRevision: "a".repeat(40),
+      dirty: false,
+    };
+  },
 };
 const entry = new URL("../src/index.ts", import.meta.url).href;
 const shim = (path: string, names: string[]) =>
@@ -281,6 +287,34 @@ try {
   console.log(
     "PASS: a tick failure that fully drains clears the module reference and permits a clean restart",
   );
+
+  const enteredRevision = deferred(), releaseRevision = deferred();
+  revisionEntered = enteredRevision.resolve;
+  revisionWait = releaseRevision.promise;
+  const beforeAutoStart = executors;
+  const autoStart = event("session_start");
+  await enteredRevision.promise;
+  await invoke("stop");
+  releaseRevision.resolve(); await autoStart;
+  revisionEntered = undefined; revisionWait = Promise.resolve();
+  assert.equal(executors, beforeAutoStart);
+  assert.equal(existsSync(lock), false);
+  console.log("PASS: stop during session_start revision inspection prevents a late auto-start continuation");
+
+  const configPath = join(cwd, ".pi", "board-agent.yml");
+  const configBytes = readFileSync(configPath);
+  const changedMetadata = deferred();
+  metadataWait = changedMetadata.promise;
+  const changingStart = invoke("run");
+  await turn();
+  writeFileSync(configPath, configBytes.toString("utf8") + "max_workers: 3\n");
+  changedMetadata.resolve(); await changingStart;
+  metadataWait = Promise.resolve();
+  assert.equal(executors, beforeAutoStart);
+  assert.equal(existsSync(lock), false);
+  assert.ok(messages.some(m => m.includes("Configuration changed during startup")));
+  writeFileSync(configPath, configBytes);
+  console.log("PASS: configuration changed during awaited startup preflight cannot acquire an owner using a stale snapshot");
 } finally {
   drainFailure = false;
   drainWait = Promise.resolve();

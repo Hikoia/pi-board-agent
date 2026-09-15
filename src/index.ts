@@ -39,7 +39,6 @@ import {
 import {
   captureRuntimeIdentity,
   checkRuntimeRevisionAsync,
-  runtimeSettingsUnchanged,
   formatRevisionFailure,
   readRuntimeStatus,
   writeRuntimeStatus,
@@ -49,7 +48,7 @@ import {
 
 let loop: BoardLoop | null = null;
 // Retained only with this loop's owner, including incomplete cleanup.
-let loopWorktrees: { cwd: string; store: TicketWorktrees } | undefined;
+let loopWorktrees: { cwd: string; store: TicketWorktrees; configKey: string } | undefined;
 function stateRoot(cwd: string): string {
   return loopWorktrees?.cwd === resolve(cwd)
     ? loopWorktrees.store.repoRoot
@@ -93,15 +92,7 @@ function hasRecoveryState(cwd: string, root: string): boolean {
   })) return true;
   return (loopWorktrees?.cwd === resolve(cwd)
     ? loopWorktrees.store
-    : new TicketWorktrees(cwd))
-    .list()
-    .some(
-      (record) =>
-        record.activeRunId !== undefined ||
-        record.launchingAt !== undefined ||
-        record.finalization !== undefined ||
-        record.schemaVersion === 3 || record.integration !== undefined || record.retry !== undefined,
-    );
+    : new TicketWorktrees(cwd)).list().length > 0;
 }
 
 function statusPrefix(level: "info" | "warn" | "error"): string {
@@ -110,6 +101,7 @@ function statusPrefix(level: "info" | "warn" | "error"): string {
   return "✓";
 }
 
+// Startup and explicit lint only; never called by UI, heartbeat or ticket admission.
 async function currentRevision(cwd: string): Promise<RevisionCheck> {
   const check = await checkRuntimeRevisionAsync(
     cwd,
@@ -117,7 +109,10 @@ async function currentRevision(cwd: string): Promise<RevisionCheck> {
     undefined,
     () => revisionLatch.mismatch,
   );
-  if (!check.ok) revisionLatch.mismatch = true;
+  if (!check.ok) {
+    revisionLatch.mismatch = true;
+    loop?.disableAdmissions();
+  }
   lastRevisionCheck = check;
   return check;
 }
@@ -125,11 +120,12 @@ async function currentRevision(cwd: string): Promise<RevisionCheck> {
 function saveRuntime(
   ctx: ExtensionContext,
   state: RuntimeState,
-  check: RevisionCheck,
+  check = lastRevisionCheck,
   root = stateRoot(ctx.cwd),
 ): void {
   // Unsupported state is a read-only failure, including status/shutdown paths.
   if (
+    !check ||
     findUnsupportedState(ctx.cwd, root).length ||
     ownerLockHeldByOther(ctx.cwd, root)
   )
@@ -146,10 +142,10 @@ function saveRuntime(
   });
 }
 
-function liveRuntimeState(check: RevisionCheck): RuntimeState {
+function liveRuntimeState(check = lastRevisionCheck): RuntimeState {
   // No new runtime schema: recovery-only includes a retained cleanup owner.
   if (loop?.isStopping()) return "recovery-only";
-  if (!check.ok)
+  if (check && !check.ok)
     return loop?.isRunning() ? "recovery-only" : "version-mismatch";
   if (!loop?.isRunning()) return "stopped";
   return loop.isAdmittingNewWork() ? "running" : "recovery-only";
@@ -164,6 +160,13 @@ async function requireCurrentRevision(
   return check;
 }
 
+function assertLoopConfiguration(configKey: string): void {
+  if (loop?.isRunning() && loopWorktrees?.configKey !== configKey) {
+    loop.disableAdmissions();
+    throw new Error("Configuration/Project metadata changed; stop successfully, lint, then run a new loop.");
+  }
+}
+
 // Start the autonomous loop (shared by /board-agent run, auto_start, and recovery).
 async function startBoardLoop(
   ctx: ExtensionContext,
@@ -175,28 +178,9 @@ async function startBoardLoop(
     throw new Error("Loop cleanup is pending; retry stop before starting again.");
   const root = stateRoot(cwd);
   assertSafeStateDirectories(cwd, root);
-  const preflight = await currentRevision(cwd);
-  if (!preflight.ok && admitNewWork) {
-    saveRuntime(
-      ctx,
-      loop?.isRunning() ? "recovery-only" : "version-mismatch",
-      preflight,
-    );
-    throw new Error(formatRevisionFailure(preflight));
-  }
-  // Cached-loop promotion must validate today's config too, not just its old snapshot.
   const cfg = loadContextConfig(ctx);
   validateConfig(cfg);
-  saveRuntime(
-    ctx,
-    preflight.ok ? liveRuntimeState(preflight) : "recovery-only",
-    preflight,
-  );
-  if (!preflight.ok)
-    ctx.ui.notify(
-      `[board-agent] ${formatRevisionFailure(preflight)} Recovery only.`,
-      "warning",
-    );
+  let preflight: RevisionCheck | undefined;
 
   let ownerLock: ReturnType<typeof acquireOwnerLock> | undefined;
   let nextLoop: BoardLoop | undefined;
@@ -211,14 +195,30 @@ async function startBoardLoop(
       cfg.type_field,
     );
     validateProjectMetadata(meta, cfg);
+    // Inspect only at startup, after remote preflight. No permission is carried
+    // across that await: stop and the process mismatch latch are checked below.
+    preflight = await currentRevision(cwd);
     if (generation !== stopGeneration)
       throw new Error("Startup cancelled by stop/shutdown.");
     assertSafeStateDirectories(cwd, root);
+    if (JSON.stringify(loadConfig(cwd)) !== JSON.stringify(cfg)) {
+      loop?.disableAdmissions();
+      throw new Error("Configuration changed during startup; retry after a successful stop.");
+    }
+    const configKey = JSON.stringify([cfg, meta, repoOwner, repoName, botLogin]);
+    assertLoopConfiguration(configKey);
+    saveRuntime(ctx, liveRuntimeState(preflight), preflight, root);
+    if (!preflight.ok) {
+      if (admitNewWork) throw new Error(formatRevisionFailure(preflight));
+      ctx.ui.notify(`[board-agent] ${formatRevisionFailure(preflight)} Recovery only.`, "warning");
+    }
     // Promotion is an admission too: validate metadata before using a cached loop.
     if (loop?.isRunning()) {
       if (admitNewWork && !loop.isAdmittingNewWork()) {
         loop.enableAdmissions();
         await loop.tickNow();
+        if (generation !== stopGeneration || !loop?.isAdmittingNewWork())
+          throw new Error("Promotion cancelled by stop/shutdown or failed preflight.");
         ctx.ui.notify(
           `[board-agent] Recovery loop promoted to autonomous mode.`,
           "info",
@@ -279,22 +279,10 @@ async function startBoardLoop(
       );
       updateWidget();
     };
-    const revisionCheck = async () => {
-      const check = await currentRevision(cwd);
-      saveRuntime(
-        ctx,
-        liveRuntimeState(check),
-        check,
-        root,
-      );
-      return {
-        ok: check.ok,
-        reason: check.ok ? undefined : formatRevisionFailure(check),
-      };
-    };
-    const onTick = async () => {
+    const onTick = () => {
       updateWidget();
-      await revisionCheck();
+      // Heartbeat freshness is liveness, not a new package checkout inspection.
+      saveRuntime(ctx, liveRuntimeState(), lastRevisionCheck, root);
     };
 
     const executor = createProductionTicketExecutor({
@@ -322,15 +310,6 @@ async function startBoardLoop(
       botLogin,
       meta,
       callback,
-      revisionCheck,
-      revisionCheckNow: () => {
-        if (!runtimeSettingsUnchanged(cwd, loadedRuntimeIdentity))
-          revisionLatch.mismatch = true;
-        return {
-          ok: !revisionLatch.mismatch,
-          reason: "Package revision/settings changed; restart is required.",
-        };
-      },
       onTick,
     };
     loopState = createLoopState();
@@ -343,7 +322,7 @@ async function startBoardLoop(
       admitNewWork,
     );
     loop = nextLoop;
-    loopWorktrees = { cwd: resolve(cwd), store: worktrees };
+    loopWorktrees = { cwd: resolve(cwd), store: worktrees, configKey };
     await nextLoop.start();
     if (
       generation !== stopGeneration ||
@@ -401,6 +380,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (loop?.isStopping()) return;
     clearBoardWidget(ctx);
+    const generation = stopGeneration;
     runtimeStartedAt = new Date().toISOString();
     try {
       // Do this before even the heartbeat write, not only inside recovery discovery.
@@ -416,6 +396,7 @@ export default function (pi: ExtensionAPI) {
         revisionLatch.mismatch = true;
       }
       const revision = await currentRevision(ctx.cwd);
+      if (generation !== stopGeneration) return;
       saveRuntime(ctx, revision.ok ? "stopped" : "version-mismatch", revision);
       const recovery = hasRecoveryState(ctx.cwd, root);
       if (cfg.auto_start && revision.ok && !loop?.isRunning()) {
@@ -426,6 +407,7 @@ export default function (pi: ExtensionAPI) {
         throw new Error(formatRevisionFailure(revision));
       }
     } catch (error: any) {
+      loop?.disableAdmissions();
       ctx.ui.notify(
         `[board-agent] Startup/recovery failed: ${error.message}`,
         "error",
@@ -480,12 +462,14 @@ export default function (pi: ExtensionAPI) {
           cfg.type_field,
         );
         validateProjectMetadata(meta, cfg);
+        assertLoopConfiguration(JSON.stringify([cfg, meta, repoOwner, repoName, cfg.bot_identity || login]));
         ctx.ui.notify(
           `Project #${cfg.project.number} (${projectOwner}) and target repo ${repoOwner}/${repoName}: accessible ✓`,
           "info",
         );
         ctx.ui.notify("All checks passed.", "info");
       } catch (err: any) {
+        loop?.disableAdmissions();
         ctx.ui.notify(`Lint failed: ${err.message}`, "error");
       }
     },
@@ -523,7 +507,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       try {
         const cwd = ctx.cwd;
-        const revision = await currentRevision(cwd);
+        const revision = lastRevisionCheck;
         const runtimeState = liveRuntimeState(revision);
         saveRuntime(ctx, runtimeState, revision);
         const runtime = readRuntimeStatus(cwd);
@@ -560,10 +544,10 @@ export default function (pi: ExtensionAPI) {
 
         const lines = [
           `Board ${projectOwner}/#${cfg.project.number}  (repo=${repoOwner}/${repoName})`,
-          `Revision: state=${runtime?.state ?? runtimeState} pid=${runtime?.pid ?? process.pid}`,
-          `  expected=${revision.expectedRevision ?? "missing"}`,
-          `  loaded=${revision.loadedRevision ?? "unknown"}`,
-          `  disk=${revision.diskRevision ?? "unknown"} dirty=${revision.dirty ? "yes" : "no"}`,
+          `Revision (last startup/lint check; not live): state=${runtime?.state ?? runtimeState} pid=${runtime?.pid ?? process.pid}`,
+          `  expected=${revision?.expectedRevision ?? loadedRuntimeIdentity.expectedRevisionAtLoad ?? "missing"}`,
+          `  loaded=${revision?.loadedRevision ?? loadedRuntimeIdentity.loadedRevision ?? "unknown"}`,
+          `  disk=${revision?.diskRevision ?? "unchecked"} dirty=${revision ? (revision.dirty ? "yes" : "no") : "unchecked"}`,
           `  columns: ${Object.entries(colCounts)
             .map(([k, v]) => `${k}(${v})`)
             .join("  ")}`,
@@ -606,6 +590,7 @@ export default function (pi: ExtensionAPI) {
       try {
         await startBoardLoop(ctx);
       } catch (err: any) {
+        loop?.disableAdmissions();
         ctx.ui.notify(`[board-agent] Failed to start: ${err.message}`, "error");
       }
     },
@@ -618,7 +603,7 @@ export default function (pi: ExtensionAPI) {
       stopGeneration++;
       if (!loop) {
         clearBoardWidget(ctx);
-        saveRuntime(ctx, "stopped", await currentRevision(ctx.cwd));
+        saveRuntime(ctx, "stopped");
         ctx.ui.notify("No loop is running.", "warning");
         return;
       }
@@ -639,8 +624,7 @@ export default function (pi: ExtensionAPI) {
           loopWorktrees = undefined;
         }
         if (!loop) clearBoardWidget(ctx);
-        const revision = await currentRevision(ctx.cwd);
-        saveRuntime(ctx, liveRuntimeState(revision), revision);
+        saveRuntime(ctx, liveRuntimeState());
       }
     },
   });
@@ -681,8 +665,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (!loop) clearBoardWidget(ctx);
       try {
-        const revision = await currentRevision(ctx.cwd);
-        saveRuntime(ctx, liveRuntimeState(revision), revision);
+        saveRuntime(ctx, liveRuntimeState());
       } catch (error: any) {
         ctx.ui.notify(
           `[board-agent] Runtime status update failed: ${error.message}`,

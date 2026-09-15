@@ -127,13 +127,15 @@ try {
   await loop.stop();
   assert.ok([...runs.values()].every((run) => run.status === "paused"));
   executor = makeExecutor();
-  loop = new BoardLoop(deps, createLoopState(), executor, worktrees);
+  loop = new BoardLoop(deps, createLoopState(), executor, worktrees, undefined, false);
   assert.equal(executor.activeCount(), 3, "restored excess runs already own slots");
   await loop.tickNow();
-  assert.equal(resumes, 3);
+  assert.equal(resumes, 3, "disabled new admissions must not prevent owned paused-run recovery");
+  assert.equal(loop.isAdmittingNewWork(), false);
   assert.equal(executor.activeCount(), 3);
   assert.equal(starts, 3);
   assert.equal(stops, 0, "recovery does not evict excess runs to meet the new cap");
+  loop.enableAdmissions();
   for (const [index, run] of [...runs.values()].entries()) {
     const args = run.args as { itemId: string; taskKey: string };
     run.status = "completed";
@@ -143,7 +145,7 @@ try {
   }
   assert.equal(executor.activeCount(), 1);
   assert.equal(stops, 3, "each terminal builder is drained before releasing its slot");
-  console.log("PASS: excess recovered builders resume within retained slots without eviction; new admissions wait until enough slots drain");
+  console.log("PASS: excess owned paused builders resume with new admissions disabled; promotion waits for enough retained slots to drain without eviction");
 } finally {
   contextRelease.resolve();
   brokenManagerRead = unreadable = false;

@@ -3,6 +3,10 @@
 # Lives at `.pi/board-agent.yml` in your project (or `~/.pi/board-agent.yml` for
 # defaults across projects — project-level overrides global). All fields are
 # optional unless marked REQUIRED.
+# Only Task Issues in the configured origin repository execute; AI review is always on.
+# After config/Project changes: stop successfully, lint, then run a new loop.
+# Package upgrades additionally require a new Pi process. Coherence is checked at
+# startup/deployment/lint, never by heartbeat/UI/ordinary model admission polling.
 
 # ── GitHub Project (v2) ─────────────────────────────────────────────────────
 project:
@@ -48,8 +52,11 @@ branches:
   # Branch prefix for short-lived per-Issue task branches (`task/issue-42`).
   task_prefix: "task/"
 
-# New integrations always preserve task history with a normal merge.
-# Old files containing "squash" are normalized to "merge" with a warning.
+# New integrations always preserve task history with a normal two-parent merge.
+# The base must permit merge commits and ordinary bot pushes (no PR/force fallback).
+# User validates open Done and manually closes before merge/push and safe cleanup.
+# Old files containing "squash" are normalized to "merge" with a warning;
+# recorded old squash results are adopted, not rewritten.
 task_merge_strategy: "merge"
 
 # ── Builder execution ───────────────────────────────────────────────────────
@@ -78,7 +85,9 @@ context:
 # ── AI review gate (always enabled) ─────────────────────────────────────────
 # PASS → Done (Issue stays open for manual validation).
 # FAIL → Ready on the same branch/worktree. Technical review failures retry review.
-# Only a concrete missing human decision goes to Needs Human; manual Ready resumes.
+# Only a complete missing human decision goes to Needs Human. A trusted reply alone
+# does not resume: manually move to Ready too. Technical failures retry by stage;
+# unfinished comment/status/reopen/release I/O settles before another model.
 # Close the reviewed Done Issue to approve merge/push and safe task cleanup.
 review:
   timeout_ms: 600000 # per-review agent timeout (10 min)

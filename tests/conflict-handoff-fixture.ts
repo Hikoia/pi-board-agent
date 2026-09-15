@@ -90,8 +90,7 @@ export async function fixture(conflict = true) {
     notices: string[] = [];
   const warnings: Array<{ source: "executor" | "loop"; message: string }> = [];
   let hook: (event: string) => void | Promise<void> = () => {},
-    calls = 0,
-    revision = true;
+    calls = 0;
   const io = async (name: string, action: () => void) => {
     events.push(name);
     await hook(`before:${name}`);
@@ -223,8 +222,6 @@ export async function fixture(conflict = true) {
           notices.push(s);
           if (level === "warn") warnings.push({ source: "loop", message: s });
         },
-        revisionCheck: () => ({ ok: revision }),
-        revisionCheckNow: () => ({ ok: revision }),
         listCards: async () => structuredClone(cards),
         review: (input) => review!(input),
         boardOps: {
@@ -272,9 +269,6 @@ export async function fixture(conflict = true) {
     },
     setBuilder: (b: Builder) => {
       builder = b;
-    },
-    setRevision: (v: boolean) => {
-      revision = v;
     },
     setReview: (value: LoopDeps["review"]) => {
       review = value;

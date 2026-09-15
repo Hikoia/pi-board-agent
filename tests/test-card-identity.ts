@@ -378,7 +378,6 @@ console.log(
       ...deps([closed]),
       cwd: finalizationRoot,
       cfg: { ...cfg, safety: { ...cfg.safety, require_clean_worktree: true } },
-      revisionCheck: () => ({ ok: false }),
     },
     createLoopState(),
     recoveryExecutor,
@@ -388,7 +387,7 @@ console.log(
   ).tickNow();
   assert.deepEqual(events, ["reconcile", "finalize:42"]);
   console.log(
-    "PASS: closed Done reaches executor finalization before dirty/admission/revision gates (adapter routing, not a Git merge E2E)",
+    "PASS: closed Done reaches executor finalization before dirty/new-admission gates (adapter routing, not a Git merge E2E)",
   );
 }
 for (const skip_closed_issues of [true, false]) {

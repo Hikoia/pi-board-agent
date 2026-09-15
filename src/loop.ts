@@ -20,7 +20,7 @@ import { persistTicketNotice, settleTicketNotice, ticketCardKey, TicketChangedEr
 import type { TicketExecutor } from "./ticket-executor.js";
 import { TicketWorktrees } from "./ticket-worktree.js";
 import { buildTasksForWave } from "./workflow-prompt.js";
-import type { OwnerLock } from "./owner-lock.js";
+import { ownerLockIsHeld, type OwnerLock } from "./owner-lock.js";
 import { assertSafeStateDirectories, assertSupportedState } from "./unsupported-state.js";
 
 export type StatusCallback = (
@@ -52,12 +52,6 @@ export interface LoopDeps {
   meta: ProjectMetadata;
   callback: StatusCallback;
   onTick?: () => void | Promise<void>;
-  revisionCheck?: () =>
-    | { ok: boolean; reason?: string }
-    | Promise<{ ok: boolean; reason?: string }>;
-  /** Synchronous local settings/latch check after the last awaited observation.
-   * Must not initiate async Git or reuse a display/capacity observation. */
-  revisionCheckNow?: () => { ok: boolean; reason?: string };
   /** Offline adapters; production uses gh.ts and runReview. */
   listCards?: () => Promise<Card[]>;
   boardOps?: LoopBoardOps;
@@ -152,8 +146,8 @@ export class BoardLoop {
         this.deps.callback(`tick failed: ${error.message}`, "error");
       if (this.currentTick) {
         if (this.heartbeat) return;
-        this.heartbeat = this.revisionAllowsNewWork()
-          .then(() => undefined)
+        this.heartbeat = Promise.resolve()
+          .then(() => this.deps.onTick?.())
           .catch(failed)
           .finally(() => {
             this.heartbeat = null;
@@ -184,41 +178,25 @@ export class BoardLoop {
   }
 
   enableAdmissions(): void {
-    if (!this.foreground.signal.aborted) this.admitNewWork = true;
+    if (this.canContinueWork()) this.admitNewWork = true;
   }
 
-  private async revisionAllowsNewWork(): Promise<boolean> {
-    if (this.foreground.signal.aborted) return false;
-    return this.applyRevisionCheck(await this.deps.revisionCheck?.());
-  }
-
-  private admissionStillAllowed(): boolean {
-    return (
-      this.applyRevisionCheck(this.deps.revisionCheckNow?.()) &&
-      this.admitNewWork
-    );
-  }
-
-  private applyRevisionCheck(revision?: {
-    ok: boolean;
-    reason?: string;
-  }): boolean {
-    if (this.foreground.signal.aborted) return false;
-    if (!revision || revision.ok) return true;
-    const wasAdmitting = this.admitNewWork;
+  disableAdmissions(): void {
     this.admitNewWork = false;
-    if (wasAdmitting)
-      this.deps.callback(
-        revision.reason ??
-          "Package revision changed; continuing recovery without new work.",
-        "error",
-      );
-    return false;
+  }
+
+  private canContinueWork(): boolean {
+    return !this.foreground.signal.aborted && (!this.ownerLock || ownerLockIsHeld(this.ownerLock));
+  }
+
+  /** Synchronous final veto after awaited preparation/card reads; no package I/O. */
+  private admissionStillAllowed(): boolean {
+    return this.canContinueWork() && this.admitNewWork;
   }
 
   async tickNow(): Promise<void> {
     if (this.currentTick) return this.currentTick;
-    if (this.foreground.signal.aborted) return;
+    if (!this.canContinueWork()) return;
     const running = this.tick().finally(() => {
       if (this.currentTick === running) this.currentTick = null;
     });
@@ -287,10 +265,11 @@ export class BoardLoop {
   }
 
   private async currentCard(expected: Card, claimed = true): Promise<Card> {
-    if (!(await this.revisionAllowsNewWork()) || !this.admitNewWork)
+    if (!this.admissionStillAllowed())
       throw new StaleCardError("Admissions stopped; preserving pending work.");
     const fresh = await this.boardOps().refresh(expected);
     if (
+      !this.admissionStillAllowed() ||
       !sameOpenCard(fresh, expected) ||
       fresh.assignees.some(
         (assignee) =>
@@ -331,8 +310,7 @@ export class BoardLoop {
     run: () => Promise<T>,
   ): Promise<T | undefined> {
     if (
-      !(await this.revisionAllowsNewWork()) ||
-      !this.admitNewWork ||
+      !this.admissionStillAllowed() ||
       this.state.foreground ||
       !this.hasModelSlot()
     )
@@ -340,7 +318,7 @@ export class BoardLoop {
     this.state.foreground = foreground;
     try {
       const pending = run();
-      // onTick can now await Git: handle an early model rejection immediately,
+      // Handle an early model rejection while an async observer is pending,
       // but still propagate it through the awaited drain below.
       void pending.catch(() => undefined);
       let result: T;
@@ -367,17 +345,17 @@ export class BoardLoop {
     try {
       const { cfg, callback, repoOwner, repoName } = this.deps;
       const cards = await this.fetchCards();
-      if (this.foreground.signal.aborted) return;
+      if (!this.canContinueWork()) return;
       const summary = await this.executor.reconcile(
         cards,
-        async () => (await this.revisionAllowsNewWork()) && this.admitNewWork,
-        () => this.admissionStillAllowed(),
+        () => this.canContinueWork(),
+        () => this.canContinueWork(),
       );
-      if (this.foreground.signal.aborted) return;
-      // Closed/Done is durable recovery, not a new admission (also on dirty/revision latch).
+      if (!this.canContinueWork()) return;
+      // Owned runs and closed/Done are recovery, independent of new admissions.
       const handledItemIds = new Set(summary.handledItemIds ?? []);
       await this.processClosedDoneCards(cards.filter((card) => !handledItemIds.has(card.itemId)), blockers);
-      if (!(await this.revisionAllowsNewWork()) || !this.admitNewWork) return;
+      if (!this.admissionStillAllowed()) return;
       if (cards.length === 0) {
         callback("No cards on the board yet.");
         return;
@@ -417,8 +395,7 @@ export class BoardLoop {
         for (const card of readyCandidates) {
           if (
             launched >= limit ||
-            !(await this.revisionAllowsNewWork()) ||
-            !this.admitNewWork
+            !this.admissionStillAllowed()
           )
             break;
           if (!this.hasModelSlot(reserved)) break;
@@ -427,8 +404,7 @@ export class BoardLoop {
           const result = await this.executor.launch(
             card,
             card.plan ? planSlug(card.plan) : undefined,
-            async () =>
-              (await this.revisionAllowsNewWork()) && this.admitNewWork,
+            () => this.admissionStillAllowed(),
             () => this.admissionStillAllowed(),
           );
           if (result.status !== "launched") continue;
@@ -600,7 +576,7 @@ export class BoardLoop {
             ["integrate", "cleanup"].includes(this.ticketWorktrees.read(card.itemId)?.retry?.stage ?? ""))) &&
         isTargetIssue(card, repoOwner, repoName, "Task"),
     );
-    if (!candidates.length || this.foreground.signal.aborted) return;
+    if (!candidates.length || !this.canContinueWork()) return;
     let refs: Set<string>;
     try {
       refs = await this.ticketWorktrees.localTaskRefs(cfg.branches.task_prefix);
@@ -612,7 +588,7 @@ export class BoardLoop {
       return;
     }
     for (const card of candidates) {
-      if (this.foreground.signal.aborted) return;
+      if (!this.canContinueWork()) return;
       // Absence only defers this tick. Presence still requires all fresh checks.
       if (
         !refs.has(
@@ -623,11 +599,7 @@ export class BoardLoop {
       ) {
         continue;
       }
-      const outcome = await this.executor.finalizeClosed(
-        card,
-        async () => (await this.revisionAllowsNewWork()) && this.admitNewWork,
-        () => this.admissionStillAllowed(),
-      );
+      const outcome = await this.executor.finalizeClosed(card);
       if (outcome.status === "finalized" || outcome.status === "skipped")
         blockers.delete(card.itemId);
       if (outcome.status !== "conflict" && outcome.status !== "blocked")

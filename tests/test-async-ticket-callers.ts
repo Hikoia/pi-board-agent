@@ -38,7 +38,7 @@ function fixture() {
   const card: Card = { itemId: `ASYNC_${number}`, number, contentType: "Issue", type: "Task", title: `T${number} Acceptance`, body: "Acceptance", plan: "demo", repoOwner: "owner", repoName: "repo", closed: false, status: cfg.columns.ready, assignees: [] };
   const store = new TicketWorktrees(repo);
   const writes: string[] = [], notices: string[] = [];
-  let starts = 0, revision = true, run: PersistedRunState | undefined;
+  let starts = 0, run: PersistedRunState | undefined;
   const board: TicketBoardAdapter = {
     getCard: async () => structuredClone(card),
     claim: async () => { card.assignees = ["bot"]; return true; },
@@ -52,11 +52,11 @@ function fixture() {
     pauseAndWait: async () => { if (run) run.status = "paused"; },
     stopAndWait: async () => { if (run) run.status = "aborted"; }, dispose: () => {},
   }) });
-  const loop = new BoardLoop({ cwd: repo, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo", meta: { projectId: "P", statusFieldId: "S", statusOptions: {} }, callback: (s) => notices.push(s), listCards: async () => [structuredClone(card)], revisionCheck: async () => ({ ok: revision, reason: "revision closed" }) }, createLoopState(), executor, store);
-  return { card, store, writes, notices, executor, loop, starts: () => starts, closeRevision: () => { revision = false; }, task: buildTasksForWave(cfg, "demo", [card])[0] };
+  const loop = new BoardLoop({ cwd: repo, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo", meta: { projectId: "P", statusFieldId: "S", statusOptions: {} }, callback: (s) => notices.push(s), listCards: async () => [structuredClone(card)] }, createLoopState(), executor, store);
+  return { card, store, writes, notices, executor, loop, starts: () => starts, disableAdmissions: () => loop.disableAdmissions(), task: buildTasksForWave(cfg, "demo", [card])[0] };
 }
 
-for (const change of ["unchanged", "revision", "human", "contract", "stop"]) {
+for (const change of ["unchanged", "admission", "human", "contract", "stop"]) {
   const f = fixture(), entered = deferred(), finish = deferred();
   const ensure = f.store.ensure.bind(f.store);
   let preparation: ReturnType<typeof ensure> | undefined;
@@ -72,7 +72,7 @@ for (const change of ["unchanged", "revision", "human", "contract", "stop"]) {
     await Promise.race([entered.promise, tick.then(() => { throw new Error(`tick settled before async preparation: ${f.notices.join("; ")}`); })]);
     assert.equal(f.starts(), 0);
     assert.deepEqual([...f.writes], [], "no launch status/cleanup before worktree preparation settles");
-    if (change === "revision") f.closeRevision();
+    if (change === "admission") f.disableAdmissions();
     if (change === "human") f.card.status = cfg.columns.needs_human;
     if (change === "contract") f.card.body = "Human changed acceptance during fetch";
     if (change === "stop") {
@@ -92,9 +92,9 @@ for (const change of ["unchanged", "revision", "human", "contract", "stop"]) {
       assert.deepEqual(f.card.assignees, []);
       assert.equal(f.card.status, change === "human" ? cfg.columns.needs_human : cfg.columns.ready);
       if (change === "contract" || change === "human") assert.deepEqual(f.writes, ["release"], "async preparation cannot overwrite a later human contract/state");
-      assert.equal(f.writes.includes("comment"), change === "revision" || change === "stop");
+      assert.equal(f.writes.includes("comment"), change === "admission" || change === "stop");
     }
-    console.log(`PASS: async ensure ${change} is awaited before actual-start fresh-card/revision/stop gates and recovery`);
+    console.log(`PASS: async ensure ${change} is awaited before actual-start fresh-card/admission/stop gates and recovery`);
   } finally {
     finish.resolve();
     await preparation;

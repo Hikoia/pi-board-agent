@@ -18,12 +18,11 @@ import { join } from "node:path";
 import { _DEFAULTS, type Config } from "../src/config.js";
 import type { Card } from "../src/gh.js";
 import type { BoardLoop, LoopDeps } from "../src/loop.js";
-import { acquireOwnerLock, ownerLockHeldByOther } from "../src/owner-lock.js";
+import { acquireOwnerLock, ownerLockHeldByOther, ownerLockIsHeld } from "../src/owner-lock.js";
 import {
   BOARD_AGENT_SOURCE,
   boardAgentRef,
   captureRuntimeIdentity,
-  checkRuntimeRevision as checkRuntimeRevisionSync,
   checkRuntimeRevisionAsync,
   formatRevisionFailure,
   readRuntimeStatus,
@@ -58,14 +57,12 @@ const git = (...args: string[]) =>
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
-async function revisionCheck(...args: Parameters<typeof checkRuntimeRevisionSync>) {
-  const sync = checkRuntimeRevisionSync(...args);
+async function revisionCheck(...args: Parameters<typeof checkRuntimeRevisionAsync>) {
   let timerRan = false;
   const timer = setTimeout(() => { timerRan = true; }, 0);
   try {
     const asyncCheck = await checkRuntimeRevisionAsync(...args);
-    assert.deepEqual(asyncCheck, sync, "async and sync revision identities/reasons/repair policy agree exactly");
-    assert.ok(timerRan, "live revision Git yields to timers");
+    assert.ok(timerRan, "startup revision Git yields to timers");
     return asyncCheck;
   } finally { clearTimeout(timer); }
 }
@@ -229,7 +226,7 @@ try {
   const changedOnDisk = await revisionCheck(projectRoot, loaded, agentDir);
   check(
     !changedOnDisk.ok && changedOnDisk.diskRevision !== revisionA,
-    "moving disk HEAD blocks work loaded from the old SHA",
+    "startup/lint detects disk HEAD moved from the loaded SHA",
   );
   git("reset", "--hard", revisionA);
   const restored = await revisionCheck(projectRoot, loaded, agentDir, true);
@@ -252,17 +249,17 @@ try {
   assert.equal(unavailable.ok, false);
   assert.equal(unavailable.diskRevision, null);
   assert.equal(unavailable.dirty, true);
-  console.log("PASS: failed Git inspections yield identical fail-closed sync/async decisions while timers remain responsive");
+  console.log("PASS: failed startup Git inspection is fail closed while timers remain responsive");
 
   const changingSetting = checkRuntimeRevisionAsync(projectRoot, loaded, agentDir);
   projectSettings(`${BOARD_AGENT_SOURCE}@${revisionB}`);
-  assert.deepEqual(await changingSetting, checkRuntimeRevisionSync(projectRoot, loaded, agentDir));
+  assert.equal((await changingSetting).ok, false);
   projectSettings();
   let lateLatch = false;
   const changingLatch = checkRuntimeRevisionAsync(projectRoot, loaded, agentDir, () => lateLatch);
   lateLatch = true;
-  assert.deepEqual(await changingLatch, checkRuntimeRevisionSync(projectRoot, loaded, agentDir, true));
-  console.log("PASS: async revision decision rereads settings and a concurrently closed process latch after awaiting Git");
+  assert.match((await changingLatch).reason!, /restart is required/);
+  console.log("PASS: startup revision decision rereads settings and a concurrently closed process latch after awaiting Git");
 
   const status = {
     expectedRevision: revisionA,
@@ -339,9 +336,8 @@ try {
     meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
     callback: () => undefined,
     listCards: async () => [ready],
-    revisionCheck: () => ({ ok: false, reason: "fixture mismatch" }),
   };
-  const boardLoop = new BoardLoop(deps, createLoopState(), executor);
+  const boardLoop = new BoardLoop(deps, createLoopState(), executor, undefined, undefined, false);
   loops.push(boardLoop);
   await boardLoop.tickNow();
   check(
@@ -349,7 +345,7 @@ try {
     "revision mismatch permits settlement but blocks a real target-Issue Ready candidate",
   );
   const positive = new BoardLoop(
-    { ...deps, revisionCheck: () => ({ ok: true }) },
+    deps,
     createLoopState(),
     executor,
   );
@@ -359,9 +355,8 @@ try {
     launches === 1,
     "positive control proves the same Ready candidate can actually launch",
   );
-  let allowed = true;
   const recovery = new BoardLoop(
-    { ...deps, revisionCheck: () => ({ ok: allowed }) },
+    deps,
     createLoopState(),
     executor,
     undefined,
@@ -374,12 +369,11 @@ try {
   recovery.enableAdmissions();
   await recovery.tickNow();
   assert.equal(launches, 2);
-  allowed = false;
-  recovery.enableAdmissions();
+  recovery.disableAdmissions();
   await recovery.tickNow();
   check(
     launches === 2 && !recovery.isAdmittingNewWork(),
-    "recovery requires explicit promotion, which still cannot bypass the revision gate",
+    "recovery requires explicit promotion and can be synchronously disabled without blocking settlement",
   );
 
   let releaseReconcile!: (summary: ReconcileSummary) => void;
@@ -393,9 +387,8 @@ try {
       ...deps,
       cfg: { ...cfg, tick_seconds: 1 },
       listCards: async () => [],
-      revisionCheck: () => {
+      onTick: () => {
         if (++heartbeatChecks >= 2) reachedHeartbeat();
-        return { ok: true };
       },
     },
     createLoopState(),
@@ -414,7 +407,7 @@ try {
     await heartbeat;
     check(
       heartbeatChecks >= 2,
-      "long-running ticks continue revision/heartbeat checks at a valid integer polling interval",
+      "long-running ticks continue liveness heartbeats at a valid integer polling interval",
     );
   } finally {
     clearTimeout(deadline);
@@ -430,15 +423,16 @@ try {
     /already running locally/,
   );
   check(
-    !ownerLockHeldByOther(projectRoot),
-    "same-process heartbeat recognizes its live owner lock",
+    !ownerLockHeldByOther(projectRoot) && ownerLockIsHeld(lock),
+    "same-process heartbeat and invocation authority recognize the live owner lock",
   );
   lock.release();
+  assert.equal(ownerLockIsHeld(lock), false, "missing lock revokes invocation authority");
   const replacement = acquireOwnerLock(projectRoot, "bot");
   lock.release();
   check(
-    existsSync(replacement.path),
-    "an old release token cannot remove a replacement owner's lock",
+    existsSync(replacement.path) && !ownerLockIsHeld(lock) && ownerLockIsHeld(replacement),
+    "a same-PID replacement revokes old invocation authority and an old token cannot release its lock",
   );
   replacement.release();
   const deadPid = Number(
@@ -468,6 +462,7 @@ try {
     writeFileSync(lock.path, JSON.stringify(record));
     const bytes = readFileSync(lock.path, "utf8");
     assert.equal(ownerLockHeldByOther(projectRoot), true);
+    assert.equal(ownerLockIsHeld(lock), false);
     assert.throws(() => acquireOwnerLock(projectRoot, "bot"));
     assert.equal(readFileSync(lock.path, "utf8"), bytes);
     rmSync(lock.path);

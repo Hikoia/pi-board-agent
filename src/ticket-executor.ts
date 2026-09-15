@@ -84,19 +84,15 @@ export interface TicketExecutor {
     canStartWorkNow?: () => boolean,
   ): Promise<ReconcileSummary>;
   recoveryBlocker?(itemId: string): string | undefined;
-  /** Observe revision before the final card await, then check local admission
-   * synchronously at start. The prepared launch already owns its worker slot. */
+  /** Check admission before the final card await, then synchronously at start.
+   * The prepared launch already owns its worker slot. */
   launch(
     card: Card,
     planSlug: string | undefined,
     canStartWork?: () => boolean | Promise<boolean>,
     canStartWorkNow?: () => boolean,
   ): Promise<LaunchResult>;
-  finalizeClosed(
-    card: Card,
-    canStartWork?: () => boolean | Promise<boolean>,
-    canStartWorkNow?: () => boolean,
-  ): Promise<FinalizeOutcome>;
+  finalizeClosed(card: Card): Promise<FinalizeOutcome>;
   activeCount(): number;
   /** Close launches/recovery immediately, before BoardLoop waits for its tick. */
   stopScheduling?(): void;
@@ -255,7 +251,7 @@ export function createWorkflowManagerAdapter(options: {
   };
 
   // Upstream emits synchronously before executeRun, after its settlement await.
-  // Revoke an already-admitted resume if stop/revision/local authority changed.
+  // Revoke an already-admitted resume if stop/local authority changed.
   const onResumed = ({ runId }: { runId: string }) => {
     if (stopping || (authorizeResume && !resumeChecks.get(runId)?.()))
       manager.pause(runId);
@@ -661,7 +657,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
   async launch(snapshot: Card, expectedPlan: string | undefined, canStartWork: () => boolean | Promise<boolean> = () => true,
     canStartWorkNow: () => boolean = () => true): Promise<LaunchResult> {
     if (this.stopping) return { status: "skipped", reason: "executor is stopping" };
-    this.canResume = canStartWork; this.canResumeNow = canStartWorkNow;
+    // New-launch admission must not revoke recovery authority for already-owned runs.
     let card = await this.deps.board.getCard(snapshot.itemId);
     if (!card || card.itemId !== snapshot.itemId || card.number !== snapshot.number) return { status: "skipped", reason: "issue identity changed" };
     const reason = this.eligible(card, expectedPlan); if (reason) return { status: "skipped", reason };
@@ -807,8 +803,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     return changed;
   }
 
-  async finalizeClosed(snapshot: Card, _canStartWork: () => boolean | Promise<boolean> = () => true,
-    _canStartWorkNow: () => boolean = () => true): Promise<FinalizeOutcome> {
+  async finalizeClosed(snapshot: Card): Promise<FinalizeOutcome> {
     const { worktrees, board, cfg } = this.deps;
     let expected: Card | undefined, initial: TicketExecutionRecord | undefined;
     try {

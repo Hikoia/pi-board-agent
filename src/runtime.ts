@@ -46,6 +46,7 @@ export interface RevisionCheck {
 
 export interface RuntimeStatus {
   schemaVersion: 1;
+  /** Last startup/lint observation, not a fresh package check on each heartbeat. */
   expectedRevision: string | null;
   loadedRevision: string | null;
   diskRevision: string | null;
@@ -178,23 +179,6 @@ export function resolveExpectedRevision(
   };
 }
 
-/** Local admission check only: async Git observation owns disk/dirty checking.
- * Re-read settings after the final remote await without another Git scan. */
-export function runtimeSettingsUnchanged(
-  projectRoot: string,
-  loaded: LoadedRuntimeIdentity,
-  agentDir?: string,
-): boolean {
-  const expected = resolveExpectedRevision(projectRoot, agentDir);
-  return (
-    !expected.error &&
-    FULL_GIT_SHA.test(expected.revision ?? "") &&
-    expected.revision === loaded.expectedRevisionAtLoad &&
-    expected.source === loaded.expectedSourceAtLoad &&
-    expected.error === loaded.expectedErrorAtLoad
-  );
-}
-
 const CHECKOUT_HEAD = ["rev-parse", "--show-toplevel", "HEAD"];
 const CHECKOUT_STATUS = ["status", "--porcelain", "--untracked-files=normal"];
 const checkoutOptions = (cwd: string) => ({
@@ -268,21 +252,7 @@ export function captureRuntimeIdentity(
   });
 }
 
-export function checkRuntimeRevision(
-  projectRoot: string,
-  loaded: LoadedRuntimeIdentity,
-  agentDir?: string,
-  mismatchLatched = false,
-): RevisionCheck {
-  return revisionDecision(
-    loaded,
-    resolveExpectedRevision(projectRoot, agentDir),
-    inspectPackageCheckout(loaded.packageRoot),
-    mismatchLatched,
-  );
-}
-
-/** Live gate: only Git execution differs from immutable synchronous capture. */
+/** Startup/lint only. Heartbeats and admissions reuse the checked provenance. */
 export async function checkRuntimeRevisionAsync(
   projectRoot: string,
   loaded: LoadedRuntimeIdentity,
@@ -349,7 +319,7 @@ function revisionDecision(
 }
 
 export function formatRevisionFailure(check: RevisionCheck): string {
-  return `Board Agent revision check failed (expected=${check.expectedRevision ?? "missing"}, loaded=${check.loadedRevision ?? "unknown"}, disk=${check.diskRevision ?? "unknown"}, dirty=${check.dirty ? "yes" : "no"}): ${check.reason ?? "unknown mismatch"}. Repair with \`${check.repairCommand}\`, then restart this Pi process.`;
+  return `Board Agent revision check failed (expected=${check.expectedRevision ?? "missing"}, loaded=${check.loadedRevision ?? "unknown"}, disk=${check.diskRevision ?? "unknown"}, dirty=${check.dirty ? "yes" : "no"}): ${check.reason ?? "unknown mismatch"}. Stop and drain all owners before repairing with \`${check.repairCommand}\`, then restart this Pi process.`;
 }
 
 export function runtimePath(projectRoot: string): string {

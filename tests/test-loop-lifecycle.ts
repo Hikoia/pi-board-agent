@@ -120,7 +120,7 @@ try {
   const heartbeatLoop = new BoardLoop({
     ...deps, cfg: { ...deps.cfg, tick_seconds: 1 },
     listCards: async () => { await busyRead; return []; },
-    revisionCheck: async () => { enterHeartbeat(); await heartbeatPending; return { ok: true }; },
+    onTick: async () => { if (!heartbeatLoop.isStopping()) { enterHeartbeat(); await heartbeatPending; } },
   }, createLoopState(), executor, worktrees, heartbeatOwner);
   const busyStart = heartbeatLoop.start();
   await heartbeatEntered;
@@ -130,7 +130,7 @@ try {
     finishBusyRead();
     await busyStart;
     await new Promise<void>((done) => setImmediate(done));
-    assert.equal(heartbeatStopped, false, "stop awaits a revision heartbeat already in flight");
+    assert.equal(heartbeatStopped, false, "stop awaits a liveness heartbeat already in flight");
     assert.ok(existsSync(heartbeatOwner.path), "heartbeat continuation cannot outlive ownership");
   } finally {
     finishBusyRead(); finishHeartbeat();

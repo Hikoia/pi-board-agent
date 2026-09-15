@@ -73,6 +73,16 @@ function releaseToken(path: string, token: string): void {
   }
 }
 
+/** Fresh exact token/record authority; missing, corrupt or replaced locks fail closed. */
+export function ownerLockIsHeld(owner: OwnerLock): boolean {
+  try {
+    const current = readOwnerLock(owner.path);
+    return current.pid === process.pid && Object.entries(owner.record).every(
+      ([key, value]) => current[key as keyof OwnerLockRecord] === value,
+    );
+  } catch { return false; }
+}
+
 /** Keep non-owner Pi processes from overwriting the active owner's runtime heartbeat. */
 export function ownerLockHeldByOther(
   cwd: string,

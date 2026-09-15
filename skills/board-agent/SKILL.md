@@ -1,14 +1,16 @@
 ---
 name: board-agent
-description: Builder procedure for implementing one GitHub Project ticket in its persistent task worktree, committing and pushing the task branch for review and manual validation. Use when the orchestrator asks you to implement task T### for a plan.
+description: Implement one Task Issue in its persistent Board Agent worktree, including partial-work or merge-conflict retries. Use when the orchestrator supplies a ticket mission; commit and push only its task branch for AI review and human validation.
 compatibility: "Requires gh CLI auth with project scope, git, and a persistent ticket worktree prepared by pi-board-agent."
 ---
 
 # Board Agent Builder
 
-Implement exactly one Issue in the persistent worktree prepared by Board Agent.
-Push only its `task/issue-<number>` branch. Board Agent reviews the pushed SHA;
-a human later closes the Issue to approve integration into the configured base.
+Implement exactly one Task Issue in the persistent worktree prepared by Board
+Agent. Plan is optional grouping, not a prerequisite. Push only the supplied
+task branch (`task/issue-<number>` by default). AI review always checks its pushed
+SHA; Done remains open until a human validates and manually closes the Issue.
+Board Agent then performs the normal merge/push and safe cleanup.
 
 ## State at entry
 
@@ -41,7 +43,7 @@ accessibility, and the smallest relevant regression check.
 
    ```bash
    git status --short
-   git branch --show-current   # must equal task/issue-<issue-number>
+   git branch --show-current   # must equal the supplied task branch
    git remote get-url origin
    git rev-parse HEAD
    ```
@@ -85,8 +87,10 @@ accessibility, and the smallest relevant regression check.
    git push -u origin task/issue-<issue-number>
    ```
 
-   Do not merge, close the Issue, delete refs/worktrees, or force-push. Report
-   success only after the exact task branch is pushed and clean.
+   Use the supplied branch name if the prefix is customized. Never merge into
+   base, close the Issue, delete refs/worktrees, or force-push. Merging base into
+   the task for conflict recovery is permitted. Report success only after the
+   exact task branch is pushed and clean.
 
 6. **Return one outcome object**
 

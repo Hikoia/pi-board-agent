@@ -15,12 +15,6 @@ import {
   TicketWorktrees,
   type TicketExecutionRecord,
 } from "../src/ticket-worktree.js";
-import {
-  BOARD_AGENT_SOURCE,
-  captureRuntimeIdentity,
-  checkRuntimeRevisionAsync,
-  runtimeSettingsUnchanged,
-} from "../src/runtime.js";
 
 const root = process.env.TMP_DIR!;
 assert.ok(root, "Run via bash tests/run-offline.sh");
@@ -40,32 +34,11 @@ git(repo, "remote", "add", "origin", origin);
 git(repo, "push", "origin", "main");
 const cfg = structuredClone(_DEFAULTS);
 cfg.max_workers = 1;
-cfg.tick_seconds = 0.01; // Only the latch case uses start(): poll while context is held.
+cfg.tick_seconds = 9999;
 cfg.safety.require_clean_worktree =
   cfg.context.enabled =
   cfg.telegram.enabled = false;
 const worktrees = new TicketWorktrees(repo);
-const packageRoot = join(root, "package");
-mkdirSync(packageRoot);
-const packageGit = (...args: string[]) =>
-  execFileSync("git", args, {
-    cwd: packageRoot,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
-packageGit("init", "-b", "main");
-packageGit("config", "user.name", "Offline");
-packageGit("config", "user.email", "offline@example.test");
-writeFileSync(join(packageRoot, "fixture.txt"), "loaded");
-packageGit("add", ".");
-packageGit("commit", "-m", "fixture");
-const packageSha = packageGit("rev-parse", "HEAD");
-const settingsPath = join(process.env.PI_CODING_AGENT_DIR!, "settings.json");
-writeFileSync(
-  settingsPath,
-  JSON.stringify({ packages: [`${BOARD_AGENT_SOURCE}@${packageSha}`] }),
-);
-const identity = captureRuntimeIdentity(packageRoot, repo);
 const deferred = () => {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => {
@@ -90,28 +63,22 @@ async function check(change: string, patch?: Partial<Card>) {
     status: cfg.columns.ready,
   };
   let card: Card | undefined = structuredClone(original);
-  let revision = true,
-    starts = 0,
+  let starts = 0,
     unreadable = false,
     failRelease = false,
     contextDone = false,
-    managerCreated = false,
     lateReads = 0;
   let run: PersistedRunState | undefined;
   let contextRecord: TicketExecutionRecord | undefined;
   const entered = deferred(),
-    finish = deferred(),
-    latched = deferred();
+    finish = deferred();
   const readEntered = deferred(),
-    readFinish = deferred(),
-    revisionEntered = deferred(),
-    revisionFinish = deferred();
+    readFinish = deferred();
   const writes: string[] = [],
     releases: Card[] = [],
     notices: string[] = [];
   const callback = (message: string) => {
     notices.push(message);
-    if (message === "revision closed") latched.resolve();
   };
   const board: TicketBoardAdapter = {
     getCard: async () => {
@@ -159,7 +126,6 @@ async function check(change: string, patch?: Partial<Card>) {
       return "offline context";
     },
     createManager: () => {
-      managerCreated = true;
       return {
       start: (_script, args) => {
         starts++;
@@ -189,27 +155,13 @@ async function check(change: string, patch?: Partial<Card>) {
       meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
       callback,
       listCards: async () => [structuredClone(original)],
-      // Same split as production: async disk observation, synchronous current
-      // local settings/revision latch after the final board read.
-      revisionCheckNow: () => ({
-        ok: revision && runtimeSettingsUnchanged(repo, identity),
-        reason: "revision closed",
-      }),
-      revisionCheck: async () => {
-        if (managerCreated && change === "card-during-revision") {
-          revisionEntered.resolve();
-          await revisionFinish.promise;
-        }
-        return change.includes("async")
-          ? checkRuntimeRevisionAsync(repo, identity)
-          : { ok: revision, reason: "revision closed" };
-      },
+
     },
     state,
     executor,
     worktrees,
   );
-  const tick = change.startsWith("revision-latched") ? loop.start() : loop.tickNow();
+  const tick = loop.tickNow();
   let stopping: Promise<void> | undefined;
   try {
     await Promise.race([
@@ -240,35 +192,14 @@ async function check(change: string, patch?: Partial<Card>) {
     assert.ok(record.launchingAt);
     assert.deepEqual(writes, [cfg.columns.building]);
     writes.length = 0;
-    if (change === "revision-async-disk") {
-      writeFileSync(join(packageRoot, "fixture.txt"), "different revision");
-      packageGit("add", ".");
-      packageGit("commit", "-m", "changed fixture");
-    } else if (change === "revision-async-dirty") {
-      writeFileSync(join(packageRoot, "dirty.txt"), "dirty package");
-    } else if (change === "revision" || change === "revision-latched")
-      revision = false;
+    if (change === "admission") loop.disableAdmissions();
     else if (change === "missing") card = undefined;
     else if (change === "read-error") unreadable = true;
     else if (patch) Object.assign(card!, patch);
-    if (change === "revision-latched") {
-      await latched.promise; // Public start() polls revision without starting a second tick.
-      assert.equal(loop.isAdmittingNewWork(), false);
-      revision = true; // A fresh ok check at invocation must NOT erase the latch.
-    }
     if (change === "release-error") failRelease = true;
     if (change === "stop-human") stopping = loop.stop();
     let before = structuredClone(card);
     finish.resolve();
-    if (change === "card-during-revision") {
-      await Promise.race([
-        revisionEntered.promise,
-        tick.then(() => { throw new Error("final async revision not reached"); }),
-      ]);
-      Object.assign(card!, { status: cfg.columns.backlog, body: "Withdrawn contract", assignees: ["human"] });
-      before = structuredClone(card);
-      revisionFinish.resolve();
-    }
     if (change.endsWith("during-read")) {
       await Promise.race([
         readEntered.promise,
@@ -276,19 +207,16 @@ async function check(change: string, patch?: Partial<Card>) {
           throw new Error("actual-start fresh read not reached");
         }),
       ]);
-      if (change.includes("revision-settings"))
-        writeFileSync(settingsPath, JSON.stringify({ packages: [`${BOARD_AGENT_SOURCE}@${"b".repeat(40)}`] }));
-      else if (change === "stop-during-read") {
+      if (change === "stop-during-read" || change === "stop-final-during-read") {
         Object.assign(card!, { status: cfg.columns.backlog, body: "Withdrawn during stop" });
         before = structuredClone(card);
         stopping = loop.stop();
-      } else {
-        revision = false;
-        if (change.startsWith("revision-latched")) {
-          await latched.promise;
-          revision = true;
-        }
-      }
+      } else if (change.startsWith("record-")) {
+        worktrees.setActiveRun(original.itemId, "replacement-run");
+      } else if (change.startsWith("card-")) {
+        Object.assign(card!, { status: cfg.columns.backlog, body: "Withdrawn contract", assignees: ["human"] });
+        before = structuredClone(card);
+      } else loop.disableAdmissions();
       readFinish.resolve();
     }
     const error = await tick.then(
@@ -310,7 +238,7 @@ async function check(change: string, patch?: Partial<Card>) {
       assert.equal(worktrees.read(original.itemId)?.activeRunId, "run-1");
       assert.deepEqual(releases, []);
       assert.deepEqual(writes, []);
-    } else if (change.startsWith("revision")) {
+    } else if (change.startsWith("admission")) {
       assert.equal(loop.isAdmittingNewWork(), false);
       assert.equal(card!.status, cfg.columns.ready);
       assert.deepEqual(writes, ["comment", cfg.columns.ready]);
@@ -318,13 +246,16 @@ async function check(change: string, patch?: Partial<Card>) {
       assert.equal(releases.length, 1);
       assert.deepEqual(card!.assignees, []);
       assert.equal(worktrees.read(original.itemId)?.launchingAt, undefined);
-      revision = true;
       await loop.tickNow();
       assert.equal(
         starts,
         0,
-        "a later healthy revision cannot reopen the admission latch",
+        "a later tick cannot reopen disabled admissions",
       );
+    } else if (change.startsWith("record-")) {
+      assert.equal(worktrees.read(original.itemId)?.activeRunId, "replacement-run");
+      assert.deepEqual(writes, [], "replaced execution cannot authorize stale settlement");
+      assert.deepEqual(releases, []);
     } else if (change === "read-error") {
       assert.match(
         error?.message ?? notices.join("\n"),
@@ -430,37 +361,28 @@ async function check(change: string, patch?: Partial<Card>) {
   } finally {
     finish.resolve();
     readFinish.resolve();
-    revisionFinish.resolve();
     unreadable = failRelease = false;
     await tick.catch(() => {});
     await loop.stop();
     // Reuse only the disposable fixture's persistent worktree across scenarios.
     worktrees.clearExecution(original.itemId);
     worktrees.update(original.itemId, (record) => ({ ...record, retry: undefined })); // independent fixture case, not production settlement
-    writeFileSync(settingsPath, JSON.stringify({ packages: [`${BOARD_AGENT_SOURCE}@${packageSha}`] }));
-    if (change.includes("async")) {
-      packageGit("reset", "--hard", packageSha);
-      rmSync(join(packageRoot, "dirty.txt"), { force: true });
-    }
+
   }
 }
 
 const failures: unknown[] = [];
 for (const [change, patch] of [
   ["unchanged"],
-  ["unchanged-async"],
-  ["revision-async-disk"],
-  ["revision-async-dirty"],
-  ["revision"],
-  ["revision-latched"],
-  ["revision-during-read"],
-  ["revision-settings-during-read"],
-  ["revision-latched-during-read"],
-  ["revision-final-during-read"],
-  ["revision-settings-final-during-read"],
-  ["revision-latched-final-during-read"],
+  ["admission"],
+  ["admission-during-read"],
+  ["admission-final-during-read"],
   ["stop-during-read"],
-  ["card-during-revision"],
+  ["stop-final-during-read"],
+  ["card-during-read"],
+  ["card-final-during-read"],
+  ["record-during-read"],
+  ["record-final-during-read"],
   ["missing"],
   ["read-error"],
   ["release-error", { status: cfg.columns.needs_human }],

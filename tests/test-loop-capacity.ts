@@ -109,7 +109,6 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
   let occupied = 0,
     models = 0,
     peak = 0;
-  let revision = true;
   const entered = deferred(),
     finish = deferred();
   const state = createLoopState();
@@ -167,7 +166,6 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
     callback: () => {},
     listCards: async () => structuredClone(cards),
     boardOps: board,
-    revisionCheck: () => ({ ok: revision }),
     review: () => model("review"),
   };
   const loop = new BoardLoop(deps, state, executor, worktrees);
@@ -184,9 +182,6 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
     peak: () => peak,
     setOccupied: (count: number) => {
       occupied = count;
-    },
-    setRevision: (value: boolean) => {
-      revision = value;
     },
   };
 }
@@ -253,7 +248,7 @@ for (const max of [1, 2, 4]) {
 }
 
 for (const lane of ["review"] as const) {
-  for (const change of ["stale", "full", "revision", "stop"] as const) {
+  for (const change of ["stale", "full", "admission", "stop"] as const) {
     const h = harness(2, [lane]);
     const ops = h.board;
     const refresh = ops.refresh;
@@ -263,7 +258,7 @@ for (const lane of ["review"] as const) {
       if (fresh?.assignees.includes("bot")) {
         if (change === "stale") fresh.body = "new contract";
         else if (change === "full") h.setOccupied(2);
-        else if (change === "revision") h.setRevision(false);
+        else if (change === "admission") h.loop.disableAdmissions();
         else stopping = h.loop.stop();
       }
       return fresh;
@@ -282,13 +277,12 @@ for (const lane of ["review"] as const) {
         2,
         "a stale candidate gives its reservation back to builders",
       );
-    if (change === "revision") {
-      h.setRevision(true);
+    if (change === "admission") {
       await h.loop.tickNow();
       assert.equal(
         h.occupied(),
         1,
-        "revision latch cannot reopen from a subsequent ok observation",
+        "disabled admissions remain closed on subsequent ticks",
       );
     }
     await h.loop.stop();
@@ -328,7 +322,7 @@ for (const lane of ["review"] as const) {
     closed: true,
     status: h.deps.cfg.columns.done,
   });
-  h.setRevision(false);
+  h.loop.disableAdmissions();
   await h.loop.tickNow();
   assert.deepEqual(
     h.events,
@@ -337,6 +331,6 @@ for (const lane of ["review"] as const) {
   );
   await h.loop.stop();
   console.log(
-    "PASS: reconcile/finalize run before the revision safety gate, without new builder/foreground admissions",
+    "PASS: reconcile/finalize run with admissions disabled, without new builder/foreground admissions",
   );
 }

@@ -58,7 +58,7 @@ try {
   await new Promise<void>((done) => setImmediate(done));
   assert.ok(existsSync(owner.path));
   assert.equal(released, false, "model slot and claim stay held until observer/drain completes");
-  assert.deepEqual(unhandled, [], "a foreground failure while awaiting revision/UI observation is immediately handled");
+  assert.deepEqual(unhandled, [], "a foreground failure while awaiting UI observation is immediately handled");
 } finally {
   finish();
   await tick;
