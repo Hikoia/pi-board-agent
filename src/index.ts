@@ -21,7 +21,6 @@ import { loadConfig, validateConfig, resolveOwner } from "./config.js";
 import {
   getProjectMetadata,
   validateProjectMetadata,
-  validateStatusOptions,
   whoami,
 } from "./gh.js";
 import { createLoopState, BoardLoop, type LoopDeps } from "./loop.js";
@@ -81,18 +80,6 @@ function loadContextConfig(ctx: ExtensionContext) {
   return loadConfig(ctx.cwd, (message) =>
     ctx.ui.notify(`[board-agent] ${message}`, "warning"),
   );
-}
-
-function configuredStatuses(cfg: ReturnType<typeof loadConfig>): string[] {
-  return [
-    cfg.columns.backlog,
-    cfg.columns.ready,
-    cfg.columns.building,
-    cfg.columns.needs_design,
-    cfg.columns.needs_human,
-    cfg.columns.review,
-    cfg.columns.done,
-  ];
 }
 
 function hasRecoveryState(cwd: string, root: string): boolean {
@@ -215,7 +202,6 @@ async function startBoardLoop(
       projectOwner,
       cfg.project.number,
       cfg.status_field,
-      cfg.plan_field,
       cfg.type_field,
     );
     validateProjectMetadata(meta, cfg);
@@ -463,7 +449,7 @@ export default function (pi: ExtensionAPI) {
       mkdirSync(resolve(cwd, CONFIG_DIR_NAME), { recursive: true });
       writeFileSync(dest, template, { encoding: "utf8", flag: "wx" });
       ctx.ui.notify(
-        `Wrote: ${dest} (edit project.number + plan_field)`,
+        `Wrote: ${dest} (edit project.number)`,
         "info",
       );
     },
@@ -472,7 +458,7 @@ export default function (pi: ExtensionAPI) {
   // ----------- /board-agent lint -----------
   subcommands.set("lint", {
     description:
-      "Check preconditions: revision, config, gh auth, project exists, plan field present",
+      "Check preconditions: revision, config, gh auth, required Task Type and Status options",
     handler: async (_args, ctx) => {
       try {
         const cwd = ctx.cwd;
@@ -491,7 +477,6 @@ export default function (pi: ExtensionAPI) {
           projectOwner,
           cfg.project.number,
           cfg.status_field,
-          cfg.plan_field,
           cfg.type_field,
         );
         validateProjectMetadata(meta, cfg);
@@ -509,7 +494,7 @@ export default function (pi: ExtensionAPI) {
   // ----------- /board-agent init-project -----------
   subcommands.set("init-project", {
     description:
-      "Initialize the GitHub Project with the standard board (columns, Type, Plan, Board view)",
+      "Initialize the GitHub Project with the Task board (required Status options, Type: Task, Board view)",
     handler: async (_args, ctx) => {
       try {
         const cwd = ctx.cwd;
@@ -576,10 +561,9 @@ export default function (pi: ExtensionAPI) {
           projectOwner,
           cfg.project.number,
           cfg.status_field,
-          cfg.plan_field,
           cfg.type_field,
         );
-        validateStatusOptions(meta, configuredStatuses(cfg));
+        validateProjectMetadata(meta, cfg);
         const { listCards } = await import("./gh.js");
         const cards = await listCards(
           meta.projectId,

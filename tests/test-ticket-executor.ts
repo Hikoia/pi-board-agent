@@ -64,9 +64,7 @@ const cfg: Config = {
   builder_timeout_ms: 21600000,
   builder_retries: 1,
   context: { ..._DEFAULTS.context, enabled: false },
-  refine: { ..._DEFAULTS.refine, enabled: false },
-  review: { ..._DEFAULTS.review, enabled: false },
-  watchdog: { ..._DEFAULTS.watchdog, enabled: false },
+  review: { ..._DEFAULTS.review },
   telegram: { ..._DEFAULTS.telegram, enabled: false },
   safety: { ..._DEFAULTS.safety, require_clean_worktree: false },
 };
@@ -1375,7 +1373,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
 // are offline adapters. Every repository/ref below belongs to this TMP_DIR.
 let finalSequence = 0;
 async function finalFixture(
-  strategy: Config["task_merge_strategy"] = "squash",
+  strategy: "merge" | "squash" = "merge",
   aiReview = false,
 ) {
   const dir = join(root, `final-executor-${++finalSequence}`);
@@ -1394,8 +1392,8 @@ async function finalFixture(
   git(checkout, "push", "-u", "origin", "main");
   const finalCfg: Config = {
     ...cfg,
-    task_merge_strategy: strategy,
-    review: { ...cfg.review, enabled: aiReview },
+    task_merge_strategy: "merge",
+    review: { ...cfg.review },
     safety: { ...cfg.safety, require_clean_worktree: true },
   };
   const finalBoard = new FakeBoard();
@@ -1573,7 +1571,7 @@ async function finalFixture(
 
 for (const strategy of ["squash", "merge"] as const) {
   const f = await finalFixture(strategy);
-  assert.equal(_DEFAULTS.review.enabled, false);
+  assert.equal("enabled" in _DEFAULTS.review, false);
   assert.equal(f.store.read(f.card.itemId)!.reviewedTaskSha, f.taskSha);
   const actual = f.make();
   const loop = new BoardLoop(

@@ -14,28 +14,18 @@ import { delimiter, join } from "node:path";
 import { _DEFAULTS, resolveOwner } from "../src/config.js";
 import {
   createComment,
-  findProjectItemByContent,
   getCard,
-  getCheckRuns,
   getProjectMetadata,
   isTargetIssue,
   listCards,
-  listPrComments,
-  listPrsWithLabel,
-  listSubIssues,
   release,
   resolveIssueId,
-  resolvePullRequestId,
   setStatus,
-  setSingleSelect,
-  setTextField,
   tryClaim,
   validateProjectMetadata,
   type Card,
 } from "../src/gh.js";
 import { BoardLoop, createLoopState } from "../src/loop.js";
-import { createStoryCreationPlan, reconcileStoryCreation } from "../src/refine.js";
-import { Watchdog, WatchdogStateStore } from "../src/watchdog.js";
 import type { TicketExecutor } from "../src/ticket-executor.js";
 import {
   GIT_GH_TIMEOUT_MS,
@@ -112,9 +102,6 @@ const connection = (nodes: unknown[], next: string | null = null) => ({
 const projectItems = (nodes: unknown[], next: string | null = null) => ({
   data: { node: { items: connection(nodes, next) } },
 });
-const subIssues = (nodes: unknown[], next: string | null = null) => ({
-  data: { repository: { issue: { subIssues: connection(nodes, next) } } },
-});
 const field = (name: string, value: string) => ({
   name: value,
   field: { name },
@@ -143,16 +130,6 @@ const rawCard = (
     repository: { owner: { login: owner }, name: "repo" },
   },
 });
-const child = (id: string) => ({
-  id,
-  number: 11,
-  closed: false,
-  title: "Task",
-  body: `marker ${id}`,
-  url: `https://example.test/${id}`,
-  repository: { owner: { login: "origin-owner" }, name: "repo" },
-});
-
 const repo = join(root, "repo");
 mkdirSync(repo);
 execFileSync("git", ["init", repo], { stdio: "pipe" });
@@ -198,72 +175,32 @@ const metadata = await getProjectMetadata(
   identity.projectOwner,
   17,
   "status",
-  "plan",
   "kind",
 );
 check(
   calls()[0].includes("login=project-org") &&
     metadata.typeFieldId === "K" &&
-    metadata.planFieldId === "L" &&
     calls()[2].includes("after=FIELDS_2"),
   "Project metadata uses Project owner and resolves canonical fields through all pages",
 );
 assert.partialDeepStrictEqual(metadata, {
   statusFieldType: "SINGLE_SELECT",
-  planFieldType: "TEXT",
   typeFieldType: "SINGLE_SELECT",
 });
 console.log("PASS: Project metadata retains explicit GraphQL field types, not option-presence guesses");
 
-for (const dataType of ["TEXT", "SINGLE_SELECT"]) {
-  reset([
-    { data: { repositoryOwner: { projectV2: { id: "P" } } } },
-    { data: { node: { fields: connection([
-      { id: "S", name: "Status", dataType: "SINGLE_SELECT", options: Object.values(_DEFAULTS.columns).map((name) => ({ name, id: name })) },
-      { id: "K", name: "Kind", dataType: "SINGLE_SELECT", options: [{ name: "Task", id: "TASK" }, { name: "Story", id: "STORY" }] },
-      { id: "L", name: "Plan", dataType, ...(dataType === "SINGLE_SELECT" ? { options: [{ name: "Release", id: "PLAN_OPTION_ID" }] } : {}) },
-    ]) } } },
-    { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "CHILD" } } } },
-  ]);
-  const meta = await getProjectMetadata("project-org", 17, "Status", "Plan", "Kind");
-  assert.equal(meta.planFieldType, dataType);
-  const story: Card = {
-    itemId: "STORY", contentType: "Issue", number: 42, title: "Release", body: "Ship",
-    status: "Ready", plan: "Release", type: "Story", closed: false, assignees: [], repoOwner: "owner", repoName: "repo",
-  };
-  const creation = createStoryCreationPlan({
-    cfg: _DEFAULTS, meta, repoOwner: "owner", repoName: "repo", storyCard: story,
-    planSlug: "Release", existingTaskCount: 0, projectId: "P",
-    refine: { goal: "Ship", impactedAreas: [], decisions: [], risks: [], openQuestions: [], tasks: [{ title: "Task", acceptanceCriteria: ["Verified"] }] },
-  });
-  const childCard: Card = { ...story, itemId: "CHILD", number: 100, type: "Task", plan: undefined, title: creation.tasks[0].title, body: creation.tasks[0].body };
-  const created = await reconcileStoryCreation({
-    cfg: _DEFAULTS, meta, repoOwner: "owner", repoName: "repo", storyCard: story, projectId: "P", assertCurrent: async () => undefined,
-  }, creation, () => undefined, {
-    listChildren: async () => [], resolveParent: async () => "PARENT",
-    createChild: async () => ({ id: "ISSUE", number: 100, url: "https://example.test/100" }),
-    findProjectItem: async () => "CHILD", addProjectItem: async () => { throw new Error("unexpected add"); },
-    readCard: async () => ({ ...childCard }),
-    setText: async (...args) => { await setTextField(...args); childCard.plan = args[3]; },
-    setSingle: async (...args) => { await setSingleSelect(...args); childCard.plan = args[3]; },
-  });
-  assert.equal(created.length, 1);
-  assert.equal(calls().length, 3, "metadata reads and exactly one field mutation; no schema mutation");
-  const mutation = calls()[2];
-  assert.ok(mutation.includes("fieldId=L") && mutation.includes("itemId=CHILD"));
-  if (dataType === "TEXT") {
-    assert.ok(mutation.includes("text=Release"));
-    assert.ok(mutation.some((arg) => arg.includes("value: { text: $text }")));
-    assert.ok(!mutation.some((arg) => arg.startsWith("optionId=")));
-  } else {
-    assert.deepEqual(meta.planOptions, { Release: "PLAN_OPTION_ID" });
-    assert.ok(mutation.includes("optionId=PLAN_OPTION_ID"), "resolve Plan name to the actual option ID, never send its name as text/ID");
-    assert.ok(mutation.some((arg) => arg.includes("singleSelectOptionId: $optionId")));
-    assert.ok(!mutation.some((arg) => arg.startsWith("text=")));
-  }
-  assert.ok(mutation.some((arg) => arg.includes("updateProjectV2ItemFieldValue")));
-  console.log(`PASS: real Story reconciliation -> gh/process adapter uses the ${dataType} Plan mutation with the actual text/option ID (no schema mutation)`);
-}
+reset([
+  { data: { repositoryOwner: { projectV2: { id: "P" } } } },
+  { data: { node: { fields: connection([
+    { id: "S", name: "Status", dataType: "SINGLE_SELECT", options: ["Ready", "In Progress", "Review", "Done", "Needs Human"].map((name) => ({ id: name, name })) },
+    { id: "T", name: "Type", dataType: "SINGLE_SELECT", options: [{ id: "TASK", name: "Task" }] },
+  ]) } } },
+]);
+validateProjectMetadata(await getProjectMetadata("project-org", 17, "Status", "Type"), _DEFAULTS);
+assert.equal(calls().length, 2);
+assert.ok(calls().every((args) => !args.some((arg) => /mutation\(/.test(arg))));
+console.log("PASS: real metadata adapter accepts only Type:Task and five statuses, with no Plan/Story/Backlog or schema writes");
+
 {
   const status = { id: "S", name: "Status", dataType: "SINGLE_SELECT", options: Object.values(_DEFAULTS.columns).map((name) => ({ name, id: name })) };
   const plan = { id: "L", name: "Plan", dataType: "TEXT" };
@@ -271,19 +208,16 @@ for (const dataType of ["TEXT", "SINGLE_SELECT"]) {
   for (const [label, fields, error] of [
     ["missing Status", [plan, type], /Status field/],
     ["wrong Status despite options", [{ ...status, dataType: "TEXT" }, plan, type], /Status field/],
-    ["missing Plan", [status, type], /Plan.*TEXT.*SINGLE_SELECT/],
-    ["number Plan", [status, { ...plan, dataType: "NUMBER" }, type], /Plan.*TEXT.*SINGLE_SELECT/],
-    ["iteration Plan", [status, { ...plan, dataType: "ITERATION" }, type], /Plan.*TEXT.*SINGLE_SELECT/],
     ["missing Type", [status, plan], /Type.*SINGLE_SELECT/],
     ["text Type", [status, plan, { ...type, dataType: "TEXT", options: undefined }], /Type.*SINGLE_SELECT/],
-    ["missing Type option", [status, plan, { ...type, options: [{ id: "TASK", name: "Task" }] }], /Type.*Story/],
+    ["missing Type option", [status, plan, { ...type, options: [{ id: "STORY", name: "Story" }] }], /Type.*Task/],
   ] as const) {
     reset([
       { data: { repositoryOwner: { projectV2: { id: "P" } } } },
       { data: { node: { fields: connection([...fields]) } } },
     ]);
     await assert.rejects(async () => validateProjectMetadata(
-      await getProjectMetadata("project-org", 17, "Status", "Plan", "Kind"), _DEFAULTS,
+      await getProjectMetadata("project-org", 17, "Status", "Kind"), _DEFAULTS,
     ), error, label);
     assert.equal(calls().length, 2, `${label}: only metadata queries, no schema mutation`);
     assert.ok(calls().every((args) => !args.some((arg) => /mutation\(/.test(arg))));
@@ -345,6 +279,7 @@ reset([
   projectItems(invalidRaw.slice(4)),
 ]);
 const invalid = await listCards("P", "Status", "Plan", "Kind");
+assert.ok(!calls()[0].some((arg) => /on PullRequest|on DraftIssue|subIssues/.test(arg)), "retired content queries are absent");
 check(
   invalid.length === invalidRaw.length &&
     calls()[0].some((arg) => arg.includes("__typename")) &&
@@ -378,7 +313,6 @@ await new BoardLoop(
     cwd: repo,
     cfg: {
       ..._DEFAULTS,
-      watchdog: { ..._DEFAULTS.watchdog, enabled: false },
       safety: { ..._DEFAULTS.safety, require_clean_worktree: false },
     },
     repoOwner: identity.repoOwner,
@@ -505,67 +439,7 @@ check(
   "fresh card reads reject a different stable item ID",
 );
 
-reset([
-  subIssues(
-    Array.from({ length: 100 }, (_, i) => child(`CHILD_${i}`)),
-    "CHILDREN_2",
-  ),
-  subIssues([child("LAST_CHILD")]),
-]);
-const children = await listSubIssues("origin-owner", "repo", 1);
-check(
-  children.length === 101 &&
-    children.at(-1)?.id === "LAST_CHILD" &&
-    calls()[1].includes("after=CHILDREN_2"),
-  "sub-issue recovery reads the child marker on page two before creation",
-);
-reset([subIssues([{ ...child("CLOSED"), closed: true }])]);
-check(
-  (await listSubIssues("origin-owner", "repo", 1))[0].closed === true &&
-    calls()[0].some((arg) => arg.includes("number closed title")),
-  "sub-issue reads request and preserve validated closed state",
-);
-reset([subIssues([{ ...child("UNKNOWN"), closed: undefined }])]);
-await assert.rejects(
-  listSubIssues("origin-owner", "repo", 1),
-  /invalid sub-issue/,
-);
-check(
-  calls().length === 1,
-  "unknown sub-issue open state fails closed at the API boundary",
-);
-reset([
-  projectItems(
-    [{ id: "PR_ITEM", content: { __typename: "PullRequest", id: "ISSUE" } }],
-    "ITEM_2",
-  ),
-  projectItems([
-    { id: "FOUND", content: { __typename: "Issue", id: "ISSUE" } },
-  ]),
-]);
-check(
-  (await findProjectItemByContent("P", "ISSUE")) === "FOUND" &&
-    calls()[1].includes("after=ITEM_2"),
-  "Project content reconciliation scans later pages and matches only an Issue typename",
-);
-reset([
-  projectItems(
-    [{ id: "A", content: { __typename: "Issue", id: "ISSUE" } }],
-    "ITEM_2",
-  ),
-  projectItems([{ id: "B", content: { __typename: "Issue", id: "ISSUE" } }]),
-]);
-await assert.rejects(findProjectItemByContent("P", "ISSUE"), /Ambiguous/);
-check(
-  calls().length === 2,
-  "even an early match cannot hide ambiguous duplicate Project content on a later page",
-);
 for (const [operation, response] of [
-  [
-    () => listSubIssues("owner", "repo", 1),
-    { data: { repository: { issue: null } } },
-  ],
-  [() => findProjectItemByContent("P", "ISSUE"), { data: { node: null } }],
   [
     () => listCards("P", "Status"),
     { data: { node: { items: { nodes: [] } } } },
@@ -579,8 +453,6 @@ for (const [operation, response] of [
   );
 }
 for (const [operation, page] of [
-  [() => listSubIssues("owner", "repo", 1), subIssues],
-  [() => findProjectItemByContent("P", "ISSUE"), projectItems],
   [() => listCards("P", "Status"), projectItems],
 ] as const) {
   reset([page([], "A"), page([], "B"), page([], "A")]);
@@ -591,20 +463,8 @@ for (const [operation, page] of [
   );
 }
 
-reset([
-  { data: { repository: { pullRequest: { id: "PR_NODE" } } } },
-  { data: { addComment: { commentEdge: { node: { id: "COMMENT" } } } } },
-]);
-const prId = await resolvePullRequestId("origin-owner", "repo", 7);
-assert.equal(await createComment(prId, "reply"), "COMMENT");
-check(
-  calls()[0].some((arg) => arg.includes("pullRequest(number: $number)")) &&
-    calls()[1].includes("issueId=PR_NODE"),
-  "PR comments resolve PullRequest identity, not the unrelated issue(number:) query",
-);
 for (const operation of [
   () => resolveIssueId("owner", "repo", 1),
-  () => resolvePullRequestId("owner", "repo", 1),
   () => createComment("NODE", "reply"),
   () => setStatus(metadata, "ITEM", "Ready"),
 ]) {
@@ -615,92 +475,3 @@ for (const operation of [
     "missing identity/mutation acknowledgement fails explicitly without a blind retry",
   );
 }
-const rawPr = (number: number) => ({
-  number,
-  title: "PR",
-  headRefName: `task/issue-${number}`,
-  headRefOid: "a".repeat(40),
-  url: "https://example.test/pr",
-  isCrossRepository: false,
-});
-reset([
-  { data: { repository: { pullRequests: connection([rawPr(1)], "PR_2") } } },
-  { data: { repository: { pullRequests: connection([rawPr(2)]) } } },
-]);
-check(
-  (await listPrsWithLabel("owner", "repo", "board-agent")).length === 2 &&
-    calls()[1].includes("after=PR_2"),
-  "watchdog PR listing has no fixed 50-PR cutoff",
-);
-reset([
-  [
-    {
-      check_runs: [
-        { name: "first", status: "completed", conclusion: "success" },
-      ],
-    },
-    {
-      check_runs: [
-        { name: "late-failure", status: "completed", conclusion: "failure" },
-      ],
-    },
-  ],
-]);
-check(
-  (await getCheckRuns("owner", "repo", "a".repeat(40))).at(-1)?.conclusion ===
-    "failure" && calls()[0].includes("--paginate"),
-  "a failing CI check on a later REST page cannot be mistaken for green",
-);
-reset([{ __error: true }]);
-await assert.rejects(getCheckRuns("owner", "repo", "a".repeat(40)));
-check(
-  calls().length === 1,
-  "CI API failure propagates instead of masquerading as an empty green result",
-);
-
-const restComments = Array.from({ length: 201 }, (_, i) => ({
-  id: i + 1,
-  body: "@bot clarify",
-  created_at: new Date((i + 1) * 1000).toISOString(),
-  user: { login: "human" },
-  author_association: i === 200 ? "COLLABORATOR" : "NONE",
-}));
-reset([
-  [
-    restComments.slice(0, 100),
-    restComments.slice(100, 200),
-    restComments.slice(200),
-  ],
-]);
-new WatchdogStateStore(repo).update(7, { lastSeenCommentId: "100" });
-let replies = 0;
-let markedReply = "";
-await new Watchdog({
-  cwd: repo,
-  cfg: {
-    ..._DEFAULTS,
-    watchdog: { ..._DEFAULTS.watchdog, respond_to_mentions: true },
-    context: { ..._DEFAULTS.context, enabled: false },
-  },
-  repoOwner: "origin-owner",
-  repoName: "repo",
-  botLogin: "bot",
-  meta: metadata,
-  callback: () => undefined,
-  mentionOps: {
-    listComments: (number) => listPrComments("origin-owner", "repo", number),
-    run: async () => {
-      replies++;
-      return { result: { reply: "offline reply" } };
-    },
-    post: async (_number, body) => {
-      markedReply = body;
-    },
-  },
-}).handleMentions(rawPr(7));
-check(
-  replies === 1 &&
-    markedReply.startsWith("<!-- board-agent-mention:201 -->\n") &&
-    new WatchdogStateStore(repo).get(7).lastSeenCommentId === "201",
-  "real REST parser feeds Watchdog: trusted mention #201 is processed, earlier outsiders are skipped, cursor advances exactly once",
-);

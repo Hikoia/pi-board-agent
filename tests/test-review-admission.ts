@@ -34,7 +34,7 @@ git(repo, 'add', '.'); git(repo, 'commit', '-m', 'offline fixture'); git(repo, '
 let sequence = 0;
 function fixture() {
   const cfg = structuredClone(_DEFAULTS); cfg.max_workers = 1; cfg.tick_seconds = 0.02;
-  cfg.refine.enabled = cfg.review.enabled = cfg.context.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+  cfg.context.enabled = cfg.telegram.enabled = false;
   const number = ++sequence;
   const card: any = { itemId: `AUDIT_${number}`, number, type: 'Task', contentType: 'Issue', title: `T00${number} contract`, body: 'Approved scope', repoOwner: 'owner', repoName: 'repo', plan: 'demo', status: cfg.columns.ready, closed: false, assignees: [] };
   const writes: string[] = [], notices: string[] = [];
@@ -59,7 +59,7 @@ const failures: unknown[] = [];
 const originalRun = WorkflowAgent.prototype.run;
 try {
   for (const change of ['revision', 'latched', 'unobserved-revision', 'local-revision', 'stop', 'unchanged']) {
-    const f = fixture(); f.cfg.review.enabled = true; f.cfg.safety.require_clean_worktree = false;
+    const f = fixture();  true; f.cfg.safety.require_clean_worktree = false;
     const record = await f.store.ensure(f.task, 'demo'); git(record.path, 'push', 'origin', record.taskBranch);
     const taskSha = git(record.path, 'rev-parse', 'HEAD');
     f.card.status = f.cfg.columns.review;

@@ -27,7 +27,7 @@ git(repo, "remote", "add", "origin", origin);
 git(repo, "push", "origin", "main");
 const cfg = structuredClone(_DEFAULTS);
 cfg.max_workers = 3;
-cfg.safety.require_clean_worktree = cfg.context.enabled = cfg.refine.enabled = cfg.review.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+cfg.safety.require_clean_worktree = cfg.context.enabled = cfg.telegram.enabled = false;
 const cards: Card[] = Array.from({ length: 4 }, (_, i) => ({
   itemId: `ITEM_${i + 1}`, number: i + 1, contentType: "Issue", type: "Task", title: `T00${i + 1} Task`, body: "Acceptance", plan: "demo",
   repoOwner: "owner", repoName: "repo", closed: false, assignees: [], status: cfg.columns.ready,

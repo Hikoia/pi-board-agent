@@ -26,7 +26,7 @@ git(repo, "add", "."); git(repo, "commit", "-m", "fixture");
 git(repo, "remote", "add", "origin", origin); git(repo, "push", "origin", "main");
 const cfg = structuredClone(_DEFAULTS);
 cfg.max_workers = 1;
-cfg.context.enabled = cfg.refine.enabled = cfg.review.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+cfg.context.enabled = cfg.telegram.enabled = false;
 const deferred = () => {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => { resolve = done; });
@@ -114,27 +114,16 @@ for (const delta of [false, true]) {
   f.store.beginLaunch(f.card.itemId);
   const launchRecord = f.store.read(f.card.itemId);
   f.card.status = cfg.columns.building; f.card.assignees = ["bot"];
-  const entered = deferred(), finish = deferred(), hasTaskDelta = f.store.hasTaskDelta.bind(f.store);
-  f.store.hasTaskDelta = async (...args) => {
-    const value = await hasTaskDelta(...args);
-    assert.equal(value, delta);
-    entered.resolve(); await finish.promise;
-    return value;
-  };
-  const recovering = f.executor.reconcile([structuredClone(f.card)]);
-  try {
-    await Promise.race([entered.promise, recovering.then(() => { throw new Error("recovery settled before delta observation"); })]);
-    assert.deepEqual(f.writes, []);
-    assert.deepEqual(f.store.read(f.card.itemId), launchRecord, "pending fetch preserves exact crash evidence");
-    finish.resolve();
-    const summary = await recovering;
-    assert.equal(summary.errors, 0);
-    assert.equal(summary.needsHuman, delta ? 1 : 0);
-    assert.equal(f.card.status, delta ? cfg.columns.needs_human : cfg.columns.ready);
-    assert.ok(existsSync(record.path));
-    assert.equal(f.store.read(f.card.itemId)?.launchingAt, undefined);
-    console.log(`PASS: crash recovery awaits hasTaskDelta=${delta} before returning Ready or quarantining local work`);
-  } finally { finish.resolve(); await recovering; await f.loop.stop(); }
+  const summary = await f.executor.reconcile([structuredClone(f.card)]);
+  assert.equal(summary.errors, 0);
+  assert.equal(summary.needsHuman, 0);
+  assert.deepEqual(f.writes, []);
+  assert.equal(f.starts(), 0);
+  assert.equal(f.card.status, cfg.columns.building);
+  assert.deepEqual(f.store.read(f.card.itemId), launchRecord, "unknown launch retains exact crash evidence regardless of task delta");
+  assert.ok(existsSync(record.path));
+  await f.loop.stop();
+  console.log(`PASS: uncertain crash recovery with local delta=${delta} retains launch evidence/work and cannot guess Ready or Needs Human`);
 }
 
 {

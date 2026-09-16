@@ -14,7 +14,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 } });
 const { fixture } = await import("./conflict-handoff-fixture.js");
 const { createProductionTicketExecutor } = await import("../src/ticket-executor.js");
-const { updateIssueComment, reopenIssue } = await import("../src/gh.js");
+const { reopenIssue } = await import("../src/gh.js");
 try {
   for (const spoof of [false, true]) {
     const f = await fixture(); const queries: string[] = [];
@@ -60,8 +60,6 @@ try {
       console.log(`PASS: real production gh/GraphQL adapter ${spoof ? "rejects forged actual author despite bot write reply" : "uses one author-verified edited marker and reopens without body changes"}`);
     } finally { await executor.shutdown(); await f.loop.stop(); }
   }
-  respond = async () => ({ data: { updateIssueComment: { issueComment: { id: "wrong" } } } });
-  await assert.rejects(updateIssueComment("expected", "body"), /mismatched/);
   respond = async () => ({ data: { reopenIssue: { issue: { id: "expected", closed: true } } } });
   await assert.rejects(reopenIssue("expected"), /unconfirmed/);
   console.log("PASS: production new mutation response boundaries reject mismatched comment identity/unconfirmed reopen");

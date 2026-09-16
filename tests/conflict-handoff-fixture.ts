@@ -52,12 +52,9 @@ export async function fixture(conflict = true) {
   cfg.max_workers = 1;
   cfg.builder_retries = 0;
   cfg.context.enabled =
-    cfg.review.enabled =
-    cfg.refine.enabled =
-    cfg.watchdog.enabled =
     cfg.telegram.enabled =
-    cfg.safety.require_clean_worktree =
-      false;
+    cfg.safety.require_clean_worktree = false;
+
   const card: Card = {
     itemId: `HANDOFF_${sequence}`,
     number: sequence,

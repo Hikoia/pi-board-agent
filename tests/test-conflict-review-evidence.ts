@@ -25,7 +25,7 @@ for (const verdict of ["pass", "fail"] as const) {
       git(f.record.path, "push", "origin", f.task.taskBranch);
       assert.notEqual(git(f.record.path, "rev-parse", "HEAD"), testedSha);
     }
-    f.cfg.review.enabled = true;
+
     f.setReview(async (input) => {
       reviews++;
       return runReview(input, async () => ({ result: { verdict, summary: "offline verdict", findings: verdict === "pass" ? [] : ["Missing repair tests"] } }));

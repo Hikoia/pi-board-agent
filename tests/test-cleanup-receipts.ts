@@ -124,11 +124,8 @@ try {
     const { ManagedTicketExecutor } = await import("../src/ticket-executor.js");
     const cfg = structuredClone(_DEFAULTS);
     cfg.context.enabled =
-      cfg.refine.enabled =
-      cfg.review.enabled =
-      cfg.watchdog.enabled =
-      cfg.telegram.enabled =
-        false;
+      cfg.telegram.enabled = false;
+
     cfg.task_merge_strategy = "merge";
     const card: Card = {
       itemId: f.task.itemId,

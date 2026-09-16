@@ -86,7 +86,7 @@ try {
     git(repo, "remote", "add", "origin", origin); git(repo, "push", "origin", "main");
     const base = git(repo, "rev-parse", "HEAD");
     const cfg = structuredClone(_DEFAULTS);
-    cfg.context.enabled = cfg.refine.enabled = cfg.review.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+    cfg.context.enabled = cfg.telegram.enabled = false;
     cfg.branches.task_prefix = prefix;
     cfg.task_merge_strategy = "merge";
     const cards: Card[] = numbers.map((number) => ({

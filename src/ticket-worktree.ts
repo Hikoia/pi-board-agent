@@ -13,7 +13,6 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import type { Config } from "./config.js";
 import {
   GIT_GH_TIMEOUT_MS,
   processFailure,
@@ -781,28 +780,6 @@ export class TicketWorktrees {
     return { ok: true, clean };
   }
 
-  async hasTaskDelta(record: TicketExecutionRecord): Promise<boolean> {
-    const fetched = await this.fetch(record.baseBranch, record.path);
-    if (!fetched.ok) throw processFailure("git", ["fetch"], fetched);
-    return this.hasLocalTaskDelta(record);
-  }
-
-  /** Revalidate after a card await without fetching (and yielding) again. */
-  hasLocalTaskDelta(record: TicketExecutionRecord): boolean {
-    return (
-      Number(
-        mustGit(
-          [
-            "rev-list",
-            "--count",
-            `origin/${record.baseBranch}..${record.taskBranch}`,
-          ],
-          record.path,
-        ),
-      ) > 0
-    );
-  }
-
   /** Create or resume the one persistent worktree owned by an Issue. */
   async ensure(
     task: BuilderTask,
@@ -895,7 +872,7 @@ export class TicketWorktrees {
    * push evidence. The caller confirms Project Done and deletes the record last. */
   async finalizeAccepted(
     task: BuilderTask,
-    _strategy: Config["task_merge_strategy"], // legacy config is merge-only here
+    _strategy: "merge" | "squash", // legacy config is merge-only here
     assertCurrent: () => Promise<void> = async () => {},
     legacyResidual?: (record: TicketExecutionRecord, remove: boolean, guard: () => Promise<void>) => Promise<void>,
     legacyApproval?: (record: TicketExecutionRecord) => string | undefined,

@@ -12,7 +12,7 @@ const { ManagedTicketExecutor } = await import("../src/ticket-executor.js");
 
 function harness(f: Awaited<ReturnType<typeof fixture>>) {
   const cfg = structuredClone(_DEFAULTS);
-  cfg.context.enabled = cfg.refine.enabled = cfg.review.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+  cfg.context.enabled = cfg.telegram.enabled = false;
   cfg.task_merge_strategy = "merge";
   const card: Card = {
     itemId: f.task.itemId, number: f.task.issueNumber, title: f.task.title, body: f.task.body,
@@ -129,11 +129,11 @@ try {
     h.cards.pop();
     await tick(1, 0, "other ticket does not replace original ticket fingerprint");
     await h.loop.stop(); Object.assign(h, h.restart());
-    h.cfg.review.enabled = true;
+
     await tick(1, 1, "new loop lifetime with same files and blocker");
     await tick(1, 0, "restarted loop deduplicates independently");
-    assert.equal(h.cfg.review.enabled, true);
-    console.log("PASS: identical blockers on different tickets notify independently; a fresh loop warns again with review.enabled unchanged");
+    assert.equal("enabled" in h.cfg.review, false);
+    console.log("PASS: identical blockers on different tickets notify independently; a fresh loop warns again with mandatory review unchanged");
 
     // Board snapshot and reconciliation see closed-Done; the actual finalizer must
     // honor the later fresh approval read, and that skipped result ends the incident.

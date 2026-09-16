@@ -73,7 +73,7 @@ try {
   const worktrees = await import("../src/ticket-worktree.js");
   const store = new worktrees.TicketWorktrees(repo);
   const cfg = structuredClone(_DEFAULTS);
-  cfg.context.enabled = cfg.refine.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+  cfg.context.enabled = cfg.telegram.enabled = false;
   const card: Card = {
     itemId: "ITEM_11", number: 11, contentType: "Issue", type: "Task", title: "T011 accepted work", body: "Acceptance",
     repoOwner: "owner", repoName: "repo", closed: true, status: cfg.columns.done, plan: "demo", assignees: [],
@@ -161,7 +161,7 @@ try {
   console.log("PASS: ManagedTicketExecutor exposes exact conflict SHAs and diagnostics without ticket mutation or success");
 
   for (const reviewEnabled of [false, true]) {
-    cfg.review.enabled = reviewEnabled;
+    reviewEnabled;
     const state = createLoopState();
     const loop = new BoardLoop({
       cwd: repo, cfg, repoOwner: "owner", repoName: "repo", botLogin: "bot",
@@ -176,7 +176,7 @@ try {
       await loop.tickNow();
       assert.equal(state.tickCount, 1);
       assert.equal(state.wavesLaunched, 0);
-      assert.equal(cfg.review.enabled, reviewEnabled);
+      assert.equal("enabled" in cfg.review, false);
       assert.equal(notices.length, 1, "one explicit warning, no false success");
       assert.equal(notices[0].level, "warn");
       assert.match(notices[0].message, /Finalization conflict.*#11/);

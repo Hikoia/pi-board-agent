@@ -11,7 +11,7 @@ try {
   assert.equal(f.card.status, f.cfg.columns.review);
   const original = f.runs()[0]; await f.loop.stop();
   const persistence = createRunPersistence(f.record.path);
-  f.cfg.review.enabled = true;
+
   f.setReview(async () => { reviews++; return { verdict: "pass", summary: "must not review incomplete evidence", findings: [], taskSha: f.taskSha }; });
   for (const mode of ["corrupt-file", "missing-args", "stripped-repair", "replaced-repair", "missing-history"] as const) {
     const run = structuredClone(original);

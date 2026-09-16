@@ -45,7 +45,7 @@ writeFileSync(join(f.repo, "work.txt"), "base change\n"); git(f.repo, "add", "wo
 const base = git(f.repo, "rev-parse", "HEAD");
 assert.throws(() => git(repair.record.path, "merge", "--no-edit", base));
 const mergeHead = git(repair.record.path, "rev-parse", "MERGE_HEAD"), dirtyRepair = git(repair.record.path, "diff");
-const design = await f.ticket("design", f.cfg.columns.needs_design), human = await f.ticket("human", f.cfg.columns.needs_human);
+const design = await f.ticket("design", "Needs Design"), human = await f.ticket("human", f.cfg.columns.needs_human);
 const leased = await f.ticket("leased");
 const lj = f.journal(leased.record, "leased-original", "running");
 f.store.setActiveRun(leased.card.itemId, lj.run.runId, Date.parse(lj.run.startedAt));
@@ -59,7 +59,7 @@ badFiles.set(join(f.store.recordsDir, "corrupt.json"), "{bad");
 for (const [file, bytes] of badFiles) writeFileSync(file, bytes);
 // Non-Task/PR/foreign identities are never converted or remotely mutated.
 for (const [i, type, contentType, repoName] of [[90, "Story", "Issue", "repo"], [91, "Task", "PullRequest", "repo"], [92, "Task", "Issue", "other"]] as const) {
-  const itemId = `excluded${i}`, card = { ...unique.card, itemId, number: i, type, contentType, repoName, status: f.cfg.columns.needs_design };
+  const itemId = `excluded${i}`, card = { ...unique.card, itemId, number: i, type, contentType, repoName, status: "Needs Design" };
   f.cards.push(card);
   const file = f.store.recordPath(itemId), bytes = JSON.stringify({ ...unique.record, itemId, issueNumber: i, taskBranch: `task/issue-${i}`, path: join(f.repo, ".pi", "worktrees", `ticket-issue-${i}-${itemId}`) });
   writeFileSync(file, bytes); badFiles.set(file, bytes);
@@ -110,11 +110,11 @@ try {
     assert.equal(record.retry?.stage, "build");
     assert.match(record.retry!.reason, /Original question/);
     assert.match(record.retry!.reason, /requestKey/);
-    assert.equal(await executor.repairFor(t.card), undefined, "ordinary retry, not repair protocol");
+    assert.equal("repairFor" in executor, false, "no repair protocol API survives migration");
   }
   console.log("PASS: owner-only per-ticket v3 conversion archives exact raw bytes, isolates v1/v2/corrupt/live-lease/non-Task data, maps only Task Needs Design and preserves questions/Needs Human");
 
-  const unrecordedDesign = { ...design.card, itemId: "unrecorded-design", number: 300, status: f.cfg.columns.needs_design };
+  const unrecordedDesign = { ...design.card, itemId: "unrecorded-design", number: 300, status: "Needs Design" };
   f.cards.push(unrecordedDesign);
   const setStatus = f.board.setStatus;
   f.board.setStatus = async (id, status) => {
@@ -126,7 +126,7 @@ try {
   await executor.reconcile(structuredClone(f.cards));
   assert.ok(resumes.includes("active-original") && resumes.includes("paused-original") && resumes.includes("repair-original"));
   assert.ok(executor.legacyBlocked(unrecordedDesign.itemId), "failed lane I/O cannot fall through to the staged designer");
-  assert.equal(unrecordedDesign.status, f.cfg.columns.needs_design, "no false successful status write");
+  assert.equal(unrecordedDesign.status, "Needs Design", "no false successful status write");
   f.board.setStatus = setStatus;
   assert.ok(!resumes.includes("quota-original"), "provider backoff still owns quota pause");
   assert.equal(starts, 0);

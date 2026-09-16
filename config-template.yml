@@ -1,148 +1,52 @@
-# pi-board-agent configuration
-#
-# Lives at `.pi/board-agent.yml` in your project (or `~/.pi/board-agent.yml` for
-# defaults across projects — project-level overrides global). All fields are
-# optional unless marked REQUIRED.
-
-# ── GitHub Project (v2) ─────────────────────────────────────────────────────
+# .pi/board-agent.yml (project overrides ~/.pi/board-agent.yml).
+# Required: project.number and an existing Project with the fields below.
+# Startup/lint never rewrite this file or the Project schema.
 project:
-  # GitHub user or org that owns the Project (v2).
-  # Leave empty -> auto-detected from `git remote get-url origin`.
-  owner: ""
-  # REQUIRED. Project number — the N in
-  # https://github.com/users/<owner>/projects/<N>
-  number: 0
+  owner: "" # empty -> origin repository owner
+  number: 0 # REQUIRED: the Project v2 number
 
-# ── Board columns (Status field) ────────────────────────────────────────────
-# Names must match the option labels of the project's single-select `Status`
-# field exactly (case-insensitive).
+# Required single-select Status options (case-insensitive).
 columns:
   ready: "Ready"
   building: "In Progress"
   review: "Review"
   done: "Done"
-  needs_design: "Needs Design"
   needs_human: "Needs Human"
-  backlog: "Backlog"
+  backlog: "Backlog" # optional manual holding column; never scheduled
 status_field: "Status"
-type_field: "Kind"
+type_field: "Type" # single-select, with a Task option
+plan_field: "Plan" # optional grouping: neither this field nor a value is required
 
-# ── Plan grouping ───────────────────────────────────────────────────────────
-# Cards are grouped into "plans" by the value of `plan_field` on the project.
-# Add one stable slug per Story/task group (for example, release-0.2.0).
-# TEXT or SINGLE_SELECT; select options must exist before Story publication.
-# After field/option edits, stop successfully, lint, then run a new loop.
-plan_field: "Plan"
-
-# ── Concurrency ─────────────────────────────────────────────────────────────
-# Total model budget: builders + one foreground (design/refine/review/watchdog).
-# Paused, pending, launching, missing/unreadable runs conservatively occupy slots.
-# Reserve one primary slot, pre-fill builders, run one primary model, back-fill;
-# watchdog models use only remaining capacity. Capped at 16.
+# Shared budget: builders + one independent reviewer. Paused/uncertain runs
+# still occupy a slot. Range 1..16; polling retains provider backoff.
 max_workers: 2
-
-# Polling interval (seconds) of the autonomous loop. Requests depend on board
-# size, pagination and active work; this interval is not a rate-limit guarantee.
 tick_seconds: 90
-
-# ── Branch strategy ─────────────────────────────────────────────────────────
 branches:
-  base: "main" # direct merge target after a Done issue is closed
-  # Branch prefix for short-lived per-Issue task branches (`task/issue-42`).
+  base: "main"
   task_prefix: "task/"
+task_merge_strategy: "merge"
 
-# How a manually accepted task is merged into branches.base after its
-# issue closes:
-#   "squash" -> one commit per task (recommended)
-#   "merge"  -> preserve full commit history of each task branch
-task_merge_strategy: "squash"
-
-# ── Builder execution ───────────────────────────────────────────────────────
-# Optional: hard timeout per builder agent (milliseconds). Omit for no cap.
-builder_timeout_ms: 21600000 # 6 hours per attempt
-
-# Retries for a recoverable failure (timeout, empty output, connection drop).
+builder_timeout_ms: 21600000 # optional; 6 hours per attempt
 builder_retries: 1
-
-# ── LLM models (parametrizzabili) ───────────────────────────────────────────
-# Explicit model id used for each role. Use "provider/modelId" or a bare
-# modelId resolvable by Pi.
 models:
   builder: "deepseek-v4-flash-0731"
-  refine: "deepseek-v4-flash-0731"
   review: "deepseek-v4-flash-0731"
-  watch: "deepseek-v4-flash-0731"
+review:
+  timeout_ms: 600000 # AI review is always enabled
 
-# ── Builder context (repo digest) ───────────────────────────────────────────
-# Navigation digest rendered from the prepared ticket worktree on new launches,
-# not the host checkout cache. Read relevant code; the worktree is authoritative.
-# No digest file is written into the ticket worktree; resumed runs keep their mission.
+# Ready -> In Progress -> Review -> Done (Issue stays OPEN).
+# A human validates and closes Done to approve merge/push/cleanup.
+# Needs Human requires a trusted reply AND a manual move back to Ready.
 context:
   enabled: true
-  max_chars: 20000 # ~5K tokens
-  exclude: [] # extra paths/globs to exclude from the digest
-
-# ── Refine phase (Stories and Task contracts) ───────────────────────────────
-# `enabled` controls both Story refinement and Needs Design Task contract
-# refinement. Stories produce sub-issues; Tasks wait for a fresh trusted
-# design decision before their existing issue contract is rewritten.
-# Each child must be implementable AND verifiable independently from base.
-# Keep real dependencies in Backlog manually until prerequisites are integrated.
-refine:
-  enabled: true
-  timeout_ms: 240000 # per-refine agent timeout
-  max_tasks: 12 # reject over-limit output; never slice requirements or auto-repair
-
-# ── AI review gate ──────────────────────────────────────────────────────────
-# Review cards are independently checked against their acceptance criteria.
-# PASS → Done; FAIL → a findings comment is posted and the card returns to
-# Ready. Closing a Done Issue approves its current local task branch, including
-# unpushed commits. Finalization needs no Plan or AI-review record: no local
-# task branch means settled; otherwise merge, push, verify, then delete.
-review:
-  enabled: false
-  timeout_ms: 600000 # per-review agent timeout (10 min)
-
-# ── Watchdog (PR CI + mentions) ───────────────────────────────────────
-# Keeps bot-managed PRs healthy: auto-fix failing CI (max rounds, cooldown),
-# then ask the human; replies to @bot mentions on its PRs.
-watchdog:
-  enabled: true # scheduled only by the main BoardLoop
-  fix_rounds_max: 5 # max auto-fix rounds per PR before needs-human
-  fix_cooldown_minutes: 5 # pause between fix attempts (CI needs time)
-  # Trusted OWNER/MEMBER/COLLABORATOR mentions only; disabled by default.
-  respond_to_mentions: false
-  pr_label: "board-agent"
-  needs_human_label: "needs-human"
-
-# ── Telegram notifications ────────────────────────────────────────────
-# Same bot + channel used by the project releases. Token/chat id come from
-# the environment (never stored here).
+  max_chars: 20000
+  exclude: []
 telegram:
   enabled: true
   bot_token_env: "TELEGRAM_BOT_TOKEN"
   chat_id_env: "TELEGRAM_CHAT_ID"
-  # Events: ci_fixed, needs_human, refine_questions, refine_done
-  "on":
-    - "ci_fixed"
-    - "needs_human"
-    - "refine_questions"
-    - "refine_done"
-
-# ── Auto start ──────────────────────────────────────────────────────────────
-# Start the loop automatically when a normal Pi session starts.
+  "on": ["needs_human"]
 auto_start: false
-
-# ── Safety rails ────────────────────────────────────────────────────────────
 safety:
-  # Refuse to launch new work if the main working tree is dirty. Only untracked
-  # runtime paths are excluded; tracked source/config changes always block.
-  # Existing managed runs are still reconciled;
-  # one ticket cannot block the board.
-  require_clean_worktree: true
-# Closed Issues never start builders/design, regardless of legacy preferences.
-
-# ── Bot identity (optional) ─────────────────────────────────────────────────
-# When set, board-agent uses this login for the assignee claim + refetch guard.
-# Leave empty to use the gh-authenticated user.
-bot_identity: ""
+  require_clean_worktree: true # gates new launches, not existing-run recovery
+bot_identity: "" # empty -> gh-authenticated user

@@ -13,8 +13,8 @@ export async function fixture(legacy = false) {
   faults.beforeGit = faults.afterGit = faults.beforeFs = faults.afterFs = faults.beforeSyncFs = undefined;
   const f = await oldFixture();
   const cfg = structuredClone(_DEFAULTS);
-  cfg.safety.require_clean_worktree = cfg.context.enabled = cfg.watchdog.enabled = cfg.refine.enabled = cfg.telegram.enabled = false;
-  cfg.task_merge_strategy = "squash"; // compatibility input must never create a new squash
+  cfg.safety.require_clean_worktree = cfg.context.enabled = cfg.telegram.enabled = false;
+  cfg.task_merge_strategy = "merge"; // compatibility input must never create a new squash
   f.task.taskKey = f.record.taskKey = `T${String(f.task.issueNumber).padStart(3, "0")}`;
   writeFileSync(f.recordFile, JSON.stringify({ ...f.record, schemaVersion: legacy ? 3 : 4, reviewedTaskSha: f.taskSha }, null, 2));
   const card: Card = { itemId: f.task.itemId, number: f.task.issueNumber, title: f.task.taskKey + " " + f.task.title, body: f.task.body,

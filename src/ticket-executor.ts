@@ -9,8 +9,7 @@ import {
 import { setTimeout as delay } from "node:timers/promises";
 import {
   LegacyTickets,
-  type ConflictBoardOps,
-  type RepairBlocker,
+  isRepairRequest,
   type LegacyMigrationReport,
 } from "./legacy-tickets.js";
 import type { OwnerLock } from "./owner-lock.js";
@@ -27,7 +26,6 @@ import {
   resolveIssueId,
   setStatus,
   tryClaim,
-  updateIssueComment,
   reopenIssue,
   type Card,
   type IssueComment,
@@ -40,13 +38,6 @@ import {
   type TicketWorktreeRecord,
 } from "./ticket-worktree.js";
 import { buildTasksForWave, renderWorkflowSource } from "./workflow-prompt.js";
-import {
-  isRepairRequest,
-  repairReviewInput,
-  type RepairRequest,
-  type RepairReview,
-} from "./repair.js";
-
 export type ExecutorStatusCallback = (
   message: string,
   level?: "info" | "warn" | "error",
@@ -67,7 +58,6 @@ export interface ReconcileSummary {
   needsHuman: number;
   orphans: number;
   errors: number;
-  repairBlockers?: Array<RepairBlocker & { itemId: string }>;
   attemptedItemIds?: string[];
 }
 
@@ -79,8 +69,7 @@ export type LaunchResult =
 export type FinalizeOutcome =
   | { status: "finalized"; resultSha: string }
   | { status: "conflict"; baseSha: string; taskSha: string; reason: string }
-  | { status: "skipped"; reason: string; repair?: RepairRequest }
-  | RepairBlocker;
+  | { status: "skipped" | "blocked"; reason: string };
 
 export interface TicketExecutor {
   /** Display only. Never used to authorize launches, recovery or capacity. */
@@ -96,11 +85,6 @@ export interface TicketExecutor {
   migrateLegacy?(owner: OwnerLock, canMigrate?: () => boolean): Promise<LegacyMigrationReport>;
   /** Migration failures are isolated from all model/board mutations. */
   legacyBlocked?(itemId: string): string | undefined;
-  repairFor?(card: Card): Promise<RepairRequest | RepairBlocker | undefined>;
-  repairForReview?(
-    record: TicketExecutionRecord,
-    card: Card,
-  ): Promise<RepairReview | RepairBlocker | undefined>;
   /** Observe revision before the final card await, then check local admission
    * synchronously at start. The prepared launch already owns its worker slot. */
   launch(
@@ -108,7 +92,6 @@ export interface TicketExecutor {
     planSlug: string | undefined,
     canStartWork?: () => boolean | Promise<boolean>,
     canStartWorkNow?: () => boolean,
-    repair?: RepairRequest,
   ): Promise<LaunchResult>;
   finalizeClosed(
     card: Card,
@@ -122,7 +105,6 @@ export interface TicketExecutor {
 }
 
 export interface TicketBoardAdapter {
-  conflict?: ConflictBoardOps;
   decisionComments?(card: Card): Promise<IssueComment[]>;
   reopen?(card: Card): Promise<void>;
   getCard(itemId: string): Promise<Card | undefined>;
@@ -140,7 +122,6 @@ export interface TicketWorkflowManager {
       itemId: string;
       issueNumber: number;
       taskKey: string;
-      repair?: RepairRequest;
     },
     options: {
       maxAgents: number;
@@ -375,52 +356,6 @@ export class ManagedTicketExecutor implements TicketExecutor {
 
   legacyBlocked(itemId: string): string | undefined {
     return this.conflicts.blockedReason(itemId);
-  }
-
-  repairFor(card: Card): Promise<RepairRequest | RepairBlocker | undefined> {
-    return this.conflicts.repairFor(card);
-  }
-
-  async repairForReview(
-    record: TicketExecutionRecord,
-    card: Card,
-  ): Promise<RepairReview | RepairBlocker | undefined> {
-    const required = this.conflicts.requestForRun(record, record.lastRunId);
-    // Unknown/rejected authority throws, never authorizes a quarantine write.
-    if (!(await this.conflicts.executionCard(record, card, record.lastRunId)))
-      throw new Error("Repair Review lost its fresh card/claim authority.");
-    try {
-      const run = record.lastRunId
-        ? createRunPersistence(record.path).load(record.lastRunId)
-        : null;
-      if (
-        required &&
-        (!run ||
-          run.runId !== record.lastRunId ||
-          !runArgsMatch(run, record) ||
-          !this.conflicts.matches(record, run.args, run.runId))
-      )
-        throw new Error(
-          "Bound repair Review run is missing or its exact arguments changed.",
-        );
-      const repair = run ? repairReviewInput(run) : undefined;
-      if (required && !repair)
-        throw new Error("Bound repair Review evidence is missing.");
-      if (
-        repair &&
-        (!runArgsMatch(run!, record) ||
-          !this.conflicts.matches(record, run!.args, run!.runId))
-      )
-        throw new Error("Repair Review run does not match the ticket record.");
-      return repair;
-    } catch (error) {
-      if (!required) throw error;
-      return {
-        status: "blocked",
-        repair: required,
-        reason: `Repair Review evidence invalid: ${String(error)}`,
-      };
-    }
   }
 
   private manager(path: string): TicketWorkflowManager {
@@ -849,11 +784,9 @@ export class ManagedTicketExecutor implements TicketExecutor {
     expectedPlan: string | undefined,
     canStartWork: () => boolean | Promise<boolean> = () => true,
     canStartWorkNow: () => boolean = () => true,
-    repair?: RepairRequest,
   ): Promise<LaunchResult> {
     this.canResume = canStartWork;
     this.canResumeNow = canStartWorkNow;
-    if (repair) return { status: "skipped", reason: "Legacy repair arguments cannot authorize a new run; migrate first." };
     if (this.stopping) return { status: "skipped", reason: "executor is stopping" };
     const blocked = this.legacyBlocked(snapshot.itemId);
     if (blocked) return { status: "skipped", reason: blocked };
@@ -878,14 +811,15 @@ export class ManagedTicketExecutor implements TicketExecutor {
 
     if (!(await this.deps.board.claim(card)))
       return { status: "skipped", reason: "claim lost" };
-    const claimed = card;
     card = await this.deps.board.getCard(snapshot.itemId);
     if (
       !card ||
+      !isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task") ||
       card.itemId !== snapshot.itemId ||
       card.number !== snapshot.number
     ) {
-      await this.deps.board.release(claimed);
+      // A changed/missing Project identity cannot authorize even claim release.
+      // Preserve the original claim for a fresh matching observation/manual cleanup.
       return {
         status: "skipped",
         reason: "issue identity changed after claim",
@@ -1225,20 +1159,6 @@ export function createProductionTicketExecutor(options: {
   const board: TicketBoardAdapter = {
     decisionComments: (card) => listIssueComments(card.repoOwner!, card.repoName!, card.number!),
     reopen: async (card) => reopenIssue(await resolveIssueId(card.repoOwner!, card.repoName!, card.number!)),
-    conflict: {
-      listComments: (card) =>
-        listIssueComments(card.repoOwner!, card.repoName!, card.number!),
-      createComment: async (card, body) =>
-        createComment(
-          await resolveIssueId(card.repoOwner!, card.repoName!, card.number!),
-          body,
-        ),
-      updateComment: (_card, id, body) => updateIssueComment(id, body),
-      reopen: async (card) =>
-        reopenIssue(
-          await resolveIssueId(card.repoOwner!, card.repoName!, card.number!),
-        ),
-    },
     getCard: (itemId) =>
       getCard(
         itemId,

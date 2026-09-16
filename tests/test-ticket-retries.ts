@@ -30,8 +30,8 @@ function fixture() {
   const number = ++sequence;
   const cfg = structuredClone(_DEFAULTS);
   cfg.max_workers = 1;
-  cfg.review.enabled = true;
-  cfg.safety.require_clean_worktree = cfg.context.enabled = cfg.refine.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+
+  cfg.safety.require_clean_worktree = cfg.context.enabled = cfg.telegram.enabled = false;
   const card: Card = { itemId: `RETRY_${number}`, number, contentType: "Issue", type: "Task", title: `T${number} task`, body: "Approved acceptance criteria", repoOwner: "owner", repoName: "repo", closed: false, status: cfg.columns.ready, assignees: [] };
   const store = new TicketWorktrees(repo), comments: IssueComment[] = [], events: string[] = [], notices: string[] = [];
   const runs: PersistedRunState[] = [];
@@ -55,8 +55,8 @@ function fixture() {
     pauseAndWait: async () => {}, dispose() {},
   };
   const executor = new ManagedTicketExecutor({ cwd: repo, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo", worktrees: store, board, callback: (s) => notices.push(s), createManager: () => manager });
-  executor.repairFor = async () => assert.fail("New path must not read repair authority");
-  executor.repairForReview = async () => assert.fail("New path must not require repair/test-history evidence");
+  assert.equal("repairFor" in executor, false, "New path has no repair authority API");
+  assert.equal("repairForReview" in executor, false, "New path has no test-history evidence API");
   let reviewImpl = async (_input: ReviewInput): Promise<CompletedReview> => ({ verdict: "pass", summary: "Looks good", findings: [], taskSha: baseSha });
   const loop = new BoardLoop({ cwd: repo, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: (s) => notices.push(s), meta: { projectId: "P", statusFieldId: "S", statusOptions: {} }, listCards: async () => [structuredClone(card)], boardOps: {
     claim: board.claim, refresh: () => board.getCard(card.itemId), release: board.release,

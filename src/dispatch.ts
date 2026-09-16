@@ -37,8 +37,6 @@ export interface WaveOutcome extends Partial<Decision> {
   limitations?: string;
   workaround?: string;
   humanAction?: string;
-  /** Legacy helper compatibility only; new execution never requires this evidence. */
-  testEvidence?: unknown;
 }
 
 /** Strictly normalize a persisted workflow result; malformed entries are not guessed. */
@@ -72,7 +70,6 @@ export function normalizeWaveResults(raw: unknown): WaveOutcome[] {
       limitations: typeof result.limitations === "string" ? result.limitations : undefined,
       workaround: typeof result.workaround === "string" ? result.workaround : undefined,
       humanAction: typeof result.humanAction === "string" ? result.humanAction : undefined,
-      ...(Object.hasOwn(result, "testEvidence") ? { testEvidence: result.testEvidence } : {}),
     });
   }
   return outcomes;

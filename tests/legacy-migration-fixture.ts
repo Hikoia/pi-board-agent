@@ -11,7 +11,7 @@ import type { TicketBoardAdapter } from "../src/ticket-executor.js";
 import { TicketWorktrees, type TicketExecutionRecord } from "../src/ticket-worktree.js";
 import { buildTasksForWave } from "../src/workflow-prompt.js";
 import { conflictRequestKey } from "../src/legacy-tickets.js";
-import type { RepairRequest } from "../src/repair.js";
+import type { RepairRequest } from "../src/legacy-tickets.js";
 
 export const git = (cwd: string, ...args: string[]) => execFileSync("git", args, {
   cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
@@ -31,7 +31,7 @@ export async function fixture() {
   git(repo, "remote", "add", "origin", origin); git(repo, "push", "origin", "main");
   const sha = git(repo, "rev-parse", "HEAD");
   const cfg = structuredClone(_DEFAULTS);
-  cfg.context.enabled = cfg.review.enabled = cfg.refine.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+  cfg.context.enabled = cfg.telegram.enabled = false;
   cfg.safety.require_clean_worktree = false;
   const store = new TicketWorktrees(repo), cards: Card[] = [], comments: IssueComment[] = [], writes: string[] = [];
   const board: TicketBoardAdapter = {
@@ -41,13 +41,8 @@ export async function fixture() {
     release: async (card) => { writes.push(`release:${card.itemId}`); cards.find((c) => c.itemId === card.itemId)!.assignees = []; },
     listComments: async () => comments.map((c) => c.body),
     comment: async (_card, body) => { writes.push("comment"); comments.push({ id: `C${comments.length}`, author: "bot", body, createdAt: new Date().toISOString() }); },
-    conflict: {
-      listComments: async (card) => structuredClone(comments.filter((c) => c.id === `repair-${card.itemId}`)),
-      createComment: async () => assert.fail("No new legacy repair protocol"),
-      updateComment: async () => assert.fail("Old comments stay read-only"),
-      reopen: async () => assert.fail("Migration does not reopen issues"),
-    },
   };
+  board.decisionComments = async (card) => structuredClone(comments.filter((c) => c.id === `repair-${card.itemId}`));
   const deps = { worktrees: store, cwd: repo, cfg, board, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {} };
   async function ticket(name: string, status: string = cfg.columns.building) {
     const card: Card = { itemId: name, number: cards.length + 1, contentType: "Issue", type: "Task", title: `T002 ${name}`,

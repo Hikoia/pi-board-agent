@@ -106,7 +106,7 @@ try {
   git(repo, "remote", "add", "origin", origin);
   git(repo, "push", "origin", "main");
   const cfg = structuredClone(deps.cfg);
-  cfg.refine.enabled = cfg.review.enabled = cfg.watchdog.enabled = false;
+
   const worktrees = new TicketWorktrees(repo);
   const card = {
     itemId: "PVTI_9", contentType: "Issue" as const, number: 9, title: "Task", body: "Acceptance",

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -8,9 +8,6 @@ import {
   openSync,
   readFileSync,
   readdirSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { workflowProjectPaths, type PersistedRunState } from "@quintinshaw/pi-dynamic-workflows";
@@ -21,32 +18,32 @@ import { directoryStamps, exactKeys, isCleanupSnapshot, readRegular, removeSnaps
 import type { BuilderTask } from "./workflow-prompt.js";
 import { sameTicketContract } from "./ticket-retry.js";
 import { assertOwnerLock, type OwnerLock } from "./owner-lock.js";
-import type { Config } from "./config.js";
-import { planSlug, taskBranch } from "./config.js";
+import { legacyNeedsDesignColumn, type Config } from "./config.js";
 import { isTargetIssue, type Card, type IssueComment } from "./gh.js";
-import { isRepairRequest, type RepairRequest } from "./repair.js";
 import {
-  isTicketExecutionRecord, git, mustGit, samePath, singleLine,
+  isTicketExecutionRecord, mustGit, samePath, singleLine,
   type TicketFinalizationState,
   type TicketExecutionRecord,
   type TicketExecutionRecordV4,
   type TicketWorktrees,
 } from "./ticket-worktree.js";
 
-/** Deliberately optional on offline boards. Never substitute live APIs for a
- * missing author-aware reader or write capability. Mutation replies aren't authority. */
-export interface ConflictBoardOps {
-  listComments(card: Card): Promise<IssueComment[]>;
-  createComment(card: Card, body: string): Promise<string>;
-  updateComment(card: Card, id: string, body: string): Promise<void>;
-  reopen(card: Card): Promise<void>;
+export interface RepairRequest {
+  requestKey: string;
+  baseSha: string;
+  taskSha: string;
 }
-export interface RepairBlocker {
-  status: "blocked";
-  reason: string;
-  repair?: RepairRequest;
+
+
+export function isRepairRequest(value: unknown): value is RepairRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const r = value as Record<string, unknown>;
+  return Object.keys(r).length === 3 &&
+    typeof r.requestKey === "string" && /^[a-zA-Z0-9._:-]{1,200}$/.test(r.requestKey) &&
+    typeof r.baseSha === "string" && /^[0-9a-f]{40}$/.test(r.baseSha) &&
+    typeof r.taskSha === "string" && /^[0-9a-f]{40}$/.test(r.taskSha);
 }
-class HandoffChanged extends Error {}
+
 type Step =
   | "comment"
   | "ready"
@@ -101,10 +98,6 @@ function identity(card: Card) {
     body: card.body,
   };
 }
-function marker(h: Handoff, phase: "requested" | "queued" | "consumed") {
-  return `${PREFIX}v1:${h.request.requestKey} -->\n${JSON.stringify({ schemaVersion: 1, ...h.request, itemId: h.card.itemId, issueNumber: h.card.number, repoOwner: h.card.repoOwner, repoName: h.card.repoName, plan: h.card.plan, title: h.card.title, bodyHash: hash(h.card.body), taskBranch: h.record.taskBranch, baseBranch: h.record.baseBranch, recordCreatedAt: h.record.createdAt, phase })}`;
-}
-
 interface CleanupReceipt {
   schemaVersion: 1;
   itemId: string;
@@ -129,7 +122,7 @@ export interface LegacyMigrationReport {
 
 /** The only v3 interpreter. Conversion never starts a manager, rewrites a run,
  * changes Git/worktree contents, or writes/collects old repair/cleanup evidence.
- * The old v3 execution methods below remain only until T003/T004 replace them. */
+ * Legacy repair ledgers and workflow journals are read-only. */
 export class LegacyTickets {
   private readonly dir: string;
   private owner?: OwnerLock;
@@ -146,7 +139,7 @@ export class LegacyTickets {
       repoOwner: string;
       repoName: string;
       board: {
-        conflict?: ConflictBoardOps;
+        decisionComments?(card: Card): Promise<IssueComment[]>;
         getCard(itemId: string): Promise<Card | undefined>;
         setStatus(itemId: string, status: string): Promise<void>;
       };
@@ -315,8 +308,8 @@ export class LegacyTickets {
         // A corrupt/lost ledger cannot turn an authentic pending repair marker
         // into an ordinary Ready launch. Its issue scopes the failure; other
         // tickets with damaged, unidentifiable files remain independent.
-        if (this.deps.board.conflict) {
-          const comments = await this.deps.board.conflict.listComments(card);
+        if (this.deps.board.decisionComments) {
+          const comments = await this.deps.board.decisionComments(card);
           if (comments.some((c) => c.author?.toLowerCase() === this.deps.botLogin.toLowerCase() &&
               c.body.startsWith(PREFIX) && !handoffs.some((h) =>
                 h.commentId === c.id && c.body.includes(h.request.requestKey))))
@@ -696,10 +689,9 @@ export class LegacyTickets {
     const { cfg, board } = this.deps;
     if (!this.owner) return; // only owner-held startup/recovery converts old lanes
     this.pendingDesign.delete(expected.itemId);
-    if (expected.closed || expected.status?.toLowerCase() !== cfg.columns.needs_design.toLowerCase() ||
+    if (expected.closed || expected.status?.toLowerCase() !== legacyNeedsDesignColumn(cfg).toLowerCase() ||
         !isTargetIssue(expected, this.deps.repoOwner, this.deps.repoName, "Task")) return;
-    // A failed/stale lane write must not fall through to the still-staged v3
-    // designer. Re-observe this ticket next tick, independently of other work.
+    // Re-observe a failed/stale migration independently of other tickets.
     this.pendingDesign.add(expected.itemId);
     const card = await board.getCard(expected.itemId);
     if (!card || !equal(identity(card), identity(expected)) || card.closed ||
@@ -827,476 +819,6 @@ export class LegacyTickets {
     }
     return result;
   }
-  private save(h: Handoff, previous?: Handoff): void {
-    if (this.deps.worktrees.read(h.card.itemId)?.schemaVersion === 4 || this.blockedReason(h.card.itemId))
-      throw new Error("Legacy repair ledger is read-only after migration.");
-    const path = this.file(h.request.requestKey);
-    this.safePath(path);
-    if (!equal(this.read(h.request.requestKey), previous))
-      throw new Error("Repair ledger changed.");
-    mkdirSync(this.dir, { recursive: true });
-    const temp = `${path}.${randomUUID()}.tmp`;
-    try {
-      writeFileSync(temp, JSON.stringify(h, null, 2), {
-        flag: "wx",
-        flush: true,
-      });
-      this.safePath(path);
-      if (!equal(this.read(h.request.requestKey), previous))
-        throw new Error("Repair ledger changed before replacement.");
-      renameSync(temp, path);
-      if (process.platform !== "win32") {
-        const fd = openSync(this.dir, "r");
-        try {
-          fsyncSync(fd);
-        } finally {
-          closeSync(fd);
-        }
-      }
-    } finally {
-      if (existsSync(temp)) unlinkSync(temp);
-    }
-  }
-  private change(h: Handoff, patch: Partial<Handoff>): Handoff {
-    const next = { ...h, ...patch };
-    this.save(next, h);
-    return next;
-  }
-  private ops(): ConflictBoardOps {
-    const ops = this.deps.board.conflict;
-    if (!ops)
-      throw new Error(
-        "Conflict repair requires an author-aware board adapter; preserved for manual resolution.",
-      );
-    return ops;
-  }
-  private async comments(
-    h: Handoff,
-    phases: Array<"requested" | "queued" | "consumed">,
-  ): Promise<IssueComment | undefined> {
-    const comments = await this.ops().listComments({
-      ...h.card,
-      closed: false,
-      assignees: [],
-    });
-    if (
-      !Array.isArray(comments) ||
-      new Set(comments.map((c) => c.id)).size !== comments.length
-    )
-      throw new Error("Ambiguous repair comment read.");
-    const botComments = comments.filter(
-      (c) => c.author?.toLowerCase() === this.deps.botLogin.toLowerCase(),
-    );
-    const candidates = botComments.filter(
-      (c) =>
-        c.id === h.commentId ||
-        (c.body.startsWith(PREFIX) && c.body.includes(h.request.requestKey)),
-    );
-    if (
-      candidates.length > 1 ||
-      candidates.some((c) => !phases.some((p) => c.body === marker(h, p))) ||
-      (h.commentId && candidates[0]?.id !== h.commentId)
-    )
-      throw new Error(
-        "Repair comment author, identity or exact versioned data changed.",
-      );
-    return candidates[0];
-  }
-  /** Closed handoff needs the exact remote pair; open Ready confirmation may
-   * accept base descendants, with prepareRepair's original ancestry/owner gates. */
-  private async prepareConflict(
-    record: TicketExecutionRecord,
-    repair: RepairRequest,
-    allowBaseAdvance = false,
-  ): Promise<void> {
-    const current = await this.deps.worktrees.cleanupRecord({
-      ...record,
-      title: "",
-      body: "",
-    });
-    if (JSON.stringify(current) !== JSON.stringify(record))
-      throw new Error("Conflict record changed.");
-    await this.prepareRepair(record, repair);
-    if (
-      !allowBaseAdvance &&
-      this.deps.worktrees.fetchedSha(record.baseBranch) !== repair.baseSha
-    )
-      throw new Error("Conflict base advanced before handoff.");
-    this.checkConflict(record, repair);
-  }
-
-  private checkConflict(record: TicketExecutionRecord, repair: RepairRequest): void {
-    this.deps.worktrees.cleanupRecord({ ...record, title: "", body: "" });
-    if (!equal(this.deps.worktrees.read(record.itemId), record)) throw new Error("Conflict record changed.");
-    this.checkRepairStart(record, repair);
-  }
-
-  /** Initial admission only. Durable recovery intentionally does not repeat the
-   * original-SHA/clean gate: the same run may have an interrupted dirty merge. */
-  private async prepareRepair(
-    record: TicketExecutionRecord,
-    repair: RepairRequest,
-  ): Promise<void> {
-    this.checkRepairStart(record, repair);
-    await this.deps.worktrees.fetchRequired(record.baseBranch, record.taskBranch);
-    if (this.deps.worktrees.fetchedSha(record.taskBranch) !== repair.taskSha)
-      throw new Error(
-        "Repair remote task SHA no longer matches the original task.",
-      );
-    if (
-      mustGit(["cat-file", "-t", repair.baseSha], this.deps.worktrees.repoRoot) !== "commit" ||
-      !this.deps.worktrees.isAncestor(repair.baseSha, this.deps.worktrees.fetchedSha(record.baseBranch))
-    )
-      throw new Error(
-        "Repair designated base is missing from the remote base history.",
-      );
-    this.checkRepairStart(record, repair);
-  }
-
-  /** Synchronous recheck after the final admission/card await, before start(). */
-  private checkRepairStart(record: TicketExecutionRecord, repair: RepairRequest): void {
-    if (!isRepairRequest(repair)) throw new Error("Invalid repair request.");
-    if (record.finalization || record.integration || this.deps.worktrees.hasCleanupReceipt(record.itemId))
-      throw new Error("Pending finalization owns the ticket.");
-    const check = this.deps.worktrees.check(record, true);
-    if (!check.ok) throw new Error(check.reason ?? "Unsafe repair worktree.");
-    if (this.deps.worktrees.localBranchSha(record.taskBranch) !== repair.taskSha)
-      throw new Error(
-        "Repair initial task SHA no longer matches the original task.",
-      );
-    if (git(["rev-parse", "--verify", "MERGE_HEAD"], record.path).ok)
-      throw new Error(
-        "An interrupted merge may only resume its existing durable run.",
-      );
-  }
-
-
-  private async current(
-    h: Handoff,
-    status: string,
-    closed: boolean,
-    canWork: () => boolean | Promise<boolean>,
-    canNow: () => boolean,
-    prior?: { status: string; closed: boolean },
-  ): Promise<Card> {
-    if (!(await canWork())) throw new Error("Repair admissions stopped.");
-    const { worktrees, cfg } = this.deps;
-    const record = worktrees.read(h.card.itemId);
-    if (!equal(record, h.record) || worktrees.hasCleanupReceipt(h.card.itemId))
-      throw new HandoffChanged(
-        "Repair record changed or cleanup owns the ticket.",
-      );
-    if (
-      record!.baseBranch !== cfg.branches.base ||
-      record!.taskBranch !==
-        taskBranch(cfg.branches.task_prefix, h.card.number) ||
-      planSlug(h.card.plan) !== record!.plan
-    )
-      throw new HandoffChanged("Repair branch or Plan changed.");
-    await this.prepareConflict(
-      record!,
-      h.request,
-      !closed && status === cfg.columns.ready,
-    );
-    const card = await this.deps.board.getCard(h.card.itemId);
-    if (
-      !card ||
-      !equal(identity(card), h.card) ||
-      card.repoOwner?.toLowerCase() !== this.deps.repoOwner.toLowerCase() ||
-      card.repoName?.toLowerCase() !== this.deps.repoName.toLowerCase() ||
-      card.assignees.length > 1 ||
-      card.assignees.some(
-        (a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase(),
-      ) ||
-      !equal(worktrees.read(h.card.itemId), h.record)
-    )
-      throw new HandoffChanged(
-        "Repair card identity, claim or record changed; handoff blocked.",
-      );
-    if (card.status !== status || card.closed !== closed) {
-      if (prior && card.status === prior.status && card.closed === prior.closed)
-        throw new Error("Repair write not yet confirmed; not replaying.");
-      throw new HandoffChanged(
-        "Repair lane/closed state changed; handoff blocked.",
-      );
-    }
-    this.checkConflict(record!, h.request);
-    if (!canNow())
-      throw new Error("Repair admissions stopped after fresh read.");
-    return card;
-  }
-
-  async request(
-    card: Card,
-    request: RepairRequest,
-    canWork: () => boolean | Promise<boolean>,
-    canNow: () => boolean,
-  ): Promise<void> {
-    this.ops();
-    let h = this.read(request.requestKey);
-    if (h?.step === "consumed" || h?.step === "launching")
-      throw new Error(
-        "Conflict request already consumed; automatic repair will not rerun it.",
-      );
-    if (!h) {
-      if (
-        this.all().some(
-          (v) => v.card.itemId === card.itemId && v.step !== "consumed",
-        )
-      )
-        throw new Error("Another repair handoff is pending.");
-      const record = this.deps.worktrees.read(card.itemId);
-      if (
-        !record ||
-        record.finalization ||
-        record.activeRunId ||
-        record.launchingAt !== undefined ||
-        record.issueNumber !== card.number ||
-        !card.plan
-      )
-        throw new Error("Repair requires the matching idle original record.");
-      h = {
-        schemaVersion: 1,
-        request,
-        card: identity(card),
-        record,
-        step: "comment",
-        attempted: false,
-        commentId: null,
-        runId: null,
-        notice: null,
-      };
-      await this.current(h, this.deps.cfg.columns.done, true, canWork, canNow);
-      this.save(h);
-    }
-    await this.progress(h, canWork, canNow);
-  }
-
-  private async progress(
-    h: Handoff,
-    canWork: () => boolean | Promise<boolean>,
-    canNow: () => boolean,
-  ): Promise<void> {
-    const ops = this.ops(),
-      { cfg, board } = this.deps;
-    if (h.step === "blocked")
-      throw new Error(
-        "Repair handoff was invalidated by a later card/claim/record change.",
-      );
-    try {
-      while (!["queued", "launching", "consumed"].includes(h.step)) {
-        const phase = h.step === "consume" ? "queued" : "requested";
-        const afterPhase =
-          h.step === "consume"
-            ? "consumed"
-            : h.step === "queue"
-              ? "queued"
-              : "requested";
-        const comment = await this.comments(
-          h,
-          h.attempted ? [phase, afterPhase] : [phase],
-        );
-        const nextStep: Step =
-          h.step === "comment"
-            ? "ready"
-            : h.step === "ready"
-              ? "reopen"
-              : h.step === "reopen"
-                ? "queue"
-                : h.step === "queue"
-                  ? "queued"
-                  : "launching";
-        if (h.attempted) {
-          // Never blindly replay a write. Confirm its complete observable result,
-          // including actual author; unchanged/unknown state remains blocked.
-          if (
-            !comment ||
-            ((h.step === "queue" || h.step === "consume") &&
-              comment.body !== marker(h, afterPhase))
-          )
-            throw new Error(
-              "Cannot confirm attempted repair comment write; not replaying.",
-            );
-          await this.current(
-            h,
-            h.step === "comment" ? cfg.columns.done : cfg.columns.ready,
-            ["comment", "ready"].includes(h.step),
-            canWork,
-            canNow,
-            h.step === "ready"
-              ? { status: cfg.columns.done, closed: true }
-              : h.step === "reopen"
-                ? { status: cfg.columns.ready, closed: true }
-                : undefined,
-          );
-          h = this.change(h, {
-            step: nextStep,
-            attempted: false,
-            commentId: comment.id,
-          });
-          continue;
-        }
-        if (h.step !== "comment" && !comment)
-          throw new Error("Authentic repair marker is missing.");
-        if (h.step === "comment" && comment)
-          throw new Error(
-            "Unjournaled repair comment cannot authorize a handoff.",
-          );
-        const card = await this.current(
-          h,
-          ["comment", "ready"].includes(h.step)
-            ? cfg.columns.done
-            : cfg.columns.ready,
-          ["comment", "ready", "reopen"].includes(h.step),
-          canWork,
-          canNow,
-        );
-        h = this.change(h, { attempted: true }); // durable BEFORE every GitHub write
-        if (h.step === "comment")
-          await ops.createComment(card, marker(h, "requested"));
-        else if (h.step === "ready")
-          await board.setStatus(card.itemId, cfg.columns.ready);
-        else if (h.step === "reopen") await ops.reopen(card);
-        else await ops.updateComment(card, h.commentId!, marker(h, afterPhase));
-      }
-    } catch (error) {
-      if (error instanceof HandoffChanged) this.change(h, { step: "blocked" });
-      throw error;
-    }
-  }
-
-  async reconcile(
-    canWork: () => boolean | Promise<boolean>,
-    canNow: () => boolean,
-  ): Promise<Array<RepairBlocker & { itemId: string }>> {
-    const blockers: Array<RepairBlocker & { itemId: string }> = [];
-    for (const h of this.all()) {
-      if (this.deps.worktrees.read(h.card.itemId)?.schemaVersion === 4 || this.blockedReason(h.card.itemId)) continue;
-      if (["launching", "consumed", "blocked"].includes(h.step)) continue;
-      const unattemptedConsume = h.step === "consume" && !h.attempted;
-      try {
-        if (h.step === "queued" || unattemptedConsume) {
-          if (!(await this.comments(h, ["queued"])))
-            throw new Error("Queued repair marker missing.");
-          await this.current(
-            h,
-            this.deps.cfg.columns.ready,
-            false,
-            canWork,
-            canNow,
-          );
-          // No consume write was attempted: re-enter normal capacity/launch admission,
-          // not a consumed launch window with no builder to recover.
-          if (unattemptedConsume) this.change(h, { step: "queued" });
-        } else await this.progress(h, canWork, canNow);
-      } catch (error) {
-        if (
-          (h.step === "queued" || unattemptedConsume) &&
-          error instanceof HandoffChanged
-        )
-          this.change(h, { step: "blocked" });
-        blockers.push({
-          itemId: h.card.itemId,
-          status: "blocked",
-          repair: h.request,
-          reason: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-    return blockers;
-  }
-  async repairFor(
-    card: Card,
-  ): Promise<RepairRequest | RepairBlocker | undefined> {
-    let h: Handoff | undefined;
-    try {
-      const blocked = this.blockedReason(card.itemId);
-      if (blocked) throw new Error(blocked);
-      if (this.deps.worktrees.read(card.itemId)?.schemaVersion === 4) return undefined;
-      const pending = this.all(card.itemId).filter(
-        (h) => h.card.itemId === card.itemId && h.step !== "consumed",
-      );
-      if (pending.length > 1)
-        throw new Error("Multiple pending repair requests.");
-      if (!pending.length) {
-        // A lost local ledger is not permission to execute a remote marker as an
-        // ordinary Ready task. Forged non-bot comments never participate.
-        if (this.deps.board.conflict) {
-          const known = this.all().filter((h) => h.card.itemId === card.itemId);
-          const comments = await this.ops().listComments(card);
-          if (
-            comments.some(
-              (c) =>
-                c.author?.toLowerCase() === this.deps.botLogin.toLowerCase() &&
-                c.body.startsWith(PREFIX) &&
-                !known.some(
-                  (h) =>
-                    h.commentId === c.id && c.body === marker(h, "consumed"),
-                ),
-            )
-          )
-            throw new Error(
-              "Unrecognized authentic repair marker; ordinary launch blocked.",
-            );
-        }
-        return undefined;
-      }
-      h = pending[0];
-      if (
-        h.step !== "queued" ||
-        !equal(identity(card), h.card) ||
-        card.closed ||
-        card.status !== this.deps.cfg.columns.ready
-      )
-        throw new Error("Repair handoff is not confirmed queued.");
-      if (!(await this.comments(h, ["queued"])))
-        throw new Error("Queued repair marker missing.");
-      return { ...h.request };
-    } catch (error) {
-      return {
-        status: "blocked",
-        repair: h?.request,
-        reason: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-  assertLaunch(itemId: string, repair?: RepairRequest): void {
-    const blocked = this.blockedReason(itemId);
-    if (blocked) throw new Error(blocked);
-    if (this.deps.worktrees.read(itemId)?.schemaVersion === 4) {
-      if (repair) throw new Error("Migrated tickets use ordinary build retry, not a new repair protocol.");
-      return;
-    }
-    const pending = this.all(itemId).filter(
-      (h) => h.card.itemId === itemId && h.step !== "consumed",
-    );
-    if (
-      pending.length &&
-      (pending.length !== 1 ||
-        pending[0].step !== "queued" ||
-        !equal(pending[0].request, repair))
-    )
-      throw new Error("Launch must bind the unique queued repair request.");
-    if (
-      repair?.requestKey.startsWith("conflict-") &&
-      (!pending.length || !equal(pending[0].request, repair))
-    )
-      throw new Error("Conflict repair is missing its queued authorization.");
-  }
-  async consume(
-    repair: RepairRequest,
-    canWork: () => boolean | Promise<boolean>,
-    canNow: () => boolean,
-  ): Promise<void> {
-    const h = this.readIfConflict(repair);
-    if (!h) return; // T14's trusted optional builder input remains usable independently.
-    if (h.step !== "queued") throw new Error("Repair request is not queued.");
-    await this.progress(
-      this.change(h, { step: "consume", attempted: false }),
-      canWork,
-      canNow,
-    );
-  }
   private readIfConflict(repair: RepairRequest) {
     return repair.requestKey.startsWith("conflict-")
       ? this.read(repair.requestKey)
@@ -1312,14 +834,6 @@ export class LegacyTickets {
     const bound = handoffs.filter(
       (h) => !!runId && h.runId === runId && h.step === "consumed",
     );
-    // The old process may have persisted its run before binding the ledger. The
-    // immutable journal supplies that binding; do not rewrite the ledger to bind.
-    if (handoffs.length && !bound.length && record.schemaVersion === 4 && runId) {
-      const run = this.runs(record).find((r) => r.runId === runId);
-      const repair = (run?.args as { repair?: unknown } | undefined)?.repair;
-      if (repair) bound.push(...handoffs.filter((h) =>
-        (!h.runId || h.runId === runId) && equal(h.request, repair)));
-    }
     if (bound.length > 1)
       throw new Error("Multiple repair requests bind the same run.");
     const h = bound[0];
@@ -1334,13 +848,13 @@ export class LegacyTickets {
       throw new Error("Repair run binding does not match the ticket record.");
     return h;
   }
-  requestForRun(
+  private requestForRun(
     record: TicketExecutionRecord,
     runId?: string,
   ): RepairRequest | undefined {
     return this.boundRun(record, runId)?.request;
   }
-  matches(
+  private matches(
     record: TicketExecutionRecord,
     args: unknown,
     runId = record.activeRunId,
@@ -1367,119 +881,5 @@ export class LegacyTickets {
       (!h.runId || h.runId === runId)
     );
   }
-  isUnstarted(record: TicketExecutionRecord): boolean {
-    if (record.schemaVersion === 4) return false;
-    return (
-      !record.activeRunId &&
-      record.launchingAt === undefined &&
-      this.execution(record)?.step === "launching"
-    );
-  }
-  private execution(
-    record: TicketExecutionRecord,
-    runId = record.activeRunId,
-  ): Handoff | undefined {
-    return (
-      this.boundRun(record, runId) ??
-      (record.schemaVersion === 3 ? this.all(record.itemId).find(
-        (h) => h.step === "launching",
-      ) : undefined)
-    );
-  }
-  /** Fresh authorization for both recovery and every repair settlement write.
-   * A lost claim/changed human contract stops only local work, never writeback. */
-  async executionCard(
-    record: TicketExecutionRecord,
-    expected: Card,
-    runId = record.activeRunId,
-  ): Promise<Card | undefined> {
-    const h = this.execution(record, runId);
-    if (!h) return expected;
-    if (!(await this.comments(h, ["consumed"])))
-      throw new Error("Consumed repair authorization is missing.");
-    const card = await this.deps.board.getCard(record.itemId);
-    if (
-      !equal(this.deps.worktrees.read(record.itemId), record) ||
-      this.deps.worktrees.hasCleanupReceipt(record.itemId)
-    )
-      throw new Error("Repair execution record changed during authorization.");
-    return card &&
-      equal(identity(card), h.card) &&
-      !card.closed &&
-      card.status === expected.status &&
-      card.assignees.length === 1 &&
-      card.assignees[0].toLowerCase() === this.deps.botLogin.toLowerCase()
-      ? card
-      : undefined;
-  }
-  /** Only repair terminal notices use this write-ahead protection. Ordinary
-   * executor comments keep their original behavior. Absence after an attempted
-   * create is ambiguous, not permission to create another comment. */
-  async terminalNotice(
-    record: TicketExecutionRecord,
-    card: Card,
-    body: string,
-  ): Promise<boolean> {
-    let h = this.execution(record);
-    if (!h || (record.schemaVersion === 4 && !h.notice)) return false;
-    if (h.notice && h.notice.body !== body)
-      throw new Error(
-        "Repair terminal notice changed; previous write must be reconciled.",
-      );
-    const confirm = async () => {
-      const matches = (await this.ops().listComments(card)).filter(
-        (c) =>
-          c.author?.toLowerCase() === this.deps.botLogin.toLowerCase() &&
-          (c.id === h!.notice?.id || c.body === body),
-      );
-      if (
-        matches.length > 1 ||
-        matches.some((c) => c.body !== body) ||
-        (h!.notice?.id && matches[0]?.id !== h!.notice.id)
-      )
-        throw new Error("Ambiguous repair terminal notice author/data.");
-      return matches[0];
-    };
-    let comment = await confirm();
-    if (!comment) {
-      if (h.notice)
-        throw new Error(
-          "Cannot confirm attempted repair terminal notice; not replaying.",
-        );
-      await this.assertSettlement(record, card);
-      h = this.change(h, { notice: { body, id: null } });
-      await this.ops().createComment(card, body);
-      comment = await confirm();
-      if (!comment)
-        throw new Error("Repair terminal notice author/data not confirmed.");
-    }
-    await this.assertSettlement(record, card);
-    if (record.schemaVersion !== 4) this.change(h, { notice: { body, id: comment.id } });
-    return true;
-  }
-  async assertSettlement(
-    record: TicketExecutionRecord,
-    card: Card,
-  ): Promise<void> {
-    if (!(await this.executionCard(record, card)))
-      throw new Error("Repair settlement lost its fresh card/claim authority.");
-  }
-  abandon(record: TicketExecutionRecord): void {
-    if (record.schemaVersion === 4) return;
-    const h = this.execution(record);
-    if (h?.step === "launching")
-      this.change(h, { step: "consumed", runId: record.activeRunId ?? null });
-  }
-  bind(record: TicketExecutionRecord, runId: string, args: unknown): void {
-    if (record.schemaVersion === 4) {
-      if (!this.matches(record, args, runId)) throw new Error("Legacy run arguments changed.");
-      return;
-    }
-    const repair = (args as { repair?: RepairRequest } | undefined)?.repair;
-    if (!repair?.requestKey.startsWith("conflict-")) return;
-    const h = this.readIfConflict(repair);
-    if (!h || !equal(h.request, repair) || (h.runId && h.runId !== runId))
-      throw new Error("Repair run binding changed.");
-    if (h.step !== "consumed") this.change(h, { step: "consumed", runId });
-  }
+
 }

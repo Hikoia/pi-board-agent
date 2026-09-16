@@ -12,7 +12,7 @@ for (const verdict of ["pass", "fail"] as const) {
     return result;
   });
   f.setReview(async (input) => {
-    reviews++; assert.equal(input.repair?.testEvidence.resultSha, sha);
+    reviews++; assert.equal("repair" in input, false, "review has no legacy evidence protocol");
     return runReview(input, async (_source, options) => {
       assert.equal(git(options.cwd, "rev-parse", "HEAD"), sha);
       return { result: { verdict, summary: verdict, findings: verdict === "pass" ? [] : ["Needs human decision"] } };
@@ -23,7 +23,7 @@ for (const verdict of ["pass", "fail"] as const) {
     assert.equal(f.card.status, f.cfg.columns.review, f.notices.join("\n"));
     assert.equal(f.card.closed, false); assert.equal(reviews, 0, "review.enabled authoritative");
     git(f.repo, "merge-base", "--is-ancestor", f.taskSha, sha); git(f.repo, "merge-base", "--is-ancestor", f.baseSha, sha);
-    f.cfg.review.enabled = true;
+
     await f.loop.tickNow(); assert.equal(reviews, 1);
     assert.equal(f.card.closed, false, "neither builder nor Review closes repair");
     assert.equal(f.card.status, verdict === "pass" ? f.cfg.columns.done : f.cfg.columns.needs_human, "repair review failure never automatically retries Ready");

@@ -13,11 +13,9 @@ import { buildStandardSpecs } from "../src/init-project.js";
 import { allocateWorkerSlots, BoardLoop, createLoopState, type LoopBoardOps, type LoopDeps } from "../src/loop.js";
 import { makeNotifier, mdToHtml } from "../src/notify.js";
 import { isPlanComplete, summarizePlans } from "../src/plan.js";
-import { parseRefineOutput, renderQuestionsComment, renderRefineComment, renderRefineWorkflowSource, type RefineOutput } from "../src/refine.js";
 import { parseReviewOutput, renderReviewComment, renderReviewWorkflowSource } from "../src/review.js";
 import type { TicketExecutor } from "../src/ticket-executor.js";
 import { TicketWorktrees } from "../src/ticket-worktree.js";
-import { renderFixWorkflowSource, renderReplyWorkflowSource, WatchdogStateStore } from "../src/watchdog.js";
 import { buildTasksForWave, extractTaskKey, renderWorkflowSource } from "../src/workflow-prompt.js";
 
 const root = process.env.TMP_DIR!;
@@ -30,8 +28,6 @@ const cfg: Config = {
   ...structuredClone(_DEFAULTS),
   project: { owner: "test", number: 1 },
   context: { ..._DEFAULTS.context, enabled: false },
-  refine: { ..._DEFAULTS.refine, enabled: false },
-  watchdog: { ..._DEFAULTS.watchdog, enabled: false },
   telegram: { ..._DEFAULTS.telegram, enabled: false },
 };
 const card = (number: number, patch: Partial<Card> = {}): Card => ({
@@ -44,8 +40,8 @@ const card = (number: number, patch: Partial<Card> = {}): Card => ({
 // Defaults/standard Project fields that disappeared with the generated tests.
 check(_DEFAULTS.max_workers === 2 && _DEFAULTS.columns.ready === "Ready" && _DEFAULTS.columns.needs_human === "Needs Human", "default worker budget and board columns remain stable");
 const statuses = buildStandardSpecs(cfg)[0].options ?? [];
-check(statuses.length === 7 && statuses.includes("Needs Human"), "init-project creates seven statuses including Needs Human");
-check(!_DEFAULTS.review.enabled && _DEFAULTS.models.review === "deepseek-v4-flash-0731", "AI review defaults disabled with its configured model");
+check(statuses.length === 5 && statuses.includes("Needs Human"), "init-project creates five statuses including Needs Human");
+check(!Object.hasOwn(_DEFAULTS.review, "enabled") && _DEFAULTS.models.review === "deepseek-v4-flash-0731", "AI review is mandatory with its configured model");
 validateConfig(cfg); // The invalid cases below cannot pass due to an unrelated invalid default.
 assert.throws(() => validateConfig({ ...cfg, max_workers: 20 }), ConfigError);
 console.log("PASS: validation rejects max_workers above 16 on an otherwise valid config");
@@ -168,22 +164,6 @@ const withContext = await execute(renderWorkflowSource({ cfg, planSlug: "001-aut
 check(withContext.prompt.includes("REPO CONTEXT") && withContext.prompt.includes(tricky), "generated workflow executes context as literal data, including quotes and template syntax");
 check(builderSource.includes('"context":null') && !builder.prompt.includes("REPO CONTEXT"), "absent context stays null and adds no digest to the builder mission");
 
-// Refine parsing now rejects rather than silently repairing/truncating bad plans.
-const good: RefineOutput = { goal: "Add password reset", impactedAreas: ["src/auth"], decisions: ["use existing auth API"], risks: ["rate limit"], openQuestions: [], tasks: [{ title: "Add form", acceptanceCriteria: ["validates email", "sends link"] }] };
-assert.deepEqual(parseRefineOutput(good), good);
-console.log("PASS: refine parser preserves a complete valid plan");
-check(parseRefineOutput(null) === null && parseRefineOutput({ ...good, goal: 42 }) === null, "refine parser rejects null and non-string goals");
-check(parseRefineOutput({ ...good, tasks: "nope" }) === null, "refine parser rejects malformed tasks instead of creating a partial plan");
-const many = Array.from({ length: 12 }, (_, index) => ({ title: `Task ${index}`, acceptanceCriteria: ["verified"] }));
-check(parseRefineOutput({ ...good, tasks: many })?.tasks.length === 12 && parseRefineOutput({ ...good, tasks: [...many, many[0]] }) === null, "refine accepts 12 tasks but fails closed above the cap (no silent truncation)");
-const refine = await execute(renderRefineWorkflowSource({ cwd: repo, storyTitle: "Add password reset", storyBody: "Users need password reset", maxTasks: cfg.refine.max_tasks, extraContext: "Use email links", contextDigest: tricky, model: "refine-model", timeoutMs: 240000 }), good);
-check(refine.prompt.includes("Add password reset") && refine.prompt.includes(tricky) && refine.prompt.includes("Use email links") && refine.options?.model === "refine-model" && schemaHas(refine, "openQuestions"), "executed refinement receives story, context, human answers, model, and schema");
-check(refine.prompt.includes("MINIMALISM:") && refine.prompt.includes("fewest complete tasks"), "refinement retains minimal design policy");
-const questions = renderQuestionsComment("001-auth", { ...good, openQuestions: ["q1?", "q2?"] });
-check(questions.includes("Needs Design") && questions.includes("1. q1?") && questions.includes("2. q2?"), "Needs Design comment numbers every open question");
-const refined = renderRefineComment("001-auth", good, [{ number: 12, url: "https://example.invalid/12", taskKey: "T001" }]);
-check(refined.includes("T001") && refined.includes("[#12](https://example.invalid/12)") && refined.includes("use existing auth API"), "refinement comment links created tasks and records decisions");
-
 const pass = parseReviewOutput({ verdict: "pass", summary: "Looks good", findings: [] });
 const fail = parseReviewOutput({ verdict: "fail", summary: "Bug", findings: ["src/a.ts: missing guard"] });
 check(pass?.verdict === "pass", "review parser accepts a passing verdict");
@@ -197,24 +177,9 @@ check(review.prompt.includes("MINIMALISM:") && review.prompt.includes("not an id
 const reviewComment = renderReviewComment(fail!);
 check(reviewComment.includes("AI review") && reviewComment.includes("src/a.ts") && reviewComment.includes("Ready"), "failed review comment explains findings and the Ready retry lane");
 
-const store = new WatchdogStateStore(root);
-store.update(42, { fixAttempts: 1 });
-store.update(42, { fixAttempts: 2, lastFixAtMs: 1234 });
-const watchdog = new WatchdogStateStore(root).get(42);
-check(watchdog.fixAttempts === 2 && watchdog.lastFixAtMs === 1234 && !watchdog.needsHuman, "watchdog state survives a new store instance per PR");
-check(store.get(999).fixAttempts === 0 && !store.get(999).needsHuman, "watchdog defaults for an unknown PR");
-const fix = await execute(renderFixWorkflowSource({ prNumber: 42, repoOwner: "test", repoName: "repo", headBranch: "task/issue-42", headSha: taskSha, failingChecks: ["pr-ci", "branch-ci"], contextDigest: tricky, model: "fix-model", timeoutMs: 60000 }), { status: "success" });
-check(fix.prompt.includes("PR #42") && fix.prompt.includes(taskSha) && fix.prompt.includes("pr-ci, branch-ci") && fix.prompt.includes("test/repo") && fix.options?.model === "fix-model", "CI fix prompt executes with PR, pinned SHA, checks, repo, and model");
-check(fix.prompt.includes("MINIMALISM:") && fix.prompt.includes("narrowest shared seam"), "CI fix retains minimal root-cause policy");
-// The reply agent type is bound to a private no-tools registry by runReplyWorkflow;
-// its trust/tool boundary has dedicated watchdog tests. Keep the renderer checks.
-const reply = renderReplyWorkflowSource({ prNumber: 7, mentionBody: "@board-bot what is the plan?", contextDigest: "ctx", model: "reply-model", timeoutMs: 60000 });
-check(reply.includes("PR #7") && reply.includes("@board-bot what is the plan?") && reply.includes("required: ['reply']"), "reply workflow embeds the mention and reply schema");
-check(reply.includes("MINIMALISM:") && reply.includes("smallest action"), "reply prompt avoids speculative redesign");
-
 check(mdToHtml("### Titolo\n- item one\n- item two\n**bold**\nplain <tag> & stuff") === "<b>Titolo</b>\n• item one\n• item two\n<b>bold</b>\nplain &lt;tag&gt; &amp; stuff", "notification renderer converts headers, bullets, bold, and HTML escaping");
 check(_DEFAULTS.telegram.enabled && _DEFAULTS.telegram.bot_token_env === "TELEGRAM_BOT_TOKEN" && _DEFAULTS.telegram.chat_id_env === "TELEGRAM_CHAT_ID", "Telegram keeps environment-only credential defaults");
-check(_DEFAULTS.telegram.on.includes("needs_human") && _DEFAULTS.telegram.on.includes("ci_fixed") && !_DEFAULTS.telegram.on.includes("pr_opened"), "Telegram retains live events and removes the obsolete plan-PR event");
+check(_DEFAULTS.telegram.on.includes("needs_human") && !_DEFAULTS.telegram.on.includes("ci_fixed") && !_DEFAULTS.telegram.on.includes("pr_opened"), "Telegram defaults to Task notifications, not retired PR/Story events");
 check(_DEFAULTS.auto_start === false, "automatic startup remains opt-in");
 check(await makeNotifier(cfg)("needs_human", "disabled") === false, "disabled notifier does not contact Telegram");
 const enabled = { ...cfg, telegram: { ...cfg.telegram, enabled: true, bot_token_env: "OFFLINE_MISSING_TOKEN", chat_id_env: "OFFLINE_MISSING_CHAT" } };
@@ -272,7 +237,7 @@ let finishReview!: () => void;
 const pendingReview = new Promise<void>((resolve) => { finishReview = resolve; });
 const schedulingState = createLoopState();
 const schedulingLoop = new BoardLoop({ ...deps,
-  cfg: { ...cfg, max_workers: 2, review: { ...cfg.review, enabled: true } },
+  cfg: { ...cfg, max_workers: 2, review: { ...cfg.review } },
   listCards: async () => structuredClone(live), boardOps: board,
   review: async (input) => {
     reviewCalls++; events.push(`review:${input.issueNumber}`); entered();

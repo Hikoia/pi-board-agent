@@ -288,9 +288,7 @@ try {
   const cfg: Config = {
     ...structuredClone(_DEFAULTS),
     project: { owner: "test", number: 1 },
-    refine: { ..._DEFAULTS.refine, enabled: false },
-    watchdog: { ..._DEFAULTS.watchdog, enabled: false },
-    review: { ..._DEFAULTS.review, enabled: false },
+    review: { ..._DEFAULTS.review },
     safety: { ..._DEFAULTS.safety, require_clean_worktree: false },
   };
   const ready: Card = {
