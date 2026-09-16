@@ -352,6 +352,16 @@ export class LegacyTickets {
           if (old && (old.targetBranch !== original.baseBranch ||
               (original.reviewedTaskSha && original.reviewedTaskSha !== old.taskSha)))
             throw new Error("Legacy finalization identity changed.");
+          if (old && !old.resultSha && !receiptBytes) {
+            await worktrees.fetchRequired(original.baseBranch);
+            if (!worktrees.isAncestor(old.baseSha, worktrees.fetchedSha(original.baseBranch)))
+              throw new Error("Legacy pre-result base is no longer in remote history.");
+            if (worktrees.localBranchSha(original.taskBranch) !== old.taskSha ||
+                await worktrees.remoteSha(original.taskBranch) !== old.taskSha)
+              throw new Error("Legacy pre-result task identity changed.");
+            const check = worktrees.check(original, true);
+            if (!check.ok) throw new Error(check.reason ?? "Unsafe legacy pre-result worktree.");
+          }
           const receipt = receiptBytes ? await this.readReceipt(task) : undefined;
           if (receipt) await this.checkCleanup(task, receipt);
           if (old?.resultSha) await this.verifyLegacyResult(old);

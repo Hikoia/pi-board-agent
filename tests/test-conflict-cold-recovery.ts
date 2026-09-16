@@ -17,14 +17,14 @@ try {
     await f.loop.tickNow(); await f.loop.tickNow(); await settle(f); await new Promise((r) => setImmediate(r));
     assert.equal(f.runs()[0].status, "paused"); assert.equal(timers.size, 1);
     await f.loop.stop(); assert.equal(timers.size, 0);
-    f.comments[0].author = "attacker"; // fresh author-aware read now refuses authorization
+    f.setHook((event) => { if (event === "read:card") throw new Error("fresh identity unavailable"); });
     const next = f.make();
     try {
       await next.loop.tickNow(); await new Promise((r) => setImmediate(r));
       assert.equal(next.executor.activeCount(), 1, "uncertain paused repair keeps its slot");
       assert.equal(timers.size, 0, "capacity observation cannot arm automatic repair recovery before fresh authorization");
       assert.equal(f.calls(), 1); assert.equal(f.runs().length, 1);
-      console.log("PASS: cold usage-limit repair recovery with invalid author retains capacity but cannot arm the scheduler from an observation");
+      console.log("PASS: cold usage-limit repair recovery with invalid ticket identity retains capacity but cannot arm the scheduler from an observation");
     } finally { await next.loop.stop(); }
   } finally { await f.loop.stop(); }
 } finally { hooks.deregister(); delete globals.__coldScheduler; }

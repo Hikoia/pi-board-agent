@@ -85,6 +85,7 @@ try {
   git(record.path, "commit", "-m", "task edit");
   git(record.path, "push", "origin", task.taskBranch);
   const taskSha = git(record.path, "rev-parse", "HEAD");
+  store.setReviewedTaskSha(task.itemId, taskSha);
   writeFileSync(join(repo, "shared.txt"), "base edit\n");
   git(repo, "add", ".");
   git(repo, "commit", "-m", "base edit");
@@ -99,7 +100,7 @@ try {
     assert.equal(git(repo, "show-ref"), localRefs, "all local refs are preserved");
     assert.equal(git(origin, "show-ref"), remoteRefs, "all remote refs are preserved");
     assert.equal(git(repo, "worktree", "list", "--porcelain"), registration);
-    assert.deepEqual(readFileSync(recordFile), recordBytes, "v3 record remains byte-identical; no early intent");
+    assert.deepEqual(readFileSync(recordFile), recordBytes, "v4 record remains byte-identical; a conflict never publishes a result");
     assert.equal(existsSync(record.path), true);
     assert.equal(readFileSync(join(record.path, "shared.txt"), "utf8"), "task edit\n");
     assert.equal(readFileSync(join(repo, "shared.txt"), "utf8"), "base edit\n");
@@ -134,63 +135,8 @@ try {
     console.log(`PASS: real stdout-only Git ${strategy} conflict is typed with exact SHAs and preserves all refs, worktrees and records without integration`);
   }
 
-  const { ManagedTicketExecutor } = await import("../src/ticket-executor.js");
-  const { BoardLoop, createLoopState } = await import("../src/loop.js");
-  const notices: Array<{ message: string; level: string }> = [];
-  const callback = (message: string, level = "info") => { notices.push({ message, level }); };
-  const noBoardWrite = async (): Promise<never> => { assert.fail("T11 must not mutate the ticket or launch repair"); };
-  const board: TicketBoardAdapter = {
-    getCard: async (id) => { assert.equal(id, card.itemId); return structuredClone(card); },
-    claim: noBoardWrite, release: noBoardWrite, comment: noBoardWrite,
-    setStatus: noBoardWrite, listComments: noBoardWrite,
-  };
-  const makeExecutor = () => new ManagedTicketExecutor({
-    cwd: repo, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback, board, worktrees: store,
-    createManager: () => { assert.fail("T11 must not launch a model or repair workflow"); },
-  });
-  const beforeCard = structuredClone(card);
-  calls.length = 0;
-  const outcome = await makeExecutor().finalizeClosed(card);
-  assert.equal(outcome.status, "conflict");
-  if (outcome.status !== "conflict") assert.fail("expected explicit conflict outcome");
-  assert.equal(outcome.baseSha, baseSha);
-  assert.equal(outcome.taskSha, taskSha);
-  assert.match(outcome.reason, /CONFLICT \(content\): Merge conflict in shared\.txt/);
-  assert.equal(notices.length, 0, "loop owns the blocking notification; executor must not announce success");
-  kept();
-  console.log("PASS: ManagedTicketExecutor exposes exact conflict SHAs and diagnostics without ticket mutation or success");
-
-  for (const reviewEnabled of [false, true]) {
-    reviewEnabled;
-    const state = createLoopState();
-    const loop = new BoardLoop({
-      cwd: repo, cfg, repoOwner: "owner", repoName: "repo", botLogin: "bot",
-      meta: { projectId: "P", statusFieldId: "S", statusOptions: {} }, callback,
-      listCards: async () => [structuredClone(card)],
-      boardOps: { claim: noBoardWrite, refresh: noBoardWrite, release: noBoardWrite, listComments: noBoardWrite, comment: noBoardWrite, setStatus: noBoardWrite },
-      review: noBoardWrite,
-    }, state, makeExecutor(), store);
-    calls.length = 0;
-    notices.length = 0;
-    try {
-      await loop.tickNow();
-      assert.equal(state.tickCount, 1);
-      assert.equal(state.wavesLaunched, 0);
-      assert.equal("enabled" in cfg.review, false);
-      assert.equal(notices.length, 1, "one explicit warning, no false success");
-      assert.equal(notices[0].level, "warn");
-      assert.match(notices[0].message, /Finalization conflict.*#11/);
-      assert.ok(notices[0].message.includes(task.taskBranch));
-      assert.ok(notices[0].message.includes(baseSha));
-      assert.ok(notices[0].message.includes(taskSha));
-      assert.match(notices[0].message, /CONFLICT \(content\): Merge conflict in shared\.txt/);
-      assert.match(notices[0].message, /preserv/i);
-      assert.deepEqual(card, beforeCard);
-      kept();
-      console.log(`PASS: real loop/executor conflict warns informatively and preserves closed-Done ticket and Git state with review.enabled=${reviewEnabled}`);
-    } finally { await loop.stop(); }
-  }
-
+  // Conflict writeback/reopen/reapproval runs through the real loop/executor in
+  // test-conflict-handoff/success. This file tests Git classification only.
   const realConflict = merges[0];
   const tree = realConflict.stdout.split(/\r?\n/)[0];
   const unknownTree = "0".repeat(40);

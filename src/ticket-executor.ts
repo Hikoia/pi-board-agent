@@ -1169,7 +1169,8 @@ export function createProductionTicketExecutor(options: {
         options.cfg.type_field,
       ),
     setStatus: (itemId, status) => setStatus(options.meta, itemId, status),
-    claim: (card) => tryClaim(card, options.botLogin),
+    // Only finalization receives a freshly approved closed card; builders still require open Ready.
+    claim: (card) => tryClaim(card, options.botLogin, card.closed === true),
     release: (card) => release(card, options.botLogin),
     async listComments(card) {
       if (!card.number || !card.repoOwner || !card.repoName) return [];

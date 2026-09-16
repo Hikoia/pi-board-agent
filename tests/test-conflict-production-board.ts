@@ -16,9 +16,16 @@ const { fixture } = await import("./conflict-handoff-fixture.js");
 const { createProductionTicketExecutor } = await import("../src/ticket-executor.js");
 const { reopenIssue } = await import("../src/gh.js");
 try {
-  for (const spoof of [false, true]) {
+  for (const corruptReopen of [false, true]) {
     const f = await fixture(); const queries: string[] = [];
     respond = async (args) => {
+      if (args[0] === "issue" && args[1] === "view") return { state: f.card.closed ? "CLOSED" : "OPEN", assignees: f.card.assignees.map((login) => ({ login })) };
+      if (args[0] === "issue" && args[1] === "edit") {
+        if (args.includes("--add-assignee")) f.card.assignees = ["bot"];
+        else if (args.includes("--remove-assignee")) f.card.assignees = [];
+        else assert.fail("unexpected issue edit");
+        return {};
+      }
       assert.deepEqual(args.slice(0, 2), ["api", "graphql"]);
       const fields = Object.fromEntries(args.filter((s) => s.includes("=")).map((s) => [s.slice(0, s.indexOf("=")), s.slice(s.indexOf("=") + 1)]));
       const q = fields.query; queries.push(q);
@@ -29,8 +36,8 @@ try {
       } } };
       if (q.includes("comments(first:")) return { data: { repository: { issue: { comments: connection(f.comments.map((c) => ({ ...c, author: { login: c.author } }))) } } } };
       if (q.includes("addComment(input:")) {
-        const id = await f.conflictOps.createComment(f.card, fields.body);
-        if (spoof) f.comments[0].author = "attacker";
+        await f.board.comment(f.card, fields.body);
+        const id = f.comments.at(-1)!.id;
         return { data: { addComment: { commentEdge: { node: { id, author: { login: "bot" } } } } } };
       }
       if (q.includes("updateProjectV2ItemFieldValue(input:")) {
@@ -38,12 +45,10 @@ try {
         return { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: fields.itemId } } } };
       }
       if (q.includes("reopenIssue(input:")) {
-        assert.equal(fields.id, "ISSUE"); await f.conflictOps.reopen();
+        assert.equal(fields.id, "ISSUE");
+        if (corruptReopen) return { data: { reopenIssue: { issue: { id: fields.id, closed: true } } } };
+        await f.board.reopen!(f.card);
         return { data: { reopenIssue: { issue: { id: fields.id, closed: false } } } };
-      }
-      if (q.includes("updateIssueComment(input:")) {
-        await f.conflictOps.updateComment(f.card, fields.id, fields.body);
-        return { data: { updateIssueComment: { issueComment: { id: fields.id } } } };
       }
       if (q.includes("issue(number:")) return { data: { repository: { issue: { id: "ISSUE" } } } };
       assert.fail(`Unexpected production gh command: ${q}`);
@@ -51,13 +56,14 @@ try {
     const executor = createProductionTicketExecutor({ cwd: f.repo, cfg: f.cfg, worktrees: f.store, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {}, meta: { projectId: "P", statusFieldId: "S", statusOptions: { Ready: "Ready" } } });
     try {
       const result = await executor.finalizeClosed(f.card);
-      assert.equal(result.status, spoof ? "blocked" : "skipped", JSON.stringify(result));
-      assert.equal(f.card.closed, spoof); assert.equal(f.card.status, spoof ? f.cfg.columns.done : f.cfg.columns.ready);
+      assert.equal(result.status, corruptReopen ? "blocked" : "skipped", JSON.stringify(result));
+      assert.equal(f.card.closed, corruptReopen); assert.equal(f.card.status, corruptReopen ? f.cfg.columns.done : f.cfg.columns.ready);
       assert.equal(f.card.body, "Keep original task edits and integrate base behavior.");
       assert.equal(f.comments.length, 1);
       assert.ok(queries.some((q) => q.includes("author { login }")), "production downloads ACTUAL author, not body/association/write reply");
       assert.ok(!queries.some((q) => q.includes("updateIssue(input:")), "no issue-body mutation");
-      console.log(`PASS: real production gh/GraphQL adapter ${spoof ? "rejects forged actual author despite bot write reply" : "uses one author-verified edited marker and reopens without body changes"}`);
+      assert.ok(!queries.some((q) => q.includes("updateIssueComment")));
+      console.log(`PASS: production adapter ${corruptReopen ? "retains pending writeback after unconfirmed reopen" : "claims the approved closed Issue and reopens Ready without body edits or legacy marker protocol"}`);
     } finally { await executor.shutdown(); await f.loop.stop(); }
   }
   respond = async () => ({ data: { reopenIssue: { issue: { id: "expected", closed: true } } } });

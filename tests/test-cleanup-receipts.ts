@@ -1,209 +1,46 @@
-// Public TicketWorktrees/loop seams; all repositories and processes are disposable/offline.
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { _DEFAULTS } from "../src/config.js";
-import type { Card } from "../src/gh.js";
-import type { TicketBoardAdapter } from "../src/ticket-executor.js";
-import {
-  fixture,
-  legacy,
-  calls,
-  faults,
-  TicketWorktrees,
-  dispose,
-} from "./cleanup-fixture.js";
+import { fixture, calls, faults, dispose } from "./cleanup-fixture.js";
+import { historicalReceipt, migrateCleanup } from "./legacy-cleanup-fixture.js";
 try {
   {
-    const f = await fixture();
-    const integrated = legacy(f, "merge", "none");
-    mkdirSync(join(f.record.path, "unknown-empty"));
-    await assert.rejects(f.finish(), /Unknown legacy residual directory/);
-    assert.equal(f.tip(), integrated);
-    assert.ok(existsSync(f.record.path));
-    assert.equal(existsSync(f.receipt), false);
-    console.log(
-      "PASS: unrecorded empty directories in legacy residue block backup authorization and cleanup",
-    );
-  }
-
-  {
-    const f = await fixture(true);
-    const recordBytes = readFileSync(f.recordFile);
-    faults.beforeGit = (args) => {
-      if (args[0] !== "worktree" || args[1] !== "remove") return;
-      faults.beforeGit = undefined;
-      f.vanish();
-      throw new Error("deterministic partial worktree removal");
-    };
+    const f = await fixture(false, true);
+    faults.beforeGit = (a) => { if (a[0] === "worktree" && a[1] === "remove") { faults.beforeGit = undefined; f.vanish(); throw new Error("partial worktree removal"); } };
     await assert.rejects(f.finish(), /partial worktree removal/);
-    assert.notEqual(
-      f.tip(),
-      f.base,
-      "integration was confirmed before cleanup",
-    );
-    assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
-    assert.deepEqual(
-      readFileSync(f.recordFile),
-      recordBytes,
-      "no early intent or v3 change",
-    );
-    assert.ok(
-      existsSync(f.receipt),
-      "failed removal must retain a dedicated cleanup receipt",
-    );
-    const receipt = readFileSync(f.receipt, "utf8");
-    assert.match(
-      receipt,
-      /ignored\/cache.bin/,
-      "snapshot includes ignored binary files",
-    );
-    assert.match(
-      receipt,
-      /ignored\/empty/,
-      "snapshot includes empty directory identities",
-    );
-    for (const path of [
-      "Cargo.lock",
-      "locked",
-      "node_modules/uri-js/yarn.lock",
-    ]) {
-      const entry = JSON.parse(receipt).snapshots[0].entries.find(
-        (e: any) => e.path === path,
-      );
-      const bytes = readFileSync(join(f.record.path, path));
-      assert.equal(entry?.type, "file");
-      assert.equal(entry.size, String(bytes.length));
-      assert.equal(
-        entry.sha256,
-        createHash("sha256").update(bytes).digest("hex"),
-      );
-    }
-    const integrated = f.tip();
+    const integrated = f.tip(); assert.notEqual(integrated, f.base);
+    assert.equal(f.store.read(f.task.itemId)?.retry?.stage, "cleanup");
+    mkdirSync(join(f.record.path, "unknown-empty"));
+    writeFileSync(join(f.record.path, "program.ts"), "preserve residual source");
     calls.length = 0;
-    assert.equal(await f.finish(), integrated);
-    assert.equal(f.tip(), integrated, "retry does not integrate twice");
-    assert.ok(
-      !calls.some((args) => ["merge-tree", "commit-tree"].includes(args[0])),
-    );
-    assert.equal(
-      existsSync(f.record.path),
-      false,
-      "lost registration and .git cannot hide residual files",
-    );
-    assert.equal(f.store.localBranchSha(f.task.taskBranch), undefined);
-    assert.equal(existsSync(f.recordFile), false);
-    assert.equal(existsSync(f.receipt), false, "receipt is removed last");
-    console.log(
-      "PASS: confirmed integration writes a full dedicated receipt; restart cleans verified registration-less leftovers before ref/record/receipt without reintegration",
-    );
+    await assert.rejects(f.finish(), /Unregistered residual/);
+    assert.equal(f.tip(), integrated); assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
+    assert.ok(existsSync(f.recordFile)); assert.ok(existsSync(f.record.path));
+    assert.equal(existsSync(f.receipt), false);
+    assert.equal(existsSync(join(f.repo, ".pi/board-agent/cleanup-backups")), false);
+    assert.equal(calls.some((a) => ["merge-tree", "commit-tree", "update-ref"].includes(a[0])), false);
+    console.log("PASS: partial normal removal retains v4 cleanup progress, unknown files/directories and refs; no new snapshot, backup or recursive fallback can invent ownership");
   }
-
-  for (const last of ["record", "receipt"] as const) {
-    const f = await fixture();
-    faults.beforeFs = (operation, path) => {
-      if (
-        operation === "unlink" &&
-        path === (last === "record" ? f.recordFile : f.receipt)
-      )
-        throw new Error(`controlled ${last} unlink failure`);
-    };
-    await assert.rejects(
-      f.finish(),
-      new RegExp(`controlled ${last} unlink failure`),
-    );
-    faults.beforeFs = undefined;
-    assert.equal(existsSync(f.record.path), false);
-    assert.equal(existsSync(f.admin), false);
-    assert.equal(f.store.localBranchSha(f.task.taskBranch), undefined);
-    assert.equal(existsSync(f.receipt), true);
-    const integrated = f.tip();
-    calls.length = 0;
-    const { BoardLoop, createLoopState } = await import("../src/loop.js");
-    const { ManagedTicketExecutor } = await import("../src/ticket-executor.js");
-    const cfg = structuredClone(_DEFAULTS);
-    cfg.context.enabled =
-      cfg.telegram.enabled = false;
-
-    cfg.task_merge_strategy = "merge";
-    const card: Card = {
-      itemId: f.task.itemId,
-      number: f.task.issueNumber,
-      type: "Task",
-      contentType: "Issue",
-      title: "Accepted",
-      body: "acceptance",
-      repoOwner: "owner",
-      repoName: "repo",
-      assignees: [],
-      closed: true,
-      status: cfg.columns.done,
-    };
-    const notices: string[] = [];
-    const callback = (message: string) => {
-      notices.push(message);
-    };
-    const noWrite = async (): Promise<never> =>
-      assert.fail("cleanup does not mutate the card or launch repair");
-    const board: TicketBoardAdapter = {
-      getCard: async () => structuredClone(card),
-      claim: noWrite,
-      release: noWrite,
-      comment: noWrite,
-      listComments: noWrite,
-      setStatus: noWrite,
-    };
-    const store = new TicketWorktrees(f.repo);
-    const executor = new ManagedTicketExecutor({
-      cwd: f.repo,
-      cfg,
-      worktrees: store,
-      board,
-      botLogin: "bot",
-      repoOwner: "owner",
-      repoName: "repo",
-      callback,
-      createManager: () => assert.fail("no builder"),
-    });
-    const loop = new BoardLoop(
-      {
-        cwd: f.repo,
-        cfg,
-        botLogin: "bot",
-        repoOwner: "owner",
-        repoName: "repo",
-        callback,
-        meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
-        listCards: async () => [structuredClone(card)],
-      },
-      createLoopState(),
-      executor,
-      store,
-    );
-    try {
-      await loop.tickNow();
-    } finally {
-      await loop.stop();
-    }
-    assert.equal(
-      existsSync(f.receipt),
-      false,
-      `no-ref negative filter must retain pending cleanup: ${JSON.stringify(notices)}`,
-    );
+  {
+    const f = await fixture(false, true);
+    faults.beforeSyncFs = (op, path) => { if (op === "unlinkSync" && path === f.recordFile) throw new Error("record unlink failure"); };
+    await assert.rejects(f.finish(), /record unlink failure/); faults.beforeSyncFs = undefined;
+    assert.equal(existsSync(f.record.path), false); assert.equal(f.store.localBranchSha(f.task.taskBranch), undefined);
+    assert.ok(existsSync(f.recordFile)); const integrated = f.tip(); calls.length = 0;
+    assert.equal(await f.finish(), integrated); assert.equal(f.tip(), integrated);
+    assert.equal(calls.some((a) => ["merge-tree", "commit-tree"].includes(a[0])), false);
     assert.equal(existsSync(f.recordFile), false);
-    assert.equal(f.tip(), integrated);
-    assert.equal(
-      notices.filter((message) => message.startsWith("Finalized")).length,
-      1,
-    );
-    assert.ok(
-      !calls.some((args) => ["merge-tree", "commit-tree"].includes(args[0])),
-    );
-    console.log(
-      `PASS: ${last} unlink failure retains a no-ref receipt; restarted real loop/executor completes it without reintegration`,
-    );
+    console.log("PASS: final record unlink failure resumes after missing refs/path without a duplicate merge; the single v4 record is deleted last");
   }
-} finally {
-  dispose();
-}
+  {
+    const f = await fixture(); await historicalReceipt(f);
+    const receipt = readFileSync(f.receipt), finish = await migrateCleanup(f);
+    let cut = false;
+    faults.beforeFs = (op, path) => { if (!cut && op === "unlink" && path.startsWith(f.record.path)) { cut = true; throw new Error("legacy partial unlink"); } };
+    await assert.rejects(finish(), /legacy partial unlink/); assert.ok(cut); faults.beforeFs = undefined;
+    const integrated = f.tip(); assert.equal(await finish(), integrated);
+    assert.deepEqual(readFileSync(f.receipt), receipt); assert.equal(existsSync(f.record.path), false);
+    assert.equal(existsSync(f.recordFile), false);
+    console.log("PASS: pre-existing receipted legacy residual resumes partial cleanup without reintegration or deleting/rewriting its archived source");
+  }
+} finally { dispose(); }

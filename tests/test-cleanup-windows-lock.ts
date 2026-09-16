@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fixture, calls, faults, root, dispose } from "./cleanup-fixture.js";
 
 try {
-  const f = await fixture(true);
+  const f = await fixture(true, true);
   if (process.platform !== "win32") {
     calls.length = 0;
     assert.ok(await f.finish());
@@ -32,8 +32,8 @@ try {
       if (args[0] !== "worktree" || args[1] !== "remove") return;
       faults.beforeGit = undefined;
       assert.ok(
-        existsSync(f.receipt),
-        "lock is acquired only after receipt publication and all pre-removal checks",
+        existsSync(f.recordFile),
+        "lock is acquired only after integration publication and all pre-removal checks",
       );
       const script = `$ErrorActionPreference='Stop'; $f=[IO.File]::Open(${quote(path)}, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None); try { [Console]::WriteLine('LOCKED'); $end=[DateTime]::UtcNow.AddSeconds(180); while (!(Test-Path -LiteralPath ${quote(release)})) { if ([DateTime]::UtcNow -gt $end) { throw 'exclusive lock release deadline exceeded' }; Start-Sleep -Milliseconds 50 } } finally { $f.Dispose() }`;
       child = spawn(
@@ -85,12 +85,12 @@ try {
       });
       assert.ok(child, "real exclusive lock was acquired");
       const integrated = f.tip(),
-        receipt = readFileSync(f.receipt);
+        progress = readFileSync(f.recordFile);
       assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
       assert.ok(existsSync(path));
       assert.ok(existsSync(f.recordFile));
       await assert.rejects(f.finish(), /EBUSY|EACCES|EPERM|worktree|cleanup/i);
-      assert.deepEqual(readFileSync(f.receipt), receipt);
+      assert.deepEqual(readFileSync(f.recordFile), progress);
       assert.equal(f.tip(), integrated);
       writeFileSync(release, "release");
       await closed;
@@ -104,7 +104,7 @@ try {
       assert.equal(existsSync(f.admin), false);
       assert.equal(f.store.localBranchSha(f.task.taskBranch), undefined);
       assert.equal(existsSync(f.recordFile), false);
-      assert.equal(existsSync(f.receipt), false);
+      assert.equal(existsSync(f.recordFile), false);
       console.log(
         "PASS: real Windows FileShare.None lock makes real Git removal fail; locked retry preserves evidence; release/restart completes exact cleanup without reintegration",
       );

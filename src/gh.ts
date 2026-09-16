@@ -551,14 +551,14 @@ async function readClaimState(
   };
 }
 
-export async function tryClaim(card: Card, botLogin: string): Promise<boolean> {
+export async function tryClaim(card: Card, botLogin: string, allowClosed = false): Promise<boolean> {
   if (!isTargetIssue(card, card.repoOwner ?? "", card.repoName ?? ""))
     return false;
   requiredString(botLogin, "claim login");
   const bot = botLogin.toLowerCase();
   const before = await readClaimState(card);
   if (
-    !before.open ||
+    (!before.open && !allowClosed) ||
     before.assignees.some((assignee) => assignee.toLowerCase() !== bot)
   )
     return false;
@@ -582,7 +582,8 @@ export async function tryClaim(card: Card, botLogin: string): Promise<boolean> {
 
   const after = await readClaimState(card);
   const won =
-    after.open &&
+    after.open === before.open &&
+    (after.open || allowClosed) &&
     after.assignees.some((assignee) => assignee.toLowerCase() === bot) &&
     after.assignees.every((assignee) => assignee.toLowerCase() === bot);
   if (!won) await release(card, botLogin);

@@ -71,6 +71,9 @@ export async function settleTicketWrite(
   const sameRecord = () => {
     if (JSON.stringify(store.read(record.itemId)) !== JSON.stringify(record))
       throw new Error("Ticket record changed during writeback.");
+    // Conflict reopening must retain exclusive branch/path ownership across
+    // each awaited board operation, not only the initial merge-tree check.
+    if (write.reopen) store.cleanupRecord({ ...record, title: write.card.title, body: write.card.body });
   };
   const fresh = async () => { sameRecord(); const card = await board.getCard(record.itemId); sameRecord(); return card; };
   const target = (card: Card | undefined): card is Card => !!card &&

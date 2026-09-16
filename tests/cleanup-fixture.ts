@@ -123,7 +123,7 @@ const hooks = registerHooks({
 });
 export const { TicketWorktrees } = await import("../src/ticket-worktree.js");
 let sequence = 0;
-export async function fixture(lockfiles = false) {
+export async function fixture(lockfiles = false, current = false) {
   const dir = join(root, `case-${++sequence}`),
     repo = join(dir, "repo"),
     origin = join(dir, "origin.git");
@@ -154,7 +154,7 @@ export async function fixture(lockfiles = false) {
     baseBranch: "main",
   };
   const store = new TicketWorktrees(repo),
-    record = { ...await store.ensure(task, "demo"), schemaVersion: 3 as const };
+    record = { ...await store.ensure(task, "demo"), schemaVersion: current ? 4 as const : 3 as const };
   // Historical cleanup/receipt tests intentionally exercise the legacy finalizer.
   // New ensure/admission now produces v4; do not accidentally migrate this fixture.
   writeFileSync(store.recordPath(task.itemId), JSON.stringify(record, null, 2));
@@ -163,6 +163,7 @@ export async function fixture(lockfiles = false) {
   git(record.path, "commit", "-m", "feature");
   git(record.path, "push", "origin", task.taskBranch);
   const taskSha = git(record.path, "rev-parse", "HEAD");
+  if (current) store.setReviewedTaskSha(task.itemId, taskSha);
   const admin = git(record.path, "rev-parse", "--absolute-git-dir");
   mkdirSync(join(record.path, "ignored", "empty"), { recursive: true });
   writeFileSync(
@@ -191,8 +192,11 @@ export async function fixture(lockfiles = false) {
     `item_${sequence}.json`,
   );
   const tip = () => git(origin, "rev-parse", "refs/heads/main");
-  const finish = (strategy: "merge" | "squash" = "merge") =>
-    new TicketWorktrees(repo).finalizeAccepted(task, strategy);
+  const finish = async (strategy: "merge" | "squash" = "merge") => {
+    const result = await store.finalizeAccepted(task, strategy);
+    if (result) await store.completeFinalization(task, result, async () => {});
+    return result;
+  };
   const vanish = () => {
     unlinkSync(join(record.path, ".git"));
     rmSync(admin, { recursive: true });

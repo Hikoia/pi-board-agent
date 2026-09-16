@@ -31,7 +31,7 @@ const deferred = () => { let resolve!: () => void; const promise = new Promise<v
     assert.equal(createRunPersistence(path).list()[0]?.status, "completed");
     await f.loop.tickNow(); await settle(f); await f.loop.tickNow();
     assert.equal(f.calls(), 2); assert.equal(f.runs().length, 1); assert.equal(peak, 1);
-    assert.ok((f.runs()[0].args as any).repair.requestKey.startsWith("conflict-"));
+    assert.equal((f.runs()[0].args as any).repair, undefined);
     console.log("PASS: max_workers=1 keeps repair queued behind a real occupied worker and launches through the original Ready scheduler only after release");
   } finally { release.resolve(); await f.loop.stop(); }
 }
@@ -66,9 +66,9 @@ const deferred = () => { let resolve!: () => void; const promise = new Promise<v
       await next.loop.tickNow(); await settle(f); await next.loop.tickNow();
       assert.equal(f.runs().length, 1); assert.equal(f.runs()[0].runId, original.runId);
       assert.deepEqual(f.runs()[0].args, original.args); assert.equal(f.runs()[0].script, original.script);
-      assert.equal(f.card.status, f.cfg.columns.needs_human); assert.equal(f.calls(), 2);
+      assert.equal(f.card.status, f.cfg.columns.ready); assert.equal(f.calls(), 2);
       assert.equal(readFileSync(join(f.record.path, "partial.txt"), "utf8"), "keep interrupted repair work\n");
-      assert.equal(f.events.filter((e) => e === "request-comment").length, 1);
+      assert.match(f.comments[0].body, /Merge conflict/);
       console.log("PASS: full handoff pause/drain/restart resumes the same persistent request/run/script/worktree despite advanced HEAD and dirty merge");
     } finally { await next.loop.stop(); }
   } finally { drain.resolve(); await f.loop.stop(); }
