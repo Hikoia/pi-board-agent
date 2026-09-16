@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fixture, faults, dispose } from "./finalization-fixture.js";
-import { acquireOwnerLock } from "../src/owner-lock.js";
+// owner-lock -> unsupported-state imports TicketWorktrees. Load it only after
+// the fixture has registered its filesystem hooks, otherwise ESM preloads the
+// unobserved store and silently bypasses the publication fault seam.
+const { acquireOwnerLock } = await import("../src/owner-lock.js");
 try {
   for (const cut of ["before-archive", "after-archive", "before-publish"] as const) {
     const f = await fixture(true);
