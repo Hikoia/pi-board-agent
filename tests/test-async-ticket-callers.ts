@@ -132,6 +132,7 @@ for (const delta of [false, true]) {
   writeFileSync(join(record.path, "accepted.txt"), "accepted\n");
   git(record.path, "add", "."); git(record.path, "commit", "-m", "accepted");
   git(record.path, "push", "origin", record.taskBranch);
+  f.store.setReviewedTaskSha(f.card.itemId, git(record.path, "rev-parse", "HEAD"));
   f.card.status = cfg.columns.done; f.card.closed = true;
   const entered = deferred(), finish = deferred(), finalize = f.store.finalizeAccepted.bind(f.store);
   f.store.finalizeAccepted = async (...args) => { entered.resolve(); await finish.promise; return await finalize(...args); };
@@ -145,11 +146,18 @@ for (const delta of [false, true]) {
     assert.equal(f.notices.some((s) => s.startsWith("Finalized")), false);
     assert.ok(f.store.localBranchSha(record.taskBranch));
     finish.resolve(); await tick; await stopping;
-    assert.equal(f.store.localBranchSha(record.taskBranch), undefined);
-    assert.equal(existsSync(record.path), false);
-    assert.equal(git(repo, "show", "origin/main:accepted.txt"), "accepted");
-    assert.equal(f.notices.filter((s) => s.startsWith("Finalized")).length, 1);
+    assert.equal(f.store.localBranchSha(record.taskBranch), git(record.path, "rev-parse", "HEAD"));
+    assert.equal(existsSync(record.path), true);
+    assert.throws(() => git(repo, "show", "origin/main:accepted.txt"));
+    assert.equal(f.notices.filter((s) => s.startsWith("Finalized")).length, 0);
     assert.deepEqual(f.writes, []);
-    console.log("PASS: loop/executor await finalization and stop drains it without aborting destructive cleanup");
+    // No Git operation had started when stop arrived. A fresh owner can finish
+    // the retained, approved record, rather than deleting it to satisfy stop.
+    const result = await finalize(f.task, "merge");
+    assert.ok(result);
+    assert.equal(git(repo, "show", "origin/main:accepted.txt"), "accepted");
+    assert.equal(existsSync(record.path), false);
+    assert.equal(f.store.localBranchSha(record.taskBranch), undefined);
+    console.log("PASS: stop drains held finalization, vetoes not-yet-started Git and retains approved work for later integration");
   } finally { finish.resolve(); await tick; await f.loop.stop(); }
 }

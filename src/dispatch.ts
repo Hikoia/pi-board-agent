@@ -6,7 +6,7 @@ export interface Decision {
   recommendation: string;
 }
 
-export function parseDecision(value: Record<string, unknown>): Decision | undefined {
+export function parseDecision(value: Partial<Record<keyof Decision, unknown>>): Decision | undefined {
   const text = (v: unknown): v is string => typeof v === "string" && !!v.trim();
   if (!text(value.question) || !text(value.context) || !text(value.recommendation) ||
       !Array.isArray(value.options) || value.options.length < 2 || !value.options.every(text) ||

@@ -59,7 +59,7 @@ export interface LoopDeps {
   revisionCheck?: () =>
     | { ok: boolean; reason?: string }
     | Promise<{ ok: boolean; reason?: string }>;
-  /** Synchronous local settings/latch check after the last awaited observation.
+  /** Synchronous startup/lint admission latch check after the last awaited observation.
    * Must not initiate async Git or reuse a display/capacity observation. */
   revisionCheckNow?: () => { ok: boolean; reason?: string };
   /** Offline adapters; production uses gh.ts and runReview. */
@@ -344,7 +344,7 @@ export class BoardLoop {
     this.state.foreground = foreground;
     try {
       const pending = run();
-      // onTick can now await Git: handle an early model rejection immediately,
+      // Handle an early model rejection immediately, including during UI updates,
       // but still propagate it through the awaited drain below.
       void pending.catch(() => undefined);
       let result: T;
@@ -536,7 +536,7 @@ export class BoardLoop {
         const parsed = parseReviewOutput(review);
         if (!parsed) throw new Error("Review returned malformed output.");
         record = this.ticketWorktrees.setReviewedTaskSha(latest.itemId, review.taskSha);
-        const decision = parsed.verdict === "needs_decision" ? parseDecision(parsed as unknown as Record<string, unknown>) : undefined;
+        const decision = parsed.verdict === "needs_decision" ? parseDecision(parsed) : undefined;
         const pass = parsed.verdict === "pass";
         record = queueTicketWrite(this.ticketWorktrees, record, pass ? "review" : "build", {
           card: latest, retry: !pass,

@@ -85,7 +85,7 @@ export interface TicketExecutor {
   migrateLegacy?(owner: OwnerLock, canMigrate?: () => boolean): Promise<LegacyMigrationReport>;
   /** Migration failures are isolated from all model/board mutations. */
   legacyBlocked?(itemId: string): string | undefined;
-  /** Observe revision before the final card await, then check local admission
+  /** Observe admission before the final card await, then check local admission
    * synchronously at start. The prepared launch already owns its worker slot. */
   launch(
     card: Card,
@@ -422,7 +422,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
   }
 
   private async outcome(record: TicketExecutionRecord, card: Card, outcome: WaveOutcome): Promise<void> {
-    const decision = outcome.status === "needs_decision" ? parseDecision(outcome as unknown as Record<string, unknown>) : undefined;
+    const decision = outcome.status === "needs_decision" ? parseDecision(outcome) : undefined;
     const success = outcome.status === "success";
     const reason = success ? (outcome.summary || "Builder completed.") :
       decision ? decision.question : [outcome.error || "Builder failed.", outcome.attempted,
@@ -766,7 +766,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     expected: Card,
     reason: string,
   ): Promise<LaunchResult> {
-    const card = await this.currentLaunchCard(record, expected);
+    const card = await this.currentLaunchCard(record, expected, expected.status ?? this.deps.cfg.columns.building);
     if (!card) return { status: "skipped", reason: "card changed before builder start" };
     // Only before start() is invoked. Admission withdrawal is not a failure.
     if (reason === "builder admissions stopped") {
@@ -855,6 +855,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
     if (!prepared)
       return { status: "skipped", reason: "card changed during preparation" };
     card = prepared;
+    if (this.stopping || !canStartWorkNow())
+      return this.resetUnstarted(record, card, "builder admissions stopped");
     // The persistent worktree belongs to the ticket, not to a previous run ID.
     const check = this.deps.worktrees.check(record, false);
     if (!check.ok) {
@@ -902,16 +904,6 @@ export class ManagedTicketExecutor implements TicketExecutor {
       return this.resetUnstarted(record, card, error.message);
     }
 
-    let manager: TicketWorkflowManager;
-    try {
-      manager = this.manager(record.path);
-    } catch (error: any) {
-      return this.resetUnstarted(
-        record,
-        card,
-        `workflow manager failed: ${error.message}`,
-      );
-    }
     // Keep the pre-observation gate: it rejects withdrawn work before revision
     // I/O, and preserves callers whose revision changes during this first read.
     const beforeRevision = await this.currentLaunchCard(record, card);
@@ -929,6 +921,16 @@ export class ManagedTicketExecutor implements TicketExecutor {
 
     const actualCheck = this.deps.worktrees.check(record, false);
     if (!actualCheck.ok) return this.resetUnstarted(record, card, actualCheck.reason ?? "worktree unsafe");
+    let manager: TicketWorkflowManager;
+    try {
+      manager = this.manager(record.path);
+    } catch (error: any) {
+      return this.resetUnstarted(
+        record,
+        card,
+        `workflow manager failed: ${error.message}`,
+      );
+    }
     let runId: string;
     try {
       runId = manager.start(

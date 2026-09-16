@@ -20,7 +20,6 @@ import {
   BOARD_AGENT_SOURCE,
   captureRuntimeIdentity,
   checkRuntimeRevisionAsync,
-  runtimeSettingsUnchanged,
 } from "../src/runtime.js";
 
 const root = process.env.TMP_DIR!;
@@ -97,7 +96,6 @@ async function check(change: string, patch?: Partial<Card>) {
     unreadable = false,
     failRelease = false,
     contextDone = false,
-    managerCreated = false,
     lateReads = 0;
   let run: PersistedRunState | undefined;
   let contextRecord: TicketExecutionRecord | undefined;
@@ -161,7 +159,6 @@ async function check(change: string, patch?: Partial<Card>) {
       return "offline context";
     },
     createManager: () => {
-      managerCreated = true;
       return {
       start: (_script, args) => {
         starts++;
@@ -191,20 +188,18 @@ async function check(change: string, patch?: Partial<Card>) {
       meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
       callback,
       listCards: async () => [structuredClone(original)],
-      // Same split as production: async disk observation, synchronous current
-      // local settings/revision latch after the final board read.
+      // Production caches startup/lint checks; simulate an explicit lint result
+      // arriving while launch awaits I/O, never a package scan on admission.
       revisionCheckNow: () => ({
-        ok: revision && runtimeSettingsUnchanged(repo, identity),
+        ok: revision,
         reason: "revision closed",
       }),
       revisionCheck: async () => {
-        if (managerCreated && change === "card-during-revision") {
+        if (contextDone && change === "card-during-revision") {
           revisionEntered.resolve();
           await revisionFinish.promise;
         }
-        return change.includes("async")
-          ? checkRuntimeRevisionAsync(repo, identity)
-          : { ok: revision, reason: "revision closed" };
+        return { ok: revision, reason: "revision closed" };
       },
     },
     state,
@@ -253,6 +248,7 @@ async function check(change: string, patch?: Partial<Card>) {
     else if (change === "missing") card = undefined;
     else if (change === "read-error") unreadable = true;
     else if (patch) Object.assign(card!, patch);
+    if (change.includes("async")) revision = (await checkRuntimeRevisionAsync(repo, identity)).ok;
     if (change === "revision-latched") {
       await latched.promise; // Public start() polls revision without starting a second tick.
       assert.equal(loop.isAdmittingNewWork(), false);
@@ -278,9 +274,10 @@ async function check(change: string, patch?: Partial<Card>) {
           throw new Error("actual-start fresh read not reached");
         }),
       ]);
-      if (change.includes("revision-settings"))
+      if (change.includes("revision-settings")) {
         writeFileSync(settingsPath, JSON.stringify({ packages: [`${BOARD_AGENT_SOURCE}@${"b".repeat(40)}`] }));
-      else if (change === "stop-during-read") {
+        revision = (await checkRuntimeRevisionAsync(repo, identity)).ok; // explicit lint
+      } else if (change === "stop-during-read") {
         Object.assign(card!, { status: cfg.columns.backlog, body: "Withdrawn during stop" });
         before = structuredClone(card);
         stopping = loop.stop();

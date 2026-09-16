@@ -36,9 +36,9 @@ import {
   resolveStateRepoRoot,
 } from "./unsupported-state.js";
 import {
+  BOARD_AGENT_SOURCE,
   captureRuntimeIdentity,
   checkRuntimeRevisionAsync,
-  runtimeSettingsUnchanged,
   formatRevisionFailure,
   readRuntimeStatus,
   writeRuntimeStatus,
@@ -48,7 +48,7 @@ import {
 
 let loop: BoardLoop | null = null;
 // Retained only with this loop's owner, including incomplete cleanup.
-let loopWorktrees: { cwd: string; store: TicketWorktrees } | undefined;
+let loopWorktrees: { cwd: string; store: TicketWorktrees; cfg: ReturnType<typeof loadConfig> } | undefined;
 function stateRoot(cwd: string): string {
   return loopWorktrees?.cwd === resolve(cwd)
     ? loopWorktrees.store.repoRoot
@@ -70,7 +70,15 @@ const revisionLatch = (processRevisionState[REVISION_LATCH] ??= {
   mismatch: false,
 });
 let runtimeStartedAt = new Date().toISOString();
-let lastRevisionCheck: RevisionCheck | undefined;
+let lastRevisionCheck: RevisionCheck = {
+  ok: false,
+  expectedRevision: loadedRuntimeIdentity.expectedRevisionAtLoad,
+  loadedRevision: loadedRuntimeIdentity.loadedRevision,
+  diskRevision: loadedRuntimeIdentity.loadedRevision,
+  dirty: loadedRuntimeIdentity.loadedDirty,
+  reason: "Startup/lint revision check has not completed.",
+  repairCommand: `pi install "${BOARD_AGENT_SOURCE}@<FULL_GIT_SHA>"`,
+};
 
 function clearBoardWidget(ctx: ExtensionContext): void {
   if (ctx.hasUI) ctx.ui.setWidget(BOARD_WIDGET_ID, undefined);
@@ -274,7 +282,7 @@ async function startBoardLoop(
       updateWidget();
     };
     const revisionCheck = async () => {
-      const check = await currentRevision(cwd);
+      const check = lastRevisionCheck;
       saveRuntime(
         ctx,
         liveRuntimeState(check),
@@ -325,10 +333,8 @@ async function startBoardLoop(
       callback,
       revisionCheck,
       revisionCheckNow: () => {
-        if (!runtimeSettingsUnchanged(cwd, loadedRuntimeIdentity))
-          revisionLatch.mismatch = true;
         return {
-          ok: !revisionLatch.mismatch,
+          ok: lastRevisionCheck.ok && !revisionLatch.mismatch,
           reason: "Package revision/settings changed; restart is required.",
         };
       },
@@ -344,7 +350,7 @@ async function startBoardLoop(
       admitNewWork,
     );
     loop = nextLoop;
-    loopWorktrees = { cwd: resolve(cwd), store: worktrees };
+    loopWorktrees = { cwd: resolve(cwd), store: worktrees, cfg };
     await nextLoop.start();
     if (
       generation !== stopGeneration ||
@@ -550,12 +556,11 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       try {
         const cwd = ctx.cwd;
-        const revision = await currentRevision(cwd);
+        const revision = lastRevisionCheck;
         const runtimeState = liveRuntimeState(revision);
         saveRuntime(ctx, runtimeState, revision);
         const runtime = readRuntimeStatus(cwd);
-        const cfg = loadContextConfig(ctx);
-        validateConfig(cfg);
+        const cfg = loopWorktrees?.cfg ?? loadContextConfig(ctx);
         const { projectOwner, repoOwner, repoName } = resolveOwner(cfg, cwd);
         const meta = await getProjectMetadata(
           projectOwner,
@@ -589,7 +594,7 @@ export default function (pi: ExtensionAPI) {
           `Revision: state=${runtime?.state ?? runtimeState} pid=${runtime?.pid ?? process.pid}`,
           `  expected=${revision.expectedRevision ?? "missing"}`,
           `  loaded=${revision.loadedRevision ?? "unknown"}`,
-          `  disk=${revision.diskRevision ?? "unknown"} dirty=${revision.dirty ? "yes" : "no"}`,
+          `  disk (last startup/lint check)=${revision.diskRevision ?? "unknown"} dirty=${revision.dirty ? "yes" : "no"}`,
           `  columns: ${Object.entries(colCounts)
             .map(([k, v]) => `${k}(${v})`)
             .join("  ")}`,
@@ -644,7 +649,7 @@ export default function (pi: ExtensionAPI) {
       stopGeneration++;
       if (!loop) {
         clearBoardWidget(ctx);
-        saveRuntime(ctx, "stopped", await currentRevision(ctx.cwd));
+        saveRuntime(ctx, "stopped", lastRevisionCheck);
         ctx.ui.notify("No loop is running.", "warning");
         return;
       }
@@ -665,7 +670,7 @@ export default function (pi: ExtensionAPI) {
           loopWorktrees = undefined;
         }
         if (!loop) clearBoardWidget(ctx);
-        const revision = await currentRevision(ctx.cwd);
+        const revision = lastRevisionCheck;
         saveRuntime(ctx, liveRuntimeState(revision), revision);
       }
     },
@@ -707,7 +712,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (!loop) clearBoardWidget(ctx);
       try {
-        const revision = await currentRevision(ctx.cwd);
+        const revision = lastRevisionCheck;
         saveRuntime(ctx, liveRuntimeState(revision), revision);
       } catch (error: any) {
         ctx.ui.notify(

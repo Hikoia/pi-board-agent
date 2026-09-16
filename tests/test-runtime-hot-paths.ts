@@ -83,15 +83,15 @@ try {
   assert.deepEqual([...calls], [], "notifications render executor observations without Git/store rediscovery");
   for (let i = 0; i < 3; i++) await deps.revisionCheck!();
   assert.deepEqual(discovery(), [], "repeated heartbeat writes reuse this owner's resolved Git root");
-  assert.equal(calls.filter((call) => call.mode === "sync").length, 0, "live revision checks use only async Git");
+  assert.equal(calls.filter((call) => call.mode === "sync").length, 0, "heartbeats run no synchronous package Git");
   assert.equal(executorStore, loopStore, "executor and loop share one owner-lifetime worktree store");
   assert.ok(widget?.includes("  T099 [paused]"));
   observation = { ...observation, active: [{ ...observation.active[0], status: "running" }] };
   deps.callback("new display observation");
   assert.ok(widget?.includes("  T099 [running]"));
-  assert.equal(calls.length, 6, "every heartbeat inspects both disk HEAD and dirty state (no TTL)");
+  assert.equal(calls.length, 0, "heartbeats reuse startup identity without package HEAD/status or settings scans");
   assert.ok(calls.every((call) => resolve(call.cwd!) === resolve(pkg)));
-  console.log("PASS: repeated notify/heartbeat uses one owner store/root and async revisions; changed executor observations refresh the real widget without Git");
+  console.log("PASS: repeated notify/heartbeat uses one owner store/root and cached startup revision; changed executor observations refresh the real widget without Git");
 
   calls.length = 0;
   await loop.tickNow();
@@ -112,6 +112,8 @@ try {
   rmSync(dirty);
   await loop.tickNow();
   assert.equal(launches, 1, "positive control admits the same candidate after the live clean gate passes");
+  assert.equal(calls.filter((call) => resolve(call.cwd!) === resolve(pkg)).length, 0,
+    "status, UI, heartbeat and ordinary admission never scan the package");
   console.log("PASS: display changes never authorize mutation/capacity; newly dirty admission remains live and fail closed");
 
   const legacy = join(cwd, ".pi", "board-agent", "inflight", "legacy.json");
@@ -152,15 +154,19 @@ try {
   git(pkg, "add", ".");
   git(pkg, "-c", "user.name=Offline", "-c", "user.email=offline@example.test", "commit", "-m", "changed package");
   cards = [ready];
+  assert.equal((await deps.revisionCheck!()).ok, true, "hot update is unsupported, not polled");
+  await command("status", ctx);
+  assert.equal(calls.filter((call) => resolve(call.cwd!) === resolve(pkg)).length, 0);
+  await command("lint", ctx); // Explicit check detects the unsupported package change.
   assert.equal((await deps.revisionCheck!()).ok, false);
   await loop.tickNow();
-  assert.equal(launches, 1, "mid-lifetime package revision blocks new work");
+  assert.equal(launches, 1, "explicit lint mismatch blocks new work");
   assert.equal(loop.isAdmittingNewWork(), false);
   git(pkg, "reset", "--hard", sha);
   assert.equal((await deps.revisionCheck!()).ok, false, "restoring package files cannot clear the process mismatch latch");
   assert.deepEqual(discovery(), []);
-  assert.ok(calls.every((call) => call.mode === "async"));
-  console.log("PASS: actual async package revision changes close live admissions for the process lifetime, without root rediscovery");
+  assert.ok(calls.filter((call) => resolve(call.cwd!) === resolve(pkg)).every((call) => call.mode === "async"));
+  console.log("PASS: explicit lint package mismatch closes admissions for the process lifetime, without root rediscovery");
 } finally {
   await command?.("stop", ctx);
   hooks.deregister(); delete globals.__hotPath;

@@ -178,23 +178,6 @@ export function resolveExpectedRevision(
   };
 }
 
-/** Local admission check only: async Git observation owns disk/dirty checking.
- * Re-read settings after the final remote await without another Git scan. */
-export function runtimeSettingsUnchanged(
-  projectRoot: string,
-  loaded: LoadedRuntimeIdentity,
-  agentDir?: string,
-): boolean {
-  const expected = resolveExpectedRevision(projectRoot, agentDir);
-  return (
-    !expected.error &&
-    FULL_GIT_SHA.test(expected.revision ?? "") &&
-    expected.revision === loaded.expectedRevisionAtLoad &&
-    expected.source === loaded.expectedSourceAtLoad &&
-    expected.error === loaded.expectedErrorAtLoad
-  );
-}
-
 const CHECKOUT_HEAD = ["rev-parse", "--show-toplevel", "HEAD"];
 const CHECKOUT_STATUS = ["status", "--porcelain", "--untracked-files=normal"];
 const checkoutOptions = (cwd: string) => ({
@@ -282,7 +265,7 @@ export function checkRuntimeRevision(
   );
 }
 
-/** Live gate: only Git execution differs from immutable synchronous capture. */
+/** Startup/lint only. Ordinary admission and heartbeat reuse the last check. */
 export async function checkRuntimeRevisionAsync(
   projectRoot: string,
   loaded: LoadedRuntimeIdentity,
