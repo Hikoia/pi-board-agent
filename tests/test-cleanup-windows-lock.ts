@@ -39,7 +39,10 @@ try {
       child = spawn(
         "powershell.exe",
         ["-NoProfile", "-NonInteractive", "-Command", script],
-        { stdio: ["ignore", "pipe", "pipe"] },
+        {
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env, PSModuleAnalysisCachePath: join(root, "powershell-module-cache") },
+        },
       );
       let output = "",
         errors = "";
