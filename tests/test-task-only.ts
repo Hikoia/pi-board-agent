@@ -58,7 +58,7 @@ for (const patch of [{ type: "Story" }, { type: "Epic" }, { type: undefined }, {
 excluded.push({ ...card, itemId: "old-design", number: 2, status: "Needs Design" });
 const cards = [card, ...excluded], untouched = structuredClone(excluded);
 const store = new TicketWorktrees(repo);
-const legacyFiles = ["refine-state.json", "refine-continuations.json", "watchdog-state.json"].map((name) => join(repo, ".pi", "board-agent", name));
+const legacyFiles = ["refine-state.json", "refine-state-unblocked.json", "watchdog-state.json"].map((name) => join(repo, ".pi", "board-agent", name));
 for (const path of legacyFiles) writeFileSync(path, "unread legacy sentinel (not JSON)\n");
 const inventory = () => legacyFiles.map((path) => [readFileSync(path, "utf8"), statSync(path).mtimeMs]);
 const before = inventory();
