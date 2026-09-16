@@ -210,7 +210,8 @@ for (const stage of ["integrate", "cleanup"] as const) {
 {
   const f = fixture(); await f.loop.tickNow();
   const record = f.record();
-  git(record.path, "update-ref", "MERGE_HEAD", baseSha);
+  // MERGE_HEAD is a per-worktree pseudoref, not writable via update-ref on newer Git.
+  writeFileSync(git(record.path, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"), `${baseSha}\n`);
   assert.equal(git(record.path, "status", "--porcelain"), "");
   f.complete({ status: "success", branch: record.taskBranch });
   await f.loop.tickNow();

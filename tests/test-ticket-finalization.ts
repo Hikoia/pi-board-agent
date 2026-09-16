@@ -139,7 +139,13 @@ try {
     if (kind === "unknown-admin") mkdirSync(join(f.repo, ".git", "worktrees", "unknown"));
     if (kind === "git-symlink") {
       const pointer = join(f.repo, "saved-git-pointer"); renameSync(join(f.record.path, ".git"), pointer);
-      symlinkSync(pointer, join(f.record.path, ".git"), "file");
+      try { symlinkSync(pointer, join(f.record.path, ".git"), "file"); }
+      catch (error) {
+        if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+        renameSync(pointer, join(f.record.path, ".git"));
+        console.log("SKIP: git-symlink worktree/ownership requires native file symlink privilege (Windows EPERM); remaining safety cases continue");
+        continue;
+      }
     }
     if (kind === "outside" || kind === "symlink") {
       const outside = join(f.repo, "external"); git(f.repo, "worktree", "move", f.record.path, outside);
