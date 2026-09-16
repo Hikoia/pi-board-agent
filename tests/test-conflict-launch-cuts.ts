@@ -26,6 +26,7 @@ try {
       await f.loop.tickNow(); await f.loop.tickNow().catch(() => {});
       assert.ok(cut, target);
       const originalRun = f.runs()[0]?.runId;
+      const interrupted = f.store.read(f.card.itemId)!;
       await f.loop.stop(); fault = () => {}; f.setManagerHook(() => {});
       const next = f.make();
       try {
@@ -33,16 +34,19 @@ try {
         if (f.runs().length) await settle(f);
         if (target === "begin-launch" && edge === "after" || target === "manager-start" && edge === "before") {
           assert.equal(f.calls(), 0); assert.equal(f.runs().length, 0);
-          assert.equal(f.card.status, f.cfg.columns.needs_human, f.notices.join("\n"));
-          // A consumed-but-unstarted attempt may be retried ONLY explicitly via
-          // ordinary maintainer Ready, never silently as the same repair request.
+          assert.equal(f.card.status, target === "begin-launch" ? f.cfg.columns.ready : f.cfg.columns.building, f.notices.join("\n"));
+          assert.notEqual(interrupted.launchingAt, undefined);
+          assert.deepEqual(f.store.read(f.card.itemId), interrupted);
+          assert.equal(next.executor.activeCount(), 1, "unknown launch retains capacity, not a product-decision lane");
+          await next.loop.tickNow();
+          assert.equal(f.calls(), 0); assert.deepEqual(f.store.read(f.card.itemId), interrupted, "zero journal matches remain uncertain on re-observation");
         } else {
           assert.equal(f.runs().length, 1); if (originalRun) assert.equal(f.runs()[0].runId, originalRun);
           assert.equal(f.calls(), 1, "no second workflow/agent invocation for the persisted cut");
           assert.equal((f.runs()[0].args as any).repair, undefined);
         }
         assert.equal(f.comments.filter((c) => c.body.includes("Merge conflict")).length, 1);
-        console.log(`PASS: ${edge} ${target} restart preserves a unique bound persistent run, or quarantines proven unstarted consumption`);
+        console.log(`PASS: ${edge} ${target} restart preserves a unique original run or retains/reobserves an uncertain occupied launch without a replacement builder`);
       } finally { await next.loop.stop(); }
     } finally { fault = () => {}; await f.loop.stop(); }
   }

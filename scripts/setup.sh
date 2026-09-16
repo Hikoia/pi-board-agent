@@ -97,6 +97,7 @@ console.log(JSON.stringify({
 ' "$PROJECT_OWNER" "$PROJECT_NUMBER" "$STATUS_FIELD" "$PLAN_FIELD" "$TYPE_FIELD" "$READY_COL" "$DONE_COL" > "$TEMP_CONFIG"
 mv -f "$TEMP_CONFIG" "$CONFIG_PATH"
 printf 'Config written: %s (YAML-compatible JSON; omitted keys use package defaults)\n' "$CONFIG_PATH"
+echo 'Before upgrade: stop/drain every old owner and back up state/worktrees/journals; unfinished v3 Tasks can continue.'
 echo 'Next steps (replace the placeholder with a reviewed, full 40-character Git SHA):'
 echo '  pi install "git:github.com/Hikoia/pi-board-agent@<FULL_40_CHARACTER_GIT_SHA>"'
 echo '  Restart Pi in this repository, then /board-agent lint and /board-agent run.'

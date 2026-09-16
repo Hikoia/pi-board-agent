@@ -568,7 +568,6 @@ export default function (pi: ExtensionAPI) {
           cfg.status_field,
           cfg.type_field,
         );
-        validateProjectMetadata(meta, cfg);
         const { listCards } = await import("./gh.js");
         const cards = await listCards(
           meta.projectId,

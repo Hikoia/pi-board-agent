@@ -15,7 +15,7 @@ import {
 } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { _DEFAULTS, type Config } from "../src/config.js";
+import { _DEFAULTS, loadConfig, type Config } from "../src/config.js";
 import type { Card } from "../src/gh.js";
 import { BoardLoop, createLoopState, type LoopDeps } from "../src/loop.js";
 import { pendingTicketWrite } from "../src/ticket-retry.js";
@@ -530,7 +530,7 @@ const complete = (itemId: string, result: unknown) => {
   }
   if (failures.length) throw new AggregateError(failures);
   console.log(
-    "PASS: status success then release failure retains evidence; restart only cleans up Review/Needs Human/manual Done without comments or builder replay",
+    "PASS: status success then release failure retains evidence; restart only cleans up Review/Ready after contract drift without comments or builder replay",
   );
 }
 
@@ -909,7 +909,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   }
   const malformedAgentSummary = await executor.reconcile(board.all());
   const malformedAgentGuardsPassed = malformedAgentRuns.every(
-    ({ itemId, runId, timeout }) => {
+    ({ itemId, timeout }) => {
       const comment = (board.comments.get(itemId) ?? []).join("\n");
       const expectedProblem = timeout
         ? "Builder agent timed out."
@@ -1374,7 +1374,6 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
 let finalSequence = 0;
 async function finalFixture(
   strategy: "merge" | "squash" = "merge",
-  aiReview = false,
 ) {
   const dir = join(root, `final-executor-${++finalSequence}`);
   const remote = join(dir, "origin.git");
@@ -1390,9 +1389,12 @@ async function finalFixture(
   git(checkout, "commit", "-m", "base");
   git(checkout, "remote", "add", "origin", remote);
   git(checkout, "push", "-u", "origin", "main");
+  mkdirSync(join(checkout, ".pi"));
+  writeFileSync(join(checkout, ".pi", "board-agent.yml"), `task_merge_strategy: ${strategy}
+`);
   const finalCfg: Config = {
     ...cfg,
-    task_merge_strategy: "merge",
+    task_merge_strategy: loadConfig(checkout, () => {}).task_merge_strategy,
     review: { ...cfg.review },
     safety: { ...cfg.safety, require_clean_worktree: true },
   };
@@ -1476,7 +1478,7 @@ async function finalFixture(
 }
 
 {
-  const f = await finalFixture("merge", true);
+  const f = await finalFixture("merge");
   f.card.plan = undefined;
   f.finalBoard.cards.get(f.card.itemId)!.plan = undefined;
   rmSync(
@@ -1648,7 +1650,7 @@ for (const strategy of ["squash", "merge"] as const) {
   ]);
   f.assertNoAdmissions();
   console.log(
-    `PASS: closed Done ${strategy} E2E finalizes the exact SHA and notifies branch cleanup once; repeated ticks/restart are no-ops`,
+    `PASS: closed Done ${strategy === "squash" ? "legacy squash normalized to merge" : "merge"} E2E finalizes the exact SHA and notifies branch cleanup once; repeated ticks/restart are no-ops`,
   );
 }
 
@@ -1671,7 +1673,7 @@ for (const strategy of ["squash", "merge"] as const) {
     const outcome = await f.make().finalizeClosed(expected);
     assert.equal(outcome.status, "skipped", JSON.stringify(mutation));
     assert.equal(f.tip(), f.baseSha);
-    assert.equal(f.store.read(expected.itemId)!.finalization, undefined);
+    assert.equal(f.store.read(expected.itemId)!.integration, undefined);
     assert.ok(existsSync(f.record.path));
   }
   f.finalBoard.cards.delete(expected.itemId);
@@ -1703,7 +1705,7 @@ for (const strategy of ["squash", "merge"] as const) {
   console.log("PASS: stale Plan snapshots cannot authorize integration; a fresh optional Plan change does not invalidate the reviewed task");
 }
 {
-  const f = await finalFixture("merge", true);
+  const f = await finalFixture("merge");
   f.store.setReviewedTaskSha(f.card.itemId, f.taskSha);
   writeFileSync(join(f.record.path, "local-only.txt"), "latest local work\n");
   git(f.record.path, "add", "local-only.txt");
@@ -1758,7 +1760,8 @@ for (const strategy of ["squash", "merge"] as const) {
   assert.equal(f.store.localBranchSha(f.record.taskBranch), f.taskSha);
   assert.equal(existsSync(f.record.path), true);
   assert.equal(f.tip(f.record.taskBranch), f.taskSha);
-  assert.equal(f.store.read(f.card.itemId)!.finalization, undefined);
+  assert.equal(f.store.read(f.card.itemId)!.integration?.resultSha, published);
+  assert.equal(f.store.read(f.card.itemId)!.retry?.stage, "cleanup");
   assert.deepEqual(f.notifications, []);
   rmSync(hook);
   const restarted = f.make();

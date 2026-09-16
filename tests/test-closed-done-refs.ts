@@ -211,7 +211,13 @@ try {
       assert.ok(f.reads.length >= 2 && f.reads.every((id) => id === "ITEM_1"), "branch presence still requires fresh approval");
       assert.equal(f.tip(), f.base, "stale presence/approval cannot integrate");
       assert.equal(f.store.localBranchSha(f.branch(1)), change === "vanished" ? undefined : accepted);
-      assert.deepEqual(mutations(), [], "no integration/cleanup Git after changed approval or vanished actual ref");
+      // V4 observes fresh base before checking a retained approved task record.
+      // A vanished local ref may permit that fetch, never integration/deletion.
+      assert.deepEqual(mutations(), change === "vanished" ? [{ mode: "async", args: [
+        "fetch", "--no-auto-maintenance", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main",
+      ] }] : [], "changed approval permits no Git; a vanished ref permits only fresh base observation");
+      assert.equal(f.store.read("ITEM_1")?.integration, undefined);
+      assert.ok(existsSync(f.store.read("ITEM_1")!.path), "owned work is retained");
       assert.equal(f.notices.some((notice) => notice.message.startsWith("Finalized")), false);
       if (change === "unreadable") assert.ok(f.notices.some((notice) => notice.level === "warn" && notice.message.includes("fresh approval read unavailable")));
       console.log(`PASS: ${change} after refs snapshot is revalidated by the original finalizer, never integrated`);

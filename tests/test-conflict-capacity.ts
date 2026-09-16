@@ -24,15 +24,18 @@ const deferred = () => { let resolve!: () => void; const promise = new Promise<v
     await f.loop.tickNow(); await f.loop.tickNow();
     assert.equal(f.executor.activeCount(), 1); assert.equal(f.calls(), 1);
     assert.equal(f.card.status, f.cfg.columns.ready); assert.equal(f.card.closed, false);
-    assert.equal(f.events.filter((e) => e === "consume-comment").length, 0, "queued repair does not claim/start outside the existing worker budget");
+    assert.equal(f.runs().length, 0, "build retry cannot start outside the occupied worker budget");
     release.resolve();
     const path = f.store.read(other.itemId)!.path;
     for (let i = 0; i < 300; i++) { if (createRunPersistence(path).list()[0]?.status === "completed") break; await new Promise((r) => setTimeout(r, 20)); }
     assert.equal(createRunPersistence(path).list()[0]?.status, "completed");
     await f.loop.tickNow(); await settle(f); await f.loop.tickNow();
-    assert.equal(f.calls(), 2); assert.equal(f.runs().length, 1); assert.equal(peak, 1);
+    // The other worker's technical failure is Ready/build, not Needs Human.
+    // It can retry on a later tick, but never overlap the conflict builder.
+    assert.equal(f.calls(), 3); assert.equal(f.runs().length, 1); assert.equal(peak, 1);
+    assert.equal(createRunPersistence(path).list().length, 2, "the third call is the sibling's later technical retry, not a duplicate conflict run");
     assert.equal((f.runs()[0].args as any).repair, undefined);
-    console.log("PASS: max_workers=1 keeps repair queued behind a real occupied worker and launches through the original Ready scheduler only after release");
+    console.log("PASS: max_workers=1 serializes the conflict retry and a sibling's later Ready/build retry behind real occupied workers without duplicate conflict runs");
   } finally { release.resolve(); await f.loop.stop(); }
 }
 

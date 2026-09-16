@@ -6,7 +6,6 @@ import { registerHooks } from "node:module";
 import { join } from "node:path";
 import { _DEFAULTS } from "../src/config.js";
 import type { Card } from "../src/gh.js";
-import type { TicketBoardAdapter } from "../src/ticket-executor.js";
 import { buildTasksForWave } from "../src/workflow-prompt.js";
 import {
   GIT_GH_TIMEOUT_MS, ProcessTimeoutError, runProcess, runProcessSync,

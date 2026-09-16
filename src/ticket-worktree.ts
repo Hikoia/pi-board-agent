@@ -1193,19 +1193,6 @@ export class TicketWorktrees {
     }
   }
 
-  private fetch(branch: string, cwd = this.repoRoot): Promise<ProcessResult> {
-    this.validateBranches(branch);
-    return gitAsync(
-      [
-        "fetch",
-        "--no-tags",
-        "origin",
-        `+refs/heads/${branch}:refs/remotes/origin/${branch}`,
-      ],
-      cwd,
-    );
-  }
-
   async fetchRequired(...branches: string[]): Promise<void> {
     this.validateBranches(...branches);
     await mustGitAsync(

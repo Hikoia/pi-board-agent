@@ -1,6 +1,8 @@
 # .pi/board-agent.yml (project overrides ~/.pi/board-agent.yml).
 # Required: project.number and an existing Project with the fields below.
 # Startup/lint never rewrite this file or the Project schema.
+# Stop/drain before changing config; restart Pi after changing the pinned package.
+# No hot update: heartbeat/UI/ordinary admission do not rescan package Git.
 project:
   owner: "" # empty -> origin repository owner
   number: 0 # REQUIRED: the Project v2 number
@@ -24,7 +26,7 @@ tick_seconds: 90
 branches:
   base: "main"
   task_prefix: "task/"
-task_merge_strategy: "merge"
+task_merge_strategy: "merge" # new results have base/task parents; normal base push only
 
 builder_timeout_ms: 21600000 # optional; 6 hours per attempt
 builder_retries: 1
