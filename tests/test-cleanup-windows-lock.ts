@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { fixture, calls, faults, root, dispose } from "./cleanup-fixture.js";
+import { join, resolve } from "node:path";
+import { fixture, calls, faults, root, dispose, TicketWorktrees } from "./cleanup-fixture.js";
 
 try {
   const f = await fixture(true, true);
@@ -89,25 +89,36 @@ try {
       assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
       assert.ok(existsSync(path));
       assert.ok(existsSync(f.recordFile));
-      await assert.rejects(f.finish(), /EBUSY|EACCES|EPERM|worktree|cleanup/i);
+      await assert.rejects(f.finish(), /EBUSY|EACCES|EPERM|worktree|cleanup|Unregistered residual/i);
       assert.deepEqual(readFileSync(f.recordFile), progress);
       assert.equal(f.tip(), integrated);
       writeFileSync(release, "release");
       await closed;
+      assert.deepEqual(readFileSync(path), Buffer.from([0, 1, 2, 255]), "the exclusively locked original bytes survived partial Git removal");
       calls.length = 0;
-      assert.equal(await f.finish(), integrated);
+      const registered = f.store.worktreeEntries().some((entry) => resolve(entry.path) === resolve(f.record.path));
+      if (registered) {
+        assert.equal(await f.finish(), integrated);
+        assert.equal(existsSync(f.record.path), false);
+        assert.equal(existsSync(f.admin), false);
+        assert.equal(f.store.localBranchSha(f.task.taskBranch), undefined);
+        assert.equal(existsSync(f.recordFile), false);
+        console.log("PASS: Windows FileShare.None failure retains registered work; unlock permits normal cleanup without reintegration");
+      } else {
+        // Some Git-for-Windows versions remove registration even when a locked
+        // child survives. V4 must not invent a snapshot or recursive fallback.
+        const restarted = new TicketWorktrees(f.repo);
+        await assert.rejects(restarted.finalizeAccepted(f.task, "merge"), /Unregistered residual requires existing legacy evidence/);
+        assert.deepEqual(readFileSync(f.recordFile), progress);
+        assert.deepEqual(readFileSync(path), Buffer.from([0, 1, 2, 255]));
+        assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
+        assert.equal(existsSync(f.receipt), false);
+        assert.equal(existsSync(join(f.repo, ".pi", "board-agent", "cleanup-backups")), false);
+        assert.ok(!calls.some((args) => args[0] === "worktree" && args[1] === "remove"));
+        console.log("PASS: real Windows FileShare.None failure leaves unregistered residuals on this Git; unlock/restart retains exact bytes/ref/progress for manual inspection, never inferred ownership or recursive cleanup");
+      }
       assert.equal(f.tip(), integrated);
-      assert.ok(
-        !calls.some((args) => ["merge-tree", "commit-tree"].includes(args[0])),
-      );
-      assert.equal(existsSync(f.record.path), false);
-      assert.equal(existsSync(f.admin), false);
-      assert.equal(f.store.localBranchSha(f.task.taskBranch), undefined);
-      assert.equal(existsSync(f.recordFile), false);
-      assert.equal(existsSync(f.recordFile), false);
-      console.log(
-        "PASS: real Windows FileShare.None lock makes real Git removal fail; locked retry preserves evidence; release/restart completes exact cleanup without reintegration",
-      );
+      assert.ok(!calls.some((args) => ["merge-tree", "commit-tree"].includes(args[0])), "no reintegration after unlocking");
     } finally {
       writeFileSync(release, "release");
       await closed;
