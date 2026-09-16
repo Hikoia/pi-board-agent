@@ -1,8 +1,8 @@
 // Public cleanup seam: links are evidence, never paths to traverse or delete through.
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { fixture, calls, faults, git, dispose } from "./cleanup-fixture.js";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { fixture, calls, faults, git, dispose, TicketWorktrees } from "./cleanup-fixture.js";
 
 import { historicalReceipt, migrateCleanup } from "./legacy-cleanup-fixture.js";
 const { readSymlink } = await import("../src/cleanup-snapshot.js");
@@ -163,22 +163,78 @@ try {
   const registered = await fixture(false, true);
   const registeredTarget = join(registered.repo, ".pi", "registered-link-target");
   mkdirSync(registeredTarget);
-  writeFileSync(join(registeredTarget, "keep.txt"), "normal Git removal must not follow this link\n");
+  const targetBytes = Buffer.from("normal Git removal must not follow this link\n");
+  writeFileSync(join(registeredTarget, "keep.txt"), targetBytes);
   const child = join(registered.record.path, "ignored", "original-link");
-  symlinkSync(registeredTarget, child, nativeSymlinks ? "dir" : "junction");
-  let normalRemoval = false;
+  const childKind = nativeSymlinks ? "dir" : "junction";
+  symlinkSync(registeredTarget, child, childKind);
+  const originalLink = await readSymlink(child), originalIdentity = lstatSync(child, { bigint: true });
+  assert.deepEqual(originalLink, { target: registeredTarget, linkType: process.platform === "win32" ? childKind : "file" });
+  let normalRemoval = false, retained = false;
+  let progress: Buffer | undefined;
+  calls.length = 0;
   faults.beforeGit = (args) => {
     if (args[0] === "worktree" && args[1] === "remove") {
-      normalRemoval = true;
+      assert.deepEqual(args, ["worktree", "remove", registered.record.path]);
       assert.ok(registered.store.read(registered.task.itemId)?.integration);
       assert.equal(existsSync(registered.receipt), false, "no new snapshot/receipt");
+      assert.ok(registered.store.worktreeEntries().some((entry) => resolve(entry.path) === resolve(registered.record.path)));
+      progress = readFileSync(registered.recordFile);
     }
   };
-  await registered.finish();
-  faults.beforeGit = undefined;
-  assert.ok(normalRemoval, "registered worktrees still use normal git worktree remove");
-  assert.equal(existsSync(registered.record.path), false);
-  assert.equal(readFileSync(join(registeredTarget, "keep.txt"), "utf8"), "normal Git removal must not follow this link\n");
-  assert.equal(existsSync(registered.receipt), false);
-  console.log("PASS: fresh integration with no receipts retains external child-link targets and normal registered Git removal never deletes their targets");
+  faults.afterGit = (args) => {
+    if (args[0] === "worktree" && args[1] === "remove") normalRemoval = true;
+  };
+  faults.beforeFs = (operation, path) => {
+    if (path.startsWith(registered.record.path))
+      assert.ok(!["open", "readdir", "link", "unlink"].includes(operation), "native cleanup must not snapshot or speculatively delete residuals");
+  };
+  try { await registered.finish(); }
+  catch (error) {
+    // Git-for-Windows can report success and drop registration yet leave the
+    // original ignored junction. Only this byte-preserving retention is allowed.
+    if (process.platform !== "win32" || originalLink.linkType !== "junction" ||
+        !(error instanceof Error) || error.name !== "Error" || error.message !== "Unknown unregistered worktree residual retained.") throw error;
+    retained = true;
+  }
+  faults.beforeGit = faults.afterGit = undefined;
+  assert.ok(normalRemoval, "real normal git worktree remove completed");
+  assert.deepEqual(calls.filter((args) => args[0] === "worktree" && args[1] === "remove"), [["worktree", "remove", registered.record.path]]);
+  const assertTargetAndNoEvidence = () => {
+    assert.deepEqual(readFileSync(join(registeredTarget, "keep.txt")), targetBytes);
+    assert.equal(existsSync(registered.receipt), false);
+    assert.deepEqual(readdirSync(join(registered.repo, ".pi", "board-agent", "cleanup")), []);
+    assert.equal(existsSync(join(registered.repo, ".pi", "board-agent", "cleanup-backups")), false);
+  };
+  if (retained) {
+    assert.ok(progress);
+    const integrated = registered.tip();
+    assert.deepEqual(registered.store.read(registered.task.itemId)?.integration, { baseSha: registered.base, taskSha: registered.taskSha, resultSha: integrated });
+    assert.equal(registered.store.read(registered.task.itemId)?.retry?.stage, "cleanup");
+    const assertRetained = async () => {
+      assert.deepEqual(readFileSync(registered.recordFile), progress);
+      assert.equal(registered.tip(), integrated);
+      assert.equal(registered.store.localBranchSha(registered.task.taskBranch), registered.taskSha);
+      assert.equal(git(registered.origin, "for-each-ref", "--format=%(objectname)", `refs/heads/${registered.task.taskBranch}`), "");
+      assert.equal(registered.store.worktreeEntries().some((entry) => resolve(entry.path) === resolve(registered.record.path)), false);
+      assert.ok(lstatSync(registered.record.path).isDirectory());
+      assert.deepEqual(await readSymlink(child), originalLink);
+      const identity = lstatSync(child, { bigint: true });
+      assert.deepEqual([identity.dev, identity.ino, identity.birthtimeNs], [originalIdentity.dev, originalIdentity.ino, originalIdentity.birthtimeNs]);
+      assertTargetAndNoEvidence();
+    };
+    await assertRetained();
+    calls.length = 0;
+    const restarted = new TicketWorktrees(registered.repo);
+    await assert.rejects(restarted.finalizeAccepted(registered.task, "merge"), {
+      name: "Error", message: "Unregistered residual requires existing legacy evidence; work retained.",
+    });
+    await assertRetained();
+    assert.ok(!calls.some((args) => ["merge-tree", "commit-tree", "push", "update-ref"].includes(args[0]) || args[0] === "worktree" && args[1] === "remove"), "restart must not reintegrate or mutate refs/worktree");
+    console.log("PASS: safe retention, NOT successful cleanup: real Windows normal Git removal lost registration but retained the original junction; restart preserves exact progress/refs/target bytes without new evidence or speculative deletion");
+  } else {
+    assert.equal(existsSync(registered.record.path), false);
+    assertTargetAndNoEvidence();
+    console.log("PASS: fresh integration with no receipts retains external child-link targets and normal registered Git removal never deletes their targets");
+  }
 } finally { dispose(); }
