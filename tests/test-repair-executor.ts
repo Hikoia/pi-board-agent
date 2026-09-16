@@ -1,5 +1,5 @@
 // T14 safety port: ordinary v4 build retry, same-run dirty recovery and real disposable Git.
-// Retired request/test-history proof assertions are mapped in the T005 evidence report.
+// Retired request/test-history proof assertions are mapped in docs/test-v4-mapping.md.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -107,7 +107,7 @@ function integrate(f: Awaited<ReturnType<typeof fixture>>) {
 {
   const f = await fixture();
   let resultSha = "";
-  f.setBuilder(async (prompt, options) => {
+  f.setBuilder(async (prompt) => {
     assert.ok(prompt.includes(f.card.body), "repair never replaces original requirements");
     for (const text of [f.repair.taskSha, f.repair.baseSha, "MERGE_HEAD", "Never force-push", "do NOT close"]) assert.ok(prompt.includes(text), text);
     resultSha = integrate(f);
@@ -240,6 +240,7 @@ for (const association of ["active", "launch-window"] as const) {
 for (const mode of ["card-during-revision", "stop-during-final-read", "revision-during-final-read", "one-reserved-slot"] as const) {
   const f = await fixture(), entered = deferred(), finish = deferred();
   let revision = true, reads = 0;
+  const latchSlots: number[] = [];
   const executor = f.makeExecutor(mode === "one-reserved-slot" ? async () => { entered.resolve(); await finish.promise; return "context"; } : undefined);
   const getCard = f.board.getCard;
   f.board.getCard = async (id) => {
@@ -249,16 +250,26 @@ for (const mode of ["card-during-revision", "stop-during-final-read", "revision-
   const launching = executor.launch(f.card, "demo", async () => {
     if (mode === "card-during-revision") { entered.resolve(); await finish.promise; }
     return true;
-  }, () => revision && executor.activeCount() === 1);
+  }, () => {
+    const slots = executor.activeCount();
+    latchSlots.push(slots);
+    // The new post-ensure stop checkpoint precedes launch reservation. Actual
+    // invocation still uses the one existing slot, never reserves a second.
+    return revision && slots === (f.store.read(f.card.itemId)?.launchingAt === undefined ? 0 : 1);
+  });
   try {
-    await entered.promise;
+    await Promise.race([entered.promise, launching.then((result) => { throw new Error(`Expected preparation gate was not reached: ${JSON.stringify(result)}`); })]);
     assert.equal(f.calls(), 0); assert.equal(executor.activeCount(), 1, "preparation owns max_workers=1 slot");
     if (mode === "card-during-revision") { f.card.status = f.cfg.columns.backlog; f.card.body = "Human withdrew contract"; }
     if (mode === "stop-during-final-read") executor.stopScheduling();
     if (mode === "revision-during-final-read") revision = false;
     finish.resolve();
     const result = await launching;
-    if (mode === "one-reserved-slot") assert.equal(result.status, "launched", "actual start must not reserve a second slot");
+    assert.equal(latchSlots[0], 0, "post-ensure admission runs before reserving the launch slot");
+    if (mode === "one-reserved-slot") {
+      assert.equal(result.status, "launched", "actual start must not reserve a second slot");
+      assert.equal(latchSlots.at(-1), 1, "actual invocation reuses exactly the reserved slot");
+    }
     else {
       assert.notEqual(result.status, "launched"); assert.equal(f.calls(), 0);
       if (mode === "card-during-revision") { assert.equal(f.card.status, f.cfg.columns.backlog); assert.equal(f.comments.length, 0); }
