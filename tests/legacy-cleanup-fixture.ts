@@ -1,7 +1,7 @@
 // Construct historical v3 evidence explicitly. Production never creates these
 // snapshots/receipts now; fixture construction is not conversion or cleanup.
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync, cpSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, copyFileSync, symlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { fixture } from "./cleanup-fixture.js";
 import { git } from "./cleanup-fixture.js";
@@ -18,8 +18,15 @@ export async function historicalReceipt(f: Omit<Awaited<ReturnType<typeof fixtur
   if (withBackup) {
     receipt.backup = join(f.repo, ".pi", "board-agent", "cleanup-backups", "historical-fixture");
     mkdirSync(receipt.backup, { recursive: true });
-    for (const [i, snapshot] of receipt.snapshots.entries())
-      cpSync(snapshot.path, join(receipt.backup, String(i)), { recursive: true, verbatimSymlinks: true });
+    // Match the old backup's entry-wise copy: recursive cp follows Windows junctions.
+    for (const [i, snapshot] of receipt.snapshots.entries()) {
+      for (const entry of snapshot.entries) {
+        const destination = join(receipt.backup, String(i), entry.path);
+        if (entry.type === "directory") mkdirSync(destination);
+        else if (entry.type === "symlink") symlinkSync(entry.target, destination, entry.linkType);
+        else copyFileSync(join(snapshot.path, entry.path), destination);
+      }
+    }
     writeFileSync(join(receipt.backup, "record.json"), bytes);
     writeFileSync(join(receipt.backup, "verified.json"), JSON.stringify({ schemaVersion: 1, snapshots: receipt.snapshots }));
   }

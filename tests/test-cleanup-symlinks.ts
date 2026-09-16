@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fixture, calls, faults, git, dispose } from "./cleanup-fixture.js";
 
 import { historicalReceipt, migrateCleanup } from "./legacy-cleanup-fixture.js";
+const { readSymlink } = await import("../src/cleanup-snapshot.js");
 
 try {
   const f = await fixture();
@@ -73,13 +74,16 @@ try {
     const entry = receipt.snapshots[0].entries.find((entry: any) => entry.path === link.path);
     assert.equal(entry?.type, "symlink");
     assert.equal(entry.target, link.target);
+    assert.equal(entry.linkType, process.platform === "win32" ? link.kind : "file");
     assert.ok(entry.identity);
     const saved = join(receipt.backup, "0", link.path);
     assert.ok(lstatSync(saved).isSymbolicLink(), "backup reproduces a link, not its target contents");
     assert.equal(readlinkSync(saved), link.target);
+    assert.equal((await readSymlink(saved)).linkType, entry.linkType);
     assert.ok(!receipt.snapshots[0].entries.some((entry: any) => entry.path.startsWith(`${link.path}/`)));
   }
   assert.ok(existsSync(join(receipt.backup, "verified.json")));
+  const verifiedBytes = readFileSync(join(receipt.backup, "verified.json"));
   faults.beforeFs = undefined;
   for (const invalid of [{ target: null }, { linkType: "unsupported-reparse" }, { sha256: "a".repeat(64) }]) {
     const corrupt = structuredClone(receipt);
@@ -150,6 +154,8 @@ try {
   for (const link of links) assert.equal(readlinkSync(join(receipt.backup, "0", link.path)), link.target);
   assert.ok(!calls.some((args) => ["merge-tree", "commit-tree"].includes(args[0])));
   assert.equal(existsSync(f.receipt), true);
+  assert.deepEqual(readFileSync(f.receipt), receiptBytes);
+  assert.deepEqual(readFileSync(join(receipt.backup, "verified.json")), verifiedBytes);
   assert.equal(f.store.localBranchSha(f.task.taskBranch), undefined);
   console.log(`PASS: original child ${nativeSymlinks ? "file/directory/dangling symlinks" : "Windows junction"} survive receipt and verified backup; changed/replaced links block; cleanup unlinks links without touching targets`);
 
