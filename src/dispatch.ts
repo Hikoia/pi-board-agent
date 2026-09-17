@@ -1,8 +1,43 @@
+import type { IssueComment } from "./gh.js";
+
+/** Only an explicit, complete product/requirement/cost/authorization question pauses a ticket. */
+export interface Decision {
+  question: string;
+  context: string;
+  options: string[];
+  recommendation: string;
+}
+
+export function parseDecision(value: Partial<Record<keyof Decision, unknown>>): Decision | undefined {
+  const text = (v: unknown): v is string => typeof v === "string" && !!v.trim();
+  if (!text(value.question) || !text(value.context) || !text(value.recommendation) ||
+      !Array.isArray(value.options) || value.options.length < 2 || !value.options.every(text) ||
+      new Set(value.options.map((s) => s.trim().toLowerCase())).size !== value.options.length) return undefined;
+  return { question: value.question, context: value.context, options: value.options,
+    recommendation: value.recommendation };
+}
+
+export function renderDecisionComment(decision: Decision): string {
+  return ["## ⚠️ Needs human input", "", "**Question**", decision.question, "",
+    "**Missing decision context**", decision.context, "", "**Options**",
+    ...decision.options.map((option) => `- ${option}`), "", "**Recommendation**",
+    decision.recommendation, "", "**Resume**",
+    "A repository OWNER, MEMBER, or COLLABORATOR must reply with the decision AND manually move this card to `Ready`. A comment alone never resumes work.",
+  ].join("\n");
+}
+
+export function trustedMissionComments(comments: IssueComment[], botLogin: string): string {
+  return comments.filter((c) => c.author?.toLowerCase() !== botLogin.toLowerCase() &&
+    ["OWNER", "MEMBER", "COLLABORATOR"].includes(c.authorAssociation ?? "") &&
+    !c.body.trimStart().startsWith("<!-- board-agent-"))
+    .map((c) => `${c.createdAt} ${c.author}: ${c.body}`).join("\n\n");
+}
+
 /** Outcome shape returned by one persisted builder workflow. */
-export interface WaveOutcome {
+export interface WaveOutcome extends Partial<Decision> {
   taskKey: string;
   itemId: string;
-  status: "success" | "failure";
+  status: "success" | "failure" | "needs_decision";
   branch?: string;
   commits?: number;
   summary?: string;
@@ -11,8 +46,6 @@ export interface WaveOutcome {
   limitations?: string;
   workaround?: string;
   humanAction?: string;
-  /** Repair-only; validated against the durable builder's tool history. */
-  testEvidence?: unknown;
 }
 
 /** Strictly normalize a persisted workflow result; malformed entries are not guessed. */
@@ -29,9 +62,12 @@ export function normalizeWaveResults(raw: unknown): WaveOutcome[] {
     if (
       typeof result.taskKey !== "string" ||
       typeof result.itemId !== "string" ||
-      (result.status !== "success" && result.status !== "failure")
+      (result.status !== "success" && result.status !== "failure" && result.status !== "needs_decision")
     ) return [];
+    const decision = result.status === "needs_decision" ? parseDecision(result) : undefined;
+    if (result.status === "needs_decision" && !decision) return [];
     outcomes.push({
+      ...decision,
       taskKey: result.taskKey,
       itemId: result.itemId,
       status: result.status,
@@ -43,7 +79,6 @@ export function normalizeWaveResults(raw: unknown): WaveOutcome[] {
       limitations: typeof result.limitations === "string" ? result.limitations : undefined,
       workaround: typeof result.workaround === "string" ? result.workaround : undefined,
       humanAction: typeof result.humanAction === "string" ? result.humanAction : undefined,
-      ...(Object.hasOwn(result, "testEvidence") ? { testEvidence: result.testEvidence } : {}),
     });
   }
   return outcomes;

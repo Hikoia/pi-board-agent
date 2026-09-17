@@ -5,10 +5,8 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import {
   createRunPersistence,
-  compactAgentHistory,
   type WorkflowManagerOptions,
 } from "@quintinshaw/pi-dynamic-workflows";
-import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { _DEFAULTS } from "../src/config.js";
 import type { Card, IssueComment } from "../src/gh.js";
 import { BoardLoop, createLoopState, type LoopDeps } from "../src/loop.js";
@@ -52,12 +50,9 @@ export async function fixture(conflict = true) {
   cfg.max_workers = 1;
   cfg.builder_retries = 0;
   cfg.context.enabled =
-    cfg.review.enabled =
-    cfg.refine.enabled =
-    cfg.watchdog.enabled =
     cfg.telegram.enabled =
-    cfg.safety.require_clean_worktree =
-      false;
+    cfg.safety.require_clean_worktree = false;
+
   const card: Card = {
     itemId: `HANDOFF_${sequence}`,
     number: sequence,
@@ -83,6 +78,7 @@ export async function fixture(conflict = true) {
   git(record.path, "commit", "-m", "task");
   git(record.path, "push", "origin", task.taskBranch);
   const taskSha = git(record.path, "rev-parse", "HEAD");
+  store.setReviewedTaskSha(card.itemId, taskSha);
   if (conflict) {
     writeFileSync(join(repo, "value.json"), '{"task":false,"base":true}\n');
     git(repo, "add", ".");
@@ -125,7 +121,8 @@ export async function fixture(conflict = true) {
       io(`status:${status}`, () => {
         cards.find((c) => c.itemId === id)!.status = status;
       }),
-    listComments: async () => comments.map((c) => c.body),
+    listComments: async () => { await hook("read:comments"); return comments.filter((c) => c.author === "bot").map((c) => c.body); },
+    reopen: async () => io("reopen", () => { card.closed = false; }),
     comment: async (_card, body) =>
       io("ordinary-comment", () => {
         comments.push({
@@ -136,45 +133,6 @@ export async function fixture(conflict = true) {
         });
       }),
   };
-  // Optional capability: old offline adapters cannot accidentally fall back to live gh.
-  const conflictOps = {
-    listComments: async () => {
-      await hook("read:comments");
-      return structuredClone(comments);
-    },
-    createComment: async (_card: Card, body: string) => {
-      let id = "";
-      await io(
-        body.startsWith("<!-- board-agent-conflict-repair:")
-          ? "request-comment"
-          : "ordinary-comment",
-        () => {
-          id = `C${comments.length + 1}`;
-          comments.push({
-            id,
-            author: "bot",
-            body,
-            createdAt: new Date().toISOString(),
-          });
-        },
-      );
-      return id;
-    },
-    updateComment: async (_card: Card, id: string, body: string) =>
-      io(
-        body.includes('"phase":"consumed"')
-          ? "consume-comment"
-          : "queue-comment",
-        () => {
-          comments.find((c) => c.id === id)!.body = body;
-        },
-      ),
-    reopen: async () =>
-      io("reopen", () => {
-        card.closed = false;
-      }),
-  };
-  Object.assign(board, { conflict: conflictOps });
   type Agent = NonNullable<WorkflowManagerOptions["agent"]>;
   type Builder = (...args: Parameters<Agent["run"]>) => Promise<unknown>;
   let builder: Builder = async () => ({
@@ -245,8 +203,8 @@ export async function fixture(conflict = true) {
           claim: board.claim,
           refresh: async () => board.getCard(card.itemId),
           release: board.release,
-          listComments: conflictOps.listComments,
-          comment: conflictOps.createComment,
+          listComments: async () => structuredClone(comments),
+          comment: async (card, body) => { await board.comment(card, body); return comments.at(-1)!.id; },
           setStatus: async (_card, status) =>
             board.setStatus(card.itemId, status),
         },
@@ -272,7 +230,6 @@ export async function fixture(conflict = true) {
     baseSha,
     taskSha,
     board,
-    conflictOps,
     comments,
     events,
     notices,
@@ -340,46 +297,13 @@ export async function repairResult(
   git(f.record.path, "add", ".");
   git(f.record.path, "commit", "-m", "resolve retaining both requirements");
   sha = git(f.record.path, "rev-parse", "HEAD");
-  const command = `set -euo pipefail
-export GIT_NO_REPLACE_OBJECTS=1
-head=$(git rev-parse HEAD)
-status=$(git status --porcelain=v1 --untracked-files=all)
-test "$head" = '${sha}'
-test -z "$status"
-printf '%s\\n' 'BOARD_AGENT_REPAIR_TEST_BEGIN ${sha}'
-(
-node test.cjs
-)
-head=$(git rev-parse HEAD)
-status=$(git status --porcelain=v1 --untracked-files=all)
-test "$head" = '${sha}'
-test -z "$status"
-printf '%s\\n' 'BOARD_AGENT_REPAIR_TEST_PASS ${sha}'`;
-  const result = await createBashTool(f.record.path).execute(
-    "test",
-    { command },
-    options?.signal,
-  );
-  options?.onHistory?.(
-    compactAgentHistory([
-      {
-        role: "assistant",
-        content: [{ type: "toolCall", name: "bash", arguments: { command } }],
-      },
-      {
-        role: "toolResult",
-        toolName: "bash",
-        isError: false,
-        content: result.content,
-      },
-    ]),
-  );
+  execFileSync(process.execPath, ["test.cjs"], { cwd: f.record.path, stdio: "pipe" });
   git(f.record.path, "push", "origin", f.task.taskBranch);
   return {
     taskKey: f.task.taskKey,
     itemId: f.task.itemId,
     branch: f.task.taskBranch,
     status: "success",
-    testEvidence: { resultSha: sha, command: "node test.cjs" },
+    summary: `Resolved both sides; node test.cjs passed at ${sha}`,
   };
 }

@@ -29,6 +29,7 @@ globals.__configStartup = {
   createProductionTicketExecutor: () => {
     starts++;
     return {
+      migrateLegacy: async () => ({ converted: [], failures: [] }),
       reconcile: async () => ({ active: [], resumed: 0, adopted: 0, needsHuman: 0, orphans: 0, errors: 0 }),
       activeCount: () => 0,
       launch: async () => assert.fail("unexpected builder"),

@@ -55,8 +55,12 @@ async function fixture() {
   const taskSha = git(record.path, "rev-parse", "HEAD");
   const tip = (branch = "main") =>
     git(repo, "ls-remote", "origin", `refs/heads/${branch}`).split(/\s+/)[0];
-  const finish = (strategy: "squash" | "merge" = "squash") =>
-    store.finalizeAccepted(task, strategy);
+  store.setReviewedTaskSha(task.itemId, taskSha);
+  const finish = async (strategy: "squash" | "merge" = "squash") => {
+    const result = await store.finalizeAccepted(task, strategy);
+    if (result) await store.completeFinalization(task, result, async () => {}); // offline board confirms Done
+    return result;
+  };
   const kept = () => {
     assert.equal(tip(), baseSha);
     assert.equal(store.localBranchSha(task.taskBranch), taskSha);
@@ -79,7 +83,7 @@ async function fixture() {
 {
   const f = await fixture();
   writeFileSync(join(f.record.path, "dirty.txt"), "keep me\n");
-  await assert.rejects(() => f.finish(), /Dirty worktree/);
+  await assert.rejects(() => f.finish(), /dirty worktree/i);
   f.kept();
   rmSync(join(f.record.path, "dirty.txt"));
   git(f.repo, "worktree", "lock", f.record.path);
@@ -124,6 +128,8 @@ async function fixture() {
   writeFileSync(join(f.record.path, "shared.txt"), "task conflict\n");
   git(f.record.path, "add", ".");
   git(f.record.path, "commit", "-m", "task conflict");
+  git(f.record.path, "push", "origin", f.task.taskBranch);
+  f.store.setReviewedTaskSha(f.task.itemId, git(f.record.path, "rev-parse", "HEAD"));
   const base = f.tip();
   const local = f.store.localBranchSha(f.task.taskBranch);
   await assert.rejects(() => f.finish(), /merge-tree/);
@@ -141,18 +147,21 @@ async function fixture() {
   chmodSync(hook, 0o755);
   await assert.rejects(() => f.finish(), /push/);
   f.kept();
-  assert.equal(f.store.read(f.task.itemId)!.finalization, undefined);
+  assert.ok(f.store.read(f.task.itemId)!.integration, "prepared result survives rejected push");
   rmSync(hook);
   writeFileSync(join(f.repo, "later.txt"), "later base work\n");
   git(f.repo, "add", ".");
   git(f.repo, "commit", "-m", "base advances");
   git(f.repo, "push", "origin", "main");
+  const advanced = f.tip();
+  assert.equal(f.store.read(f.task.itemId)!.reviewedTaskSha, f.taskSha);
   const result = await f.finish();
   assert.equal(f.tip(), result);
+  assert.equal(git(f.repo, "show", "-s", "--format=%P", result!), `${advanced} ${f.taskSha}`);
   assert.equal(git(f.repo, "show", "origin/main:later.txt"), "later base work");
   assert.equal(git(f.repo, "show", "origin/main:feature.txt"), "feature");
   console.log(
-    "PASS: rejected pushes retain all work; retry merges into the latest base without a journal",
+    "PASS: rejected pushes retain prepared progress; nonconflicting base advance retries ordinary integration with the unchanged approved task",
   );
 }
 {
@@ -167,11 +176,17 @@ async function fixture() {
     "remote-only work",
   );
   git(f.repo, "push", "origin", `${newer}:refs/heads/${f.task.taskBranch}`);
+  await assert.rejects(() => f.finish(), /Remote task SHA/);
+  assert.equal(f.tip(f.task.taskBranch), newer);
+  assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
+  assert.ok(existsSync(f.record.path));
+  git(f.record.path, "merge", "--ff-only", newer);
+  f.store.setReviewedTaskSha(f.task.itemId, newer);
   await f.finish("merge");
   git(f.repo, "merge-base", "--is-ancestor", newer, "origin/main");
   assert.equal(f.tip(f.task.taskBranch), "");
   console.log(
-    "PASS: remote-ahead commits are integrated automatically before cleanup",
+    "PASS: remote-only commits are never deleted; integrating them locally permits normal cleanup",
   );
 }
 {
@@ -265,15 +280,9 @@ async function fixture() {
     `refs/heads/${f.task.taskBranch}`,
     "refs/heads/main",
   );
-  await assert.rejects(() => f.finish(), /symbolic/);
-  assert.equal(f.tip(), f.baseSha);
-  git(
-    f.repo,
-    "symbolic-ref",
-    `refs/heads/${f.task.taskBranch}`,
-    "refs/heads/missing",
-  );
+  await assert.rejects(() => f.finish(), /symbolic|ownership/);
   assert.throws(() => f.store.localBranchSha(f.task.taskBranch), /symbolic/);
+  assert.equal(f.tip(), f.baseSha);
   assert.throws(() => f.store.localBranchSha("-invalid"), /Invalid branch/);
   console.log(
     "PASS: symbolic or invalid local refs cannot redirect merge or deletion",
@@ -289,10 +298,10 @@ async function fixture() {
   );
   f.store.update(f.task.itemId, (record) => ({
     ...record,
-    finalization: {
-      targetBranch: "main",
+    integration: {
       baseSha: f.baseSha,
       taskSha: f.taskSha,
+      resultSha: git(f.repo, "commit-tree", `${f.taskSha}^{tree}`, "-p", f.baseSha, "-p", f.taskSha, "-m", "prepared before push"),
     },
   }));
   const before = JSON.stringify(f.store.read(f.task.itemId));
@@ -301,10 +310,10 @@ async function fixture() {
     /pending finalization/,
   );
   assert.equal(JSON.stringify(f.store.read(f.task.itemId)), before);
-  // Legacy execution state remains protected for builders, but does not gate human-approved completion.
+  // Native integration excludes builders and resumes only the prepared result.
   assert.ok(await f.finish());
   assert.equal(f.store.has(f.task.itemId), false);
   console.log(
-    "PASS: builder identity and legacy-journal protections remain; closed-ticket finalization needs neither",
+    "PASS: builder identity and immutable integration protections remain while approved finalization resumes its original result",
   );
 }

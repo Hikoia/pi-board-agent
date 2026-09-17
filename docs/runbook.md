@@ -1,535 +1,278 @@
-# 0.2.0 rollout and recovery runbook
+# Task-only v4 rollout and recovery
 
-Board Agent runs inside a foreground Pi process. It is installed from one
-reviewed, full Git SHA; there is no Docker/daemon deployment in 0.2.0.
+Board Agent runs inside one foreground Pi process. Install a reviewed full Git
+SHA, not a moving branch. **v4 is the ticket record schema**, not a new package
+major-version promise. There is no hot update or Docker/daemon deployment.
 
-## Invariants
+## Non-negotiable operating rules
 
-- The effective Pi package entry is pinned to a 40-character SHA.
-- The loaded module SHA, package checkout HEAD, and configured SHA are equal.
-- The package checkout is clean and is never used for development.
-- Exactly one owner process controls a target checkout.
-- Windows requires PowerShell FullLanguage with `Add-Type`/PInvoke allowed;
-  constrained hosts fail closed rather than losing subprocess containment.
-- Issue mutations target only the repository from `origin`; `project.owner`
-  controls Project GraphQL access only.
-- Never delete dirty worktrees, branches, journals, records, receipts or repair
-  ledgers merely to clear a warning.
-- Do not blindly downgrade while a cleanup receipt or repair is pending. Older
-  readers may ignore recovery evidence and replay work. Use a compatible reader;
-  any downgrade needs a separately verified stopped backup consistent with the
-  current Git/GitHub state, not just restored old files.
-
-## Capacity and admission
-
-`max_workers` is the total model budget for builders plus one foreground
-invocation shared by Task design, Story refine, review and watchdog. Occupied
-slots include launching, pending, paused, missing/unreadable associated runs,
-not just running models. A widget showing more occupied than running is
-conservative by design; investigate recovery evidence rather than raising the
-limit or deleting a record to bypass it.
-
-Tick order is recovery/finalization → reserve one primary slot → pre-fill
-builders → at most one primary model (Task design → Story refine → Review) →
-recount/back-fill builders → awaited watchdog maintenance. Waiting/non-model
-work may fall through to another primary lane. Watchdog models take spare
-capacity only and can be deferred while builders fill the budget. This is not a
-throughput guarantee or a fair queue across model roles.
-
-Runtime/widget summaries are non-authoritative observations. Live
-identity/contract/sole-claim, stop, capacity and revision checks gate the actual
-start after preparation; fresh identity/claim/revision checks gate write-back.
-Failed reads do not fall back to old board snapshots; failed builder assignee
-releases retain unsettled execution evidence for retry. Foreground best-effort
-releases warn on failure. A green-looking UI is not permission to clear evidence.
-
-Runtime network Git and package-revision checks use the async deadline runner;
-Git writes remain ordered and small synchronous local/context probes remain.
-No speed/cost claim follows from this. Closed-Done Issues of every Type are
-freshly checked against exact local/origin task refs. Query failures block, never
-mean absence. Existing execution, receipt and repair recovery takes precedence.
-With neither ref and no pending recovery, historical tickets move directly to
-configured Backlog, leaving all residual files and idle records untouched. No
-migration command or toggle is needed: the next normal tick handles history.
-Closed Backlog is complete for Story/Plan accounting and does not launch work;
-idle historical records stop per-ticket polling. Open Backlog is not complete.
-Identical per-ticket finalization/repair blockers warn once per loop lifetime,
-not once per attempt: checks and safe retries still run every tick. A changed
-reason/SHA, recovery, different ticket or restart can warn again. Silence does
-not mean success and never authorizes replay of an unconfirmed write.
+- Exactly one owner controls a target checkout. Coordinate all hosts before an
+  upgrade; do not delete a live/foreign/corrupt lock to start another owner.
+- Keep the installed package checkout, pin and runtime config immutable while
+  the owner runs. Package/config consistency checks occur at startup, lint and
+  deployment, not heartbeat/UI/ordinary admission. Runtime revision fields are
+  the **last checked** observation, not a continuously scanned disk identity.
+- Only target-repository Task Issues enter model execution. Closed Done Issues
+  of any Type may finalize without an AI-review marker and move to Backlog.
+  PR, Draft and foreign cards remain untouched. Plan is optional.
+- AI review is mandatory. Done stays OPEN and unmerged until human validation
+  and manual Issue close. New integrations are merge-only, with normal base push.
+- Never delete dirty worktrees, refs, records, journals, receipts or ledgers just
+  to clear a warning. Never force-push base or force-clean ticket worktrees.
+- Ignored files in a task worktree may be discarded by **`git clean -fdX` and
+  normal Git worktree removal**. Preserve valuable ignored data outside that worktree before close.
 
 ## Project preflight
 
-Startup, lint and promotion from recovery to autonomous mode check current
-config and enabled-lane metadata before admitting work:
+Startup, lint and explicit run/promotion validate current config/metadata:
 
-- Status and Type must be single-select; Plan must be text or single-select.
-- Backlog, Ready, In Progress, Review, Done, Needs Human and Type `Task` are required
-  (using the configured option names).
-- With refinement enabled, Needs Design and Type `Story` are required too.
-- Each unrefined/partial Story needs its Plan option to exist before claim,
-  model or child work. Text Plan writes text; select Plan uses its existing
-  option ID. Child creation independently checks metadata and publishes Ready
-  only after Plan/Type are set and freshly verified.
+- Status: single-select with Backlog, Ready, In Progress, Review, Done, Needs Human.
+- Configured Type field (default `Type`): single-select with Task.
+- Plan field/value is not required. Backlog is also available as a manual hold.
 
-Missing/wrong fields or select options fail closed. Preflight never creates or
-repairs schema. `/board-agent init-project` is a separate **explicit** operator
-schema action, not a startup fallback. After manual schema/config edits, stop
-successfully, lint, then run a **new** loop to refresh its metadata/config.
-Promoting a cached recovery loop validates today's metadata but keeps its old
-snapshot. Restart Pi too after a package-pin change.
+No preflight rewrites user config or Project schema. `/board-agent init-project`
+is an explicit setup action that creates missing Task fields, not a fallback
+that rebuilds existing option lists. Stop successfully, lint and start a **new**
+loop after editing config/metadata. A cached recovery loop retains its snapshot.
+Restart Pi after changing the package pin or installed source.
 
-Remove deprecated `safety.skip_closed_issues` from both
-`~/.pi/board-agent.yml` and `.pi/board-agent.yml`. Explicit `true` and `false`
-remain boolean-compatible but both emit a file-specific warning through
-startup/config commands, including shadowed global values. Absence/defaults
-stay quiet; invalid booleans and unknown keys still fail. Closed Issues never
-start builders/design regardless of this key. A closed Done Issue of any Type
-may finalize/backlog; only Tasks may enter conflict handoff and must be confirmed
-reopened before builder admission.
+## Configuration compatibility
 
-## Story scope and builder context
+Project `.pi/board-agent.yml` overrides `~/.pi/board-agent.yml`. Both source files
+are validated before normalization; warnings identify the source file even if a
+project value shadows a global value. No automatic rewrite occurs.
 
-Ready tasks must be independently implementable **and verifiable from the
-current base**. Combine an unavailable API and its consumer/verification into
-one Task; otherwise hold dependent work in Backlog until the prerequisite is
-integrated. Ordering task numbers or using one worker does not serialize merges.
-`refine.max_tasks` is an output rejection limit, not permission to truncate
-requirements. Invalid/over-limit output creates no intents/children and gets no
-automatic repair pass; normal later polling of unjournaled Ready Stories remains.
-Unresolved questions wait in Needs Design without publishing tentative children.
-Human review still checks semantic independence; schema validation cannot.
+These finite retired inputs are accepted with warnings:
 
-Refine and Task-design agents use private roles plus SDK
-`session.tools: ["structured_output"]`: the actual surface excludes coding and
-shared-store tools. A prompt ban or empty role allowlist alone is insufficient
-in workflow 3.10.0; do not extend this guarantee to other roles. Builders use
-[`workflow-prompt.ts`](../src/workflow-prompt.ts)'s production mission and the
-[builder skill](../skills/board-agent/SKILL.md); the packaged
-[compatibility agent path](../agents/board-agent-builder.md) supplies no second
-rule body or permissions. Their new-launch digest comes from the prepared
-worktree, not the host cache; read relevant code as authority. Durable resumes
-retain their mission. Digest generation creates no worktree cache files.
+| Input | Current meaning |
+| --- | --- |
+| `refine.enabled`, `refine.timeout_ms`, `refine.max_tasks` | Ignored; no Story/designer execution |
+| `watchdog.enabled`, `fix_rounds_max`, `fix_cooldown_minutes`, `respond_to_mentions`, `pr_label`, `needs_human_label` under `watchdog` | Ignored; no PR maintenance or mention listener |
+| `models.refine`, `models.watch` | Ignored; builder/review models are retained |
+| `columns.needs_design` | Migration label only; old Task questions map to Needs Human |
+| `review.enabled` | Ignored; false cannot disable review |
+| `task_merge_strategy: squash` | Normalizes to merge for new integration |
+| `safety.skip_closed_issues` | Deprecated boolean; closed Issues never launch builders |
 
-## Stop and retry
+Unknown keys, malformed objects, wrong types and invalid ranges remain errors.
+Previously unsupported `pr`, `builder_tier`, `branches.plan_prefix` and
+`watchdog.interval_seconds` are not guessed. Remove them after deliberate config
+review. Models, `max_workers`, timeouts, builder retries, context, custom column
+labels and notifications remain configurable; use [config-template.yml](../config-template.yml).
 
-`/board-agent stop` and session shutdown close admissions and abort foreground
-models, then await tick/heartbeat cleanup and manager pause/lease drains before
-releasing the owner. Concurrent calls share one completion barrier. During a
-failed/incomplete drain the loop, managers and owner remain retained; run and
-auto-start cannot replace them. Retry stop after resolving the reported cleanup
-failure. `recovery-only`/“stopping” is not a completed stop; only successful
-cleanup permits takeover. A tick error can remain a warning after cleanup has
-actually completed.
-
-Cancellation does **not** abort destructive Git or authorize force-cleanup.
-Already-started Git keeps its deadline and recovery/verification sequence; stop
-waits. Foreground finally blocks and claim-release attempts finish before ownership
-release. Preserve failed CI-fix worktrees; disposable review cleanup is awaited.
-
-## Back up before any upgrade or manual state repair
-
-Stop every owner first:
+## Stop before upgrading—not finish every Task
 
 ```text
 /board-agent status
 /board-agent stop
 ```
 
-From the target repository, record and copy all recovery evidence:
+Stop closes new admission, disables automatic resume scheduling and cancels
+foreground review. It waits for the current tick/heartbeat, review cleanup and
+managed pause/lease drain before releasing ownership. Reentrant stop/shutdown
+calls share that barrier. If draining fails, the loop/managers/owner remain:
+resolve the reported failure and retry stop. A stopping/recovery-only display or
+paused status alone is **not** proof that old agents finished their finally blocks.
+
+Stop during worktree preparation must not launch a manager or post a builder
+failure comment. Existing work stays. Already-started Git runs to a bounded
+outcome; stop waits instead of terminating it or releasing ownership underneath
+it. Later destructive steps can be vetoed and resumed from retained progress.
+Startup continuations are canceled if stop arrives while initialization waits.
+
+You may upgrade with unfinished or paused Tasks. After the old process has
+**stopped and drained**, a new exclusive owner converts supported v3 Tasks and
+continues their original worktree and journal. Do not run old and new versions
+side by side against the same state or use `/reload` as a hot-update procedure.
+
+## Stopped backup
+
+Before installation or manual recovery, use a **new** backup directory. Capture
+all applicable paths; skip only those that do not exist:
 
 ```bash
 git status --porcelain=v1 --untracked-files=all
 git worktree list --porcelain
 git branch -avv
-mkdir -p ../board-agent-backup
-cp -a .pi/board-agent ../board-agent-backup/state
-cp -a .pi/worktrees ../board-agent-backup/worktrees
-git bundle create ../board-agent-backup/refs.bundle --all
+mkdir ../board-agent-backup-<unique-name>
+cp -a .pi/board-agent ../board-agent-backup-<unique-name>/state
+cp -a .pi/worktrees ../board-agent-backup-<unique-name>/worktrees
+git bundle create ../board-agent-backup-<unique-name>/refs.bundle --all
 ```
 
-On PowerShell:
+PowerShell equivalents for copies/bundle:
 
 ```powershell
-git status --porcelain=v1 --untracked-files=all
-git worktree list --porcelain
-git branch -avv
-New-Item -ItemType Directory -Force ..\board-agent-backup | Out-Null
-Copy-Item -Recurse -Force .pi\board-agent ..\board-agent-backup\state
-Copy-Item -Recurse -Force .pi\worktrees ..\board-agent-backup\worktrees
-git bundle create ..\board-agent-backup\refs.bundle --all
+New-Item -ItemType Directory ..\board-agent-backup-<unique-name>
+Copy-Item -Recurse .pi\board-agent ..\board-agent-backup-<unique-name>\state
+Copy-Item -Recurse .pi\worktrees ..\board-agent-backup-<unique-name>\worktrees
+git bundle create ..\board-agent-backup-<unique-name>\refs.bundle --all
 ```
 
-Use a new backup directory each time; skip only paths that do not exist. The
-bundle saves committed refs, not dirty or untracked files: retain the worktree
-copy as well. Copy any worktrees located outside `.pi/worktrees` separately.
+A bundle saves committed refs, **not dirty/untracked/ignored work**. Preserve
+those bytes/layout too, including worktrees outside `.pi/worktrees`. Record each
+Project item/Issue, status, Type, optional Plan, assignees, path, branch and HEAD.
+WorkflowManager journals/leases are in Pi's external workflow project storage,
+keyed by the persistent worktree path: include those, not only repository-local
+`.pi`. Preserve old repair/cleanup/Story/watchdog sources and retained backups.
 
-Also save the Project item status, Issue number, assignees, Plan, Type, task
-branch, worktree path, and HEAD for every active ticket.
+## Deployment checklist
 
-### Unsupported state policy
-
-0.2.0 deliberately has no automatic migration for:
-
-- `.pi/board-agent/inflight/*.json`;
-- malformed ticket records; or
-- ticket records with schema version 1 or 2.
-
-Startup, `/board-agent lint`, and `/board-agent run` list every unsupported path
-and stop before GitHub mutation. They do not archive, rename, overwrite, or
-delete anything.
-
-After backing up, finish or manually preserve the old task work. Only then
-remove/migrate the listed files. A valid 0.2.0 ticket record must be schema v3;
-do not change the version number without reconstructing and verifying every
-field and Git ref.
-
-Remove these obsolete keys from `.pi/board-agent.yml`:
-
-```text
-pr
-builder_tier
-branches.plan_prefix
-watchdog.interval_seconds
-```
-
-Use `models.builder`, `branches.base`, `branches.task_prefix`, and the main
-`tick_seconds` scheduler instead. `pi-dynamic-workflows` is installed as a
-normal dependency, not bundled.
-
-## Release checklist
-
-In a clean development clone or isolated worktree:
+In the reviewed release checkout:
 
 ```bash
 npm ci
 npm run check
 npm pack --dry-run
+git status --short
+git rev-parse HEAD
 ```
 
-Confirm:
+Verify package/lockfile consistency, Node `>=22.19.0`, and Linux/Windows checks
+on exact Node **22.19.0**. The package contains runtime, builder skill, template,
+architecture and runbook, not dependencies bundled into source or audit reports.
 
-- package and lockfile versions are `0.2.0`;
-- Node engine is `>=22.19.0`;
-- the tarball contains `src/`, `skills/`, `agents/`, and
-  `config-template.yml`, but no Docker files or bundled dependency metadata;
-- Linux and Windows CI use exact Node `22.19.0` and run
-  `npm ci && npm run check`;
-- `git status --short` contains only intended release changes.
+Before enabling the owner in a target repository:
 
-Commit and push the complete release. Record the immutable commit:
-
-```bash
-RELEASE_SHA=$(git rev-parse HEAD)
-test "${#RELEASE_SHA}" -eq 40
-```
-
-## Rollout
-
-1. Stop active owners and wait for `/board-agent stop` to settle managers.
-2. Take the backup above.
-3. Install the reviewed SHA:
+1. Verify the configured base permits **normal merge commits and normal pushes**
+   by the deployment identity. Required-PR-only or linear/squash-only policy is
+   incompatible with this direct executor. Resolve policy explicitly; do not
+   bypass protection, force-push, or invent a PR/squash fallback.
+2. Stop/drain every old owner and take the backup above. Tasks need not be done.
+3. Install the reviewed full SHA, then restart Pi:
 
    ```bash
-   pi install "git:github.com/Hikoia/pi-board-agent@$RELEASE_SHA"
-   ```
-
-4. Restart Pi. Verify the deployment artifact:
-
-   ```bash
+   pi install "git:github.com/Hikoia/pi-board-agent@<REVIEWED_FULL_40_CHARACTER_SHA>"
    pi list
    git -C ~/.pi/agent/git/github.com/Hikoia/pi-board-agent rev-parse HEAD
    git -C ~/.pi/agent/git/github.com/Hikoia/pi-board-agent status --porcelain
    ```
 
-   HEAD must equal `RELEASE_SHA`; status must be empty.
-
-5. In each target repository:
-
-   ```text
-   /board-agent lint
-   /board-agent status
-   /board-agent run
-   ```
-
-6. Let startup reconciliation finish before moving new cards to `Ready`.
-7. If managing several projects, run:
+   The installed checkout must be clean at that exact SHA. Use the actual
+   `PI_CODING_AGENT_DIR` package path if customized. A pinned install does not
+   advance automatically with `pi update --extensions`.
+4. In the target repository run lint, inspect status, then run. Startup acquires
+   the exclusive owner before conversion or manager creation. Review isolated
+   conversion failures before moving additional Tasks to Ready.
+5. For explicit fleet verification:
 
    ```bash
    node scripts/verify-board-agent-fleet.mjs <project-path> [more-paths...]
    ```
 
-   `STALE`, `OVERRIDE`, `DIRTY`, `MISMATCH`, or `STOPPED` requires correction
-   and a Pi restart before new work is admitted.
+   This deployment tool deliberately inspects current package HEAD/status.
+   STALE, OVERRIDE, DIRTY, MISMATCH or STOPPED needs investigation. It is not an
+   ordinary heartbeat hook, and STOPPED is expected during a stopped rollout.
 
-## State locations
+Windows additionally needs PowerShell FullLanguage with `Add-Type`/PInvoke for
+Job Objects. Git/gh run non-interactively with deadlines and ordinary descendant
+termination. No timeout or permission failure is authority to discard work.
 
-```text
-.pi/board-agent/owner.lock
-.pi/board-agent/owner.lock.reclaim  # present only during stale-owner takeover
-.pi/board-agent/runtime.json
-.pi/board-agent/context.md
-.pi/board-agent/refine-state.json
-.pi/board-agent/refine-state-unblocked.json  # same-format healthy updates beside frozen evidence
-.pi/board-agent/watchdog-state.json
-.pi/board-agent/ticket-worktrees/<safe-project-item-id>.json  # unchanged v3
-.pi/board-agent/cleanup/<safe-project-item-id>.json          # late cleanup receipt
-.pi/board-agent/cleanup-backups/<unique-backup>/            # verified legacy residuals + record
-.pi/board-agent/repair/conflict-<hash>.json                  # retained handoff/run binding
-.pi/board-agent/repair-intent-backups/<item>-<hash>.json     # exact old record bytes
-.pi/worktrees/ticket-*/
-.pi/worktrees/review-*/
-.pi/worktrees/watchdog-*/
-```
+## v3 continuation and unsupported state
 
-WorkflowManager journals are in Pi's workflow project storage, keyed by the
-persistent ticket worktree path. Use `/board-agent status` and the record's
-`activeRunId` to locate them. Include those journals in the stopped backup too;
-copying only `.pi/board-agent/` does not capture external run/lease evidence.
-Cleanup backups, intent archives and consumed repair ledgers are not automatically
-garbage-collected. Keep them in backups; neither restarting nor successful repair
-is permission to discard this evidence.
+The single legacy adapter supports current v3 Task records, WorkflowManager
+journals, repair ledgers and cleanup receipts. Conversion is per ticket, exact
+raw/create-only backup first, atomic v4 publication second. Reentry skips
+published v4, even after an interrupted response. Source/backup mutation,
+owner loss or stop before publication blocks conversion.
 
-## Recovery matrix
+- Active/paused work resumes the original run/script/args/path.
+- A launch window adopts only a unique persisted match; ambiguous/missing
+  evidence stays occupied for re-observation, never launches another builder.
+- Unlaunched old repair becomes an ordinary build retry retaining diagnostics.
+- Confirmed old merge/squash results are cleanup-only; an unconfirmed recorded
+  result needs fresh remote observation before push/cleanup. No new squash is made.
+- Fresh human-closed Done approval needs no AI-review marker, in either schema.
+- Existing receipts/ledgers remain read-only; they are not garbage-collected.
+  Unregistered residuals require existing validated ownership/unchanged evidence
+  and any recorded backup. Unknown leftovers stay untouched; no new snapshots
+  or automatic backup-and-delete path is created.
+- Needs Human remains. Old Task Needs Design becomes Needs Human with its
+  original questions. Closed Done non-Task Issues may complete; unrelated
+  Story/PR records and existing Issues are not closed/deleted. Story/watchdog journals are retired read-only artifacts.
 
-| Message / state | Automation behavior | Required human action |
-| --- | --- | --- |
-| `Unsupported pre-0.2.0 Board Agent state detected` | Startup/lint/run stop read-only | Stop Pi, back up the listed paths and refs, finish/preserve old work, then remove or deliberately migrate each listed artifact. |
-| Closed `Done`, neither local nor origin task ref and no pending recovery | Move to configured Backlog, keep Issue closed; no merge proof or leftover deletion | No action required. Unknown residuals and idle execution records remain untouched, not cleanup-authorized. |
-| Closed `Done`, either/both exact task refs exist | Integrate all source changes into latest `origin/<base>`, push/verify, v2 receipt, checked cleanup, then Backlog | Validate both local and remote commits before closure. Remote-only restores the local ref by compare-and-create; divergence uses temporary merge objects without modifying the task checkout/index. |
-| Git cleanup succeeded, Backlog write failed | Next tick retries the no-branch board move without another merge | Fix board permissions/connectivity. If the write succeeded but its reply was lost, observing Backlog stops retries; no duplicate success notice. |
-| Reopened, moved, replaced or removed before Backlog write | Fresh card check prevents overwriting the manual change | Preserve the human decision; no automatic reopen/comment/archive is performed. |
-| Pending cleanup receipt, even without local ref/record | Reconfirms remote integration and retries only receipted cleanup | Preserve receipt and any backup. Do not recreate a branch/worktree or relaunch a builder to make cleanup retry. |
-| `In Progress` without a valid v3 record | That card moves to `Needs Human`; siblings continue | Inspect Issue history and branches. Restore a verified record/worktree from backup or restart intentionally from `Ready`. |
-| Missing WorkflowManager run or mismatched persisted args | Stops/quarantines only that ticket | Preserve the worktree, inspect the run journal and record, then move to `Ready` only when ownership and intended diff are known. |
-| Dirty completed worktree / wrong branch / unmanaged path | Fails closed to `Needs Human` | Do not reset automatically. Inspect and commit/push valid ticket work, or discard it explicitly; restore the expected registered branch/path before retry. |
-| Usage-limit pause | Remains paused for the scheduler | Wait or repair provider access. Do not create a second run. |
-| `AI review failed ... Leaving status unchanged` | No stale write-back; an unchanged card stays `Review` | Fix fetch/auth/agent/cleanup failure. Retry uses a new detached worktree only if still eligible. |
-| Main checkout changed during isolated review | Review fails and ephemeral cleanup is attempted | Inspect the main checkout immediately; preserve unexpected changes and restore its prior branch/HEAD/status before retry. |
-| Missing or older AI-reviewed SHA on a closed Done Task | Not a finalization gate; closure approves the current local branch | Reopen the Issue if the current commits are not approved. AI review still governs automated `Review` → `Done`. |
-| Dirty, missing, locked or unmanaged registered task worktree | No unsafe removal; card remains closed and `Done` | Stop Board Agent and preserve/resolve the worktree. For a lock, confirm no process uses it before `git worktree unlock <path>`. A branch without a registered worktree needs no recreation. |
-| Verified merge conflict with provable original ownership | No integration push/cleanup; guarded `requested` → Ready → reopen → `queued` handoff | Let the unique original-worktree builder repair and return to Review. Validate and close the Issue again; see below. |
-| Conflict without handoff proof / unrelated history / malformed Git output | Blocks and preserves work; not authority to launch repair | Inspect the blocker while stopped and backed up. Do not fabricate a marker/record or clear pending evidence. |
-| Unconfirmed handoff/terminal write, closed Ready, or open Ready not confirmed queued | Reads reconcile exact attempted results; no blind replay or ordinary builder fallback | Preserve the ledger and actual bot comment. Investigate permissions and remote state; uncertainty remains blocked, not permission to repeat a write. |
-| Human changes owner, lane or ticket identity during repair | Fresh authority checks stop unsafe handoff/settlement; an observed contrary state invalidates unfinished handoff | Keep the human decision and recovery evidence. Moving back to an old lane does not resurrect an invalidated request. |
-| Repair failure / bad test evidence / repair Review findings | Needs Human when still authorized; no automatic Ready retry | Inspect preserved work and evidence. A consumed request is not reused; an explicit maintainer reopen/Ready retry follows ordinary builder flow. |
-| Push rejected / verification failed | Local branch and worktrees remain | Repair credentials, connectivity or branch protection. Ordinary finalization before a receipt retries against fresh remote base with a normal, non-force push; pending legacy results need the proof below. |
-| Cleanup drift/failure after base integration | Late receipt retains retry authority; local ref is deleted only after directory/Git cleanup, then record and receipt last | Resolve the reported lock or ref race without deleting evidence. Added/changed/replaced files, unknown ownership, corrupt receipts/backups and unmerged remote-only commits block. No duplicate integration or cleanup success while managed directories remain. |
-| `Story creation needs human input` | Creation journal and completed children remain; Story moves to `Needs Human` | Fix auth, Project fields, duplicate marker ambiguity, or incorrect item identity. Move the Story to `Ready`; it resumes without rerunning refinement or duplicating children. |
-| Story/Task in `Needs Design` | Waits without consuming untrusted comments | Reply as repository OWNER/MEMBER/COLLABORATOR after the latest authentic question/gate. |
-| Story create/add/comment attempted but result unconfirmed | Keeps attempt markers and refuses blind repetition | Inspect paginated sub-Issues, Project items, and bot comments. Restore/adopt the intended remote result where possible. Clear an attempt marker only while stopped, after backup and positive confirmation that the operation did not take effect. |
-| CI fix stopped / unresolved prior CI fix worktree | Retains `.pi/worktrees/watchdog-<pr>-*`; does not start a replacement | Inspect and preserve dirty files/commits, compare the PR remote SHA, then explicitly remove only the resolved watchdog worktree. Do not force-delete unresolved work. |
-| Git/`gh` timeout | Process tree is terminated; durable state remains at the last completed boundary | Repair network/credentials and let fresh reads reconcile side effects. An unconfirmed attempted repair write is not blindly replayed. |
-| Owner lock held | A second owner refuses to start | Use the existing process. Reclaim only a provably dead same-host pid; a different-host lock requires coordination. |
-| `owner.lock.reclaim` remains after interruption | Stale takeover fails closed | Stop/coordinate every owner and contender, back up both lock files, verify no takeover is active, then remove only the stale reclaim file. Never clear a live or foreign-host owner by guessing. |
-| Could not pause workflow runs / cleanup incomplete during stop | Loop, managers and owner lock remain held; restart/admission blocked | Inspect the named managers/leases, then retry `/board-agent stop`. Coordinate deliberate process termination only if cleanup cannot be recovered; a stopped heartbeat is not proof of successful shutdown. |
-| Fresh read fails or item disappears | No snapshot-authorized mutation; missing items use orphan recovery | Preserve record/worktree/journal evidence and investigate remote identity/access. Retry fresh observation; do not substitute an old card dump. |
-| Assignee release fails after terminal comment/status | Execution association stays unsettled; settlement retries without a new builder | Repair access/ownership and let reconciliation finish. Do not delete the association because the card already looks terminal. |
-| Closed-Done local/origin ref query fails | Warns and blocks that candidate, retaining work and Done | Resolve the Git failure and retry; unknown is never absence. |
-| Truncated Story creation journal | Affected Story cannot publish or complete; healthy updates continue durably | Follow the exact-byte journal recovery procedure below; keep both files. |
+Unsupported inflight, v1/v2 and corrupt data is reported, not renamed, deleted
+or upgraded by changing a schema number. Stop and preserve it; manually assess
+it with a compatible old reader in an isolated copy. Do not infer ownership or
+restore only old JSON against newer remote effects. A downgrade requires a
+separately verified coherent stopped backup and remote-state reconciliation.
 
-## Truncated Story journal recovery
+## Retry and human decision matrix
 
-Older code could store more refinement tasks than publication intents. A
-recognizable shortened prefix (even zero intents, or an entry already marked
-refined) is evidence, **not** an actionable plan. The affected Story is warned
-and blocked before claim/model/write; its already-published children are not
-reset. This exception does not make arbitrary malformed journals acceptable.
+| State / failure | Automation and operator response |
+| --- | --- |
+| Ready/build | Continue original branch/worktree, including dirty partial work and MERGE_HEAD; tests, push, then mandatory review |
+| Ready/review | Retry the original pinned review commit; fix provider/fetch/setup failure, not rebuild successful code |
+| Needs Human | Real requirement/product/cost/authorization decision only: trusted maintainer reply **and manual Ready**; reply alone does nothing |
+| Review code findings | Ready/build, not Needs Human; preserve original work |
+| Malformed output, tests, timeout, exhausted retries | Technical retry, not a decision; repair the underlying problem |
+| Pending comment/status/reopen/release | Retry I/O after fresh observation and safe drain; no replacement builder or false Ready claim |
+| Done OPEN | Await human validation/close; no integration or task cleanup |
+| Closed Done Issue of any Type | Fresh human approval needs no review marker. Integrate exact local/remote sources, then Backlog; unsafe ownership still blocks |
+| Real merge conflict | Comment, reopen, Ready/build; resolve original branch, tests → review → Done → **renewed human close** |
+| Nonconflicting base advance rejects push | Closed Ready/integrate; observe then prepare another normal merge, no model or reopen |
+| Push response lost | Observe fresh origin/base before deciding integrate versus cleanup; do not infer success from local result |
+| Integrated cleanup/Backlog write failure | Retain cleanup progress; retry cleanup/Backlog only, no merge/build/review replay |
+| Remote base rewritten or confirmed result absent | Preserve integration record/refs/work; investigate, never supersede cleanup with a new result |
+| Dirty/untracked programs, changed refs, wrong path/branch, Git lock | Cleanup blocks. Stop and investigate the actual owner; never force-remove/prune/unlock to get green |
+| Unknown unregistered leftover | Retain it. No recursive fallback or new snapshot to manufacture removal authority |
+| Missing/mismatched journal or unknown launch | Retain association and conservative capacity; investigate original journals, never start a competing run |
+| Manual lane/claim/identity withdrawal | Do not overwrite it or treat it as a technical failure; release only a freshly verified original bot claim after drain |
+| No local task ref | Check remote; restore remote-only ref using compare-and-create, never create a builder/worktree |
+| Confirmed no local or remote task refs | Move closed Done to Backlog only; preserve idle records/leftovers and never bypass pending or corrupt recovery |
+| Failed owner drain / owner.lock.reclaim remains | Coordinate all owners, preserve evidence, retry or investigate; never steal ownership from an uncertain process |
 
-The current reader keeps `.pi/board-agent/refine-state.json` **exactly byte-for-byte
-at its original path**, including formatting/line endings. It writes only
-healthy Story changes atomically to `.pi/board-agent/refine-state-unblocked.json`
-in the **same existing journal format/schema**, so siblings' publication,
-comment cursors and completion remain durable across restart. Reads combine
-both files. A companion cannot override truncated evidence, and a missing
-original or malformed/symlinked companion fails closed.
+`max_workers` counts launching, paused, missing and unsettled associated runs as
+occupied. An optimistic widget cannot authorize more capacity. Normal provider
+backoff is retained. Review gets at most one foreground slot; builders use the
+remaining budget. There is no second retry queue or same-ticket immediate retry.
 
-Recovery is manual, with no automatic consolidation, migration or repair:
-
-1. Finish a successful stop for every owner. Take a new backup of **both**
-   journal files, all worktrees (dirty/untracked included), refs, ticket records
-   and external WorkflowManager journals. Keep the original bytes in backup.
-2. Compare the entire `creation.refine.tasks` list against `creation.tasks`,
-   deterministic markers, paginated remote sub-Issues/Project items, assignees,
-   comments and integrated refs. Record which requirements are still missing
-   and which attempted operations actually took effect. Uncertainty remains
-   blocked; it is not permission to repeat a create/add/comment.
-3. Have a maintainer explicitly reconcile the complete intended scope and
-   remote results while stopped. There is no supported “change the count,”
-   “delete the blocked entry,” or “mark refined” shortcut. If manually
-   reconstructing state, preserve verified identities, digests and attempt
-   evidence in **both** files; validate in a disposable copy before resuming.
-4. Restart only with a reader that understands both files. Do not discard the
-   companion to clear an error or blindly downgrade: older readers ignore its
-   healthy progress and may replay work. A downgrade needs a separately
-   verified, coherent stopped backup compatible with that reader **and** the
-   current remote/Git state; restoring old files does not undo GitHub effects.
-
-## Manual verification before retry
-
-Before retrying a local task branch, inspect its commits and worktrees:
+Inspect before manual recovery:
 
 ```bash
 git -C <repo> worktree list --porcelain
-git -C <worktree> status --porcelain=v1
+git -C <worktree> status --porcelain=v1 --untracked-files=all
 git -C <worktree> branch --show-current
 git -C <worktree> rev-parse HEAD
 git -C <repo> ls-remote origin refs/heads/<task-branch> refs/heads/<base>
 ```
 
-Done + closed approves committed work on both exact local and origin task refs.
-Either may be absent/ahead, or the sources may diverge. Merge preserves both
-histories; squash preserves combined content. Registered task worktrees must be
-clean; source conflicts and concurrent ref changes prevent cleanup/Backlog.
-Stop the owner before manually resolving completed-ticket branches. Never
-force-push the base as a recovery shortcut.
+These observations do not authorize deletion by themselves. Normal cleanup
+verifies fresh integration, expected remote ref deletion, normal worktree
+removal, expected local ref deletion, Project Backlog, then record deletion last.
+Missing steps resume; changed ownership and valuable work block. Keep the record
+until the sequence actually completes.
 
-## Conflict repair and reapproval
+## State locations and evidence
 
-Only a Task's positively verified base merge-tree conflict can initiate automatic
-repair. Divergent-source conflicts and non-Task conflicts stay closed Done for
-manual resolution. The original idle v3 record, Plan, task branch/worktree, exact local/remote task
-SHA, fresh base SHA, identity, ownership, revision and stop gates must still
-match; another builder or a cleanup receipt blocks handoff. A failed fetch,
-permission error, timeout or unrelated history is not a conflict request.
-
-Board Agent records an attempt locally, creates an actual bot-authored versioned
-`requested` comment, moves the card to `Ready` while closed, reopens the Issue,
-and confirms open Ready before marking the same comment `queued`. The Issue
-body is not changed. The marker is `consumed` before launch; the existing
-`max_workers` scheduler admits one repair run in the original task worktree,
-not a new role or queue. Actual author and exact marker data are read back;
-ordinary/fake comments cannot authorize repair. Failed or ambiguous writes stop
-until their exact results can be confirmed, rather than being blindly repeated.
-Fresh human lane/claim checks apply through settlement, not only at selection.
-While the Issue remains closed, the remote base HEAD must still equal the
-original conflict SHA. When confirming open Ready or queueing/consuming the
-request, main may advance only while the original base SHA remains in its
-history. This also covers a successful reopen or queued-comment write interrupted
-before local confirmation. The same request, comment and original SHAs are kept;
-do not replace them to chase main. Rewritten-away base or changed task SHAs block.
-If consumption stopped before its comment write was attempted, fresh validation
-of the queued marker and open Ready card returns the same request to normal
-capacity/launch admission. An attempted but unconfirmed write is never replayed.
-
-The builder retains original work and requirements, merges the specified base
-commit into the task, resolves both sides without blanket ours/theirs, and runs
-existing relevant integration tests on the final committed result. It commits
-and pushes only the task branch normally: no force-push, main mutation or
-self-close. The host verifies original-task/base ancestry, no unfinished merge,
-a clean worktree, exact local/remote result SHA and actual persisted passing test
-execution. Missing, failed, truncated or ambiguous evidence is failure, even
-with a reported success. Only the same durable run may resume a dirty partial
-repair; a new launch must pass the original-SHA/clean admission checks.
-
-Success returns to `Review`; `review.enabled` stays authoritative and unchanged.
-Review/humans assess whether the tests and resolution cover both branches'
-requirements. Humans must validate the repair, reach `Done`, and **close the
-Issue again**. Builder/evidence failure or repair Review findings go to
-`Needs Human` when settlement is authorized, never automatically back to Ready.
-Consumed requests stay retained, not automatically reused; deliberate maintainer
-reopen/Ready after consumption takes the ordinary retry path.
-
-Ordinary Review is not proof that the latest main/base was integrated and passed
-integration tests. The repair gate concerns its specified base and tested result,
-not every future base advance. Normal finalization has no blanket integration
-test gate and still requires human approval of the current task commits.
-
-## Cleanup receipts and retained backups
-
-A late destructive receipt in `.pi/board-agent/cleanup/` is written only after
-remote base integration is confirmed and destructive preconditions are ready;
-it is **not an early merge intent**. New v2 receipts add `remoteTaskSha` (SHA or
-null), while `taskSha` still binds the original local ref/worktree. Both source
-refs must remain unchanged before publication. A changed/new remote ref blocks
-cleanup; deletion uses the exact recorded SHA lease. Existing strict v1 receipts
-resume cleanup-only in place under their original rules, without upgrading the
-evidence. Execution records remain v3. Receipt data binds ticket, branches,
-task/result SHAs, exact record, managed paths/Git ownership, directory
-identities and relative entries (type, size, content hash or symlink target),
-including ignored files. Symlink targets are recorded, not traversed or deleted.
-Ordinary dependency lockfiles (`node_modules/uri-js/yarn.lock`, `Cargo.lock`) and
-files named `locked` are included in full snapshots, hashes and verified backups;
-their names do not block cleanup. Only the owned Git administration snapshot has
-the `.lock`/`locked` filename veto, alongside existing Git common-directory,
-target-ref and worktree locks. New/changed Git locks fail fresh destructive
-checks, and real OS file-access errors still block and preserve retry evidence.
-
-Registered ticket worktrees use normal `git worktree remove`. After registration
-is gone, only matching receipted leftovers are removed item-by-item, rechecked
-before deletion. Missing entries may already have been removed; additions,
-changed contents/link targets, replacements, locks, foreign/nested Git identities,
-special files or corrupt evidence block and preserve remaining work. There is
-no force-remove, prune, unlock or recursive-delete fallback for ticket cleanup.
-Remote integration is rechecked; only after all managed directories and related
-Git cleanup succeed is the local ref deleted, then the record, then the receipt.
-A remaining receipt retries even if the ref/record is gone. No success is reported
-while the managed directory remains.
-
-Proven legacy residuals require a full content/layout backup plus original record
-in `.pi/board-agent/cleanup-backups/`, with verified source/copy equality and
-unchanged source before receipt publication/cleanup. Retries reverify the backup;
-failed backups also remain. This is not a promise to copy external link targets,
-ACLs or other unspecified filesystem metadata. Backups do not authorize guessing
-at ownership or integration; unknown/unrecorded directories remain blocked.
-
-## Legacy finalization and conflict recovery
-
-Older valid v3 records may contain `finalization`; ordinary updates still cannot
-remove or replace pending intent. There is no new manual recovery command and
-no supported “delete the member and retry” shortcut. With owners stopped, back
-up records, receipts, ledgers, worktrees, refs and external workflow journals
-before investigating:
-
-- **Present `resultSha`, confirmed on fresh remote base:** after validating the
-  recorded tree/parents and original record/path/task, recovery is cleanup-only,
-  with the verified legacy backup and late receipt. No repair builder or new
-  integration is triggered, even if the base later changed.
-- **Missing `resultSha`, verified conflict:** absence alone is not enough. The
-  old persistence order saved the initial intent before merge-tree, then saved
-  `resultSha` **before any push**. Only that narrow proof, with matching original
-  task/local/remote SHA, review SHA when present, clean owned worktree, valid old
-  base still in current base history and fresh identity/claim/revision checks,
-  permits automatic recovery. Exact original record bytes are durably archived
-  and verified in `.pi/board-agent/repair-intent-backups/` before a dedicated,
-  checked atomic intent clear and new repair request. Archive/source mutation
-  or failed Git checks block the clear; the general update guard is not relaxed.
-- **Present but unconfirmed/unknown result, rewritten base history, unknown old
-  base, task/review/identity drift or any other uncertainty:** block and preserve
-  everything. A result absent from today's remote may have been pushed and later
-  rewritten away; that is never proof of never-pushed.
-- **Old integrated residual without a receipt/result journal:** only existing
-  ancestry or squash-tree equality plus original record/path/task and surviving
-  tracked-file identity proof can authorize backup/cleanup. Unknown directories,
-  altered residuals or ambiguous integration remain untouched. Missing metadata
-  is not authority to recreate or discard work.
-
-## Historical reports
-
-The repository-only `architecture-flow-audit.md`, `overengineering-audit.md`
-and `review-builder-concurrency-analysis.md` retain their original source
-baselines and findings for traceability. They are not current run instructions
-or proof of present performance; use this runbook and
-[architecture](architecture.md) for current behavior.
-
-## Clean-clone smoke test
-
-After the release commit is pushed:
-
-```bash
-tmp=$(mktemp -d)
-git clone https://github.com/Hikoia/pi-board-agent.git "$tmp/pi-board-agent"
-git -C "$tmp/pi-board-agent" checkout "$RELEASE_SHA"
-cd "$tmp/pi-board-agent"
-npm ci
-npm run check
-npm pack --dry-run
-export PI_CODING_AGENT_DIR="$tmp/pi-agent" # isolate settings and package clones
-pi install "git:github.com/Hikoia/pi-board-agent@$RELEASE_SHA"
+```text
+.pi/board-agent/owner.lock[.reclaim]
+.pi/board-agent/runtime.json                     # last-check identity + heartbeat
+.pi/board-agent/context.md
+.pi/board-agent/ticket-worktrees/<item>.json      # v4 continuation
+.pi/board-agent/legacy-v3/*                      # exact raw migration sources
+.pi/board-agent/repair/*                         # old, read-only
+.pi/board-agent/cleanup/*                        # old, read-only
+.pi/board-agent/cleanup-backups/*                # old, retained if present
+.pi/board-agent/repair-intent-backups/*           # old, retained if present
+.pi/board-agent/refine-state{,-unblocked}.json    # retired, untouched
+.pi/board-agent/watchdog-state.json              # retired, untouched
+.pi/worktrees/ticket-*                          # persistent Task work
+.pi/worktrees/review-*                          # isolated ephemeral review
 ```
 
-Start the smoke Pi session with that same environment, run `/board-agent init`
-in a disposable repository, and confirm the generated file equals the packaged
-template. `/board-agent lint` should reject the template's unset
-`project.number`; configure a disposable Project only for deliberate live
-validation. Do not use production settings, credentials, or Projects.
+Old watchdog worktrees also remain for manual preservation; no new watchdog
+runs. Include external WorkflowManager storage in backups. There is no automatic
+archive GC or production repair/snapshot maintenance path.
+
+## Validation boundaries
+
+`npm run check` uses isolated, auto-discovered offline fixtures, local bare Git
+remotes and fake board/model boundaries. It is not live GitHub/Project or real
+model certification. Validate the configured base push/merge policy separately
+before release; never change protection as a test shortcut. The repository-only T006 test port
+mapping is in [test-v4-mapping.md](test-v4-mapping.md).
+
+Historical `architecture-flow-audit.md`, `overengineering-audit.md` and
+`review-builder-concurrency-analysis.md` retain their original baselines. They
+are not current policy; use this runbook and [architecture](architecture.md).

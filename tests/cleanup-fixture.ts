@@ -2,18 +2,13 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
-  cpSync,
-  existsSync,
   mkdirSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
   rmSync,
-  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as syncFs from "node:fs";
 import { registerHooks } from "node:module";
 import { join } from "node:path";
 import type { BuilderTask } from "../src/workflow-prompt.js";
@@ -36,10 +31,16 @@ export const calls: string[][] = [];
 
 export const faults: {
   beforeGit?: (args: string[], options: ProcessOptions) => void | Promise<void>;
+  afterGit?: (args: string[], options: ProcessOptions) => void | Promise<void>;
+  beforeSyncFs?: (operation: string, path: string, ...args: any[]) => void;
   beforeFs?: (operation: string, path: string) => void | Promise<void>;
   afterFs?: (operation: string, path: string) => void | Promise<void>;
 } = {};
 const globals = globalThis as any;
+globals.__cleanupSyncFs = (op: "unlinkSync" | "renameSync", path: string, ...args: any[]) => {
+  faults.beforeSyncFs?.(op, String(path), ...args);
+  return (syncFs[op] as any)(path, ...args);
+};
 globals.__cleanupFs = async (
   operation: "unlink" | "link" | "open" | "readdir" | "readlink",
   path: string,
@@ -72,13 +73,19 @@ globals.__cleanupGit = (
   if (mode === "sync") return runProcessSync(command, args, options);
   return (async () => {
     await faults.beforeGit?.(args, options);
-    return runProcess(command, args, options);
+    const result = await runProcess(command, args, options);
+    await faults.afterGit?.(args, options);
+    return result;
   })();
 };
 const worktreeUrl = new URL("../src/ticket-worktree.ts", import.meta.url).href;
 const runnerUrl = new URL("../src/process-runner.ts", import.meta.url).href;
 const hooks = registerHooks({
   resolve(specifier, context, next) {
+    if (context.parentURL === worktreeUrl && specifier === "node:fs")
+      return { url: `data:text/javascript,${encodeURIComponent(`export * from 'node:fs';
+        export const unlinkSync = (...args) => globalThis.__cleanupSyncFs('unlinkSync', ...args);
+        export const renameSync = (...args) => globalThis.__cleanupSyncFs('renameSync', ...args);`)}`, shortCircuit: true };
     if (
       context.parentURL === worktreeUrl &&
       specifier === "./process-runner.js"
@@ -110,7 +117,7 @@ const hooks = registerHooks({
 });
 export const { TicketWorktrees } = await import("../src/ticket-worktree.js");
 let sequence = 0;
-export async function fixture(lockfiles = false) {
+export async function fixture(lockfiles = false, current = false) {
   const dir = join(root, `case-${++sequence}`),
     repo = join(dir, "repo"),
     origin = join(dir, "origin.git");
@@ -141,12 +148,16 @@ export async function fixture(lockfiles = false) {
     baseBranch: "main",
   };
   const store = new TicketWorktrees(repo),
-    record = await store.ensure(task, "demo");
+    record = { ...await store.ensure(task, "demo"), schemaVersion: current ? 4 as const : 3 as const };
+  // Historical cleanup/receipt tests intentionally exercise the legacy finalizer.
+  // New ensure/admission now produces v4; do not accidentally migrate this fixture.
+  writeFileSync(store.recordPath(task.itemId), JSON.stringify(record, null, 2));
   writeFileSync(join(record.path, "feature.txt"), "feature\n");
   git(record.path, "add", ".");
   git(record.path, "commit", "-m", "feature");
   git(record.path, "push", "origin", task.taskBranch);
   const taskSha = git(record.path, "rev-parse", "HEAD");
+  if (current) store.setReviewedTaskSha(task.itemId, taskSha);
   const admin = git(record.path, "rev-parse", "--absolute-git-dir");
   mkdirSync(join(record.path, "ignored", "empty"), { recursive: true });
   writeFileSync(
@@ -175,8 +186,11 @@ export async function fixture(lockfiles = false) {
     `item_${sequence}.json`,
   );
   const tip = () => git(origin, "rev-parse", "refs/heads/main");
-  const finish = (strategy: "merge" | "squash" = "merge") =>
-    new TicketWorktrees(repo).finalizeAccepted(task, strategy);
+  const finish = async (strategy: "merge" | "squash" = "merge") => {
+    const result = await store.finalizeAccepted(task, strategy);
+    if (result) await store.completeFinalization(task, result, async () => {});
+    return result;
+  };
   const vanish = () => {
     unlinkSync(join(record.path, ".git"));
     rmSync(admin, { recursive: true });
@@ -229,8 +243,9 @@ export function legacy(
 }
 
 export function dispose() {
-  faults.beforeGit = faults.beforeFs = faults.afterFs = undefined;
+  faults.beforeGit = faults.afterGit = faults.beforeFs = faults.afterFs = faults.beforeSyncFs = undefined;
   hooks.deregister();
+  delete globals.__cleanupSyncFs;
   delete globals.__cleanupGit;
   delete globals.__cleanupFs;
 }

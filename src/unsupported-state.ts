@@ -35,6 +35,7 @@ function stateFiles(path: string, unsupported: string[]): string[] {
 export function findUnsupportedState(
   cwd: string,
   root = resolveStateRepoRoot(cwd),
+  isolateTickets = false,
 ): string[] {
   const dotpi = join(root, ".pi");
   const state = join(dotpi, "board-agent");
@@ -49,7 +50,9 @@ export function findUnsupportedState(
       join(state, "ticket-worktrees"),
       unsupported,
     )) {
-      if (!path.toLowerCase().endsWith(".json")) continue;
+      // Startup isolates individual files in the legacy adapter. Unsafe parent
+      // directories and old inflight stores still block the whole owner.
+      if (isolateTickets || !path.toLowerCase().endsWith(".json")) continue;
       try {
         const stat = lstatSync(path);
         if (!stat.isFile() || stat.isSymbolicLink())
@@ -66,8 +69,8 @@ export function findUnsupportedState(
     .map((path) => relative(root, path).replaceAll("\\", "/"));
 }
 
-export function assertSupportedState(cwd: string, root?: string): void {
-  const files = findUnsupportedState(cwd, root);
+export function assertSupportedState(cwd: string, root?: string, isolateTickets = false): void {
+  const files = findUnsupportedState(cwd, root, isolateTickets);
   if (!files.length) return;
   throw new Error(
     [

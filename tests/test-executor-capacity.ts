@@ -27,7 +27,7 @@ git(repo, "remote", "add", "origin", origin);
 git(repo, "push", "origin", "main");
 const cfg = structuredClone(_DEFAULTS);
 cfg.max_workers = 3;
-cfg.safety.require_clean_worktree = cfg.context.enabled = cfg.refine.enabled = cfg.review.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+cfg.safety.require_clean_worktree = cfg.context.enabled = cfg.telegram.enabled = false;
 const cards: Card[] = Array.from({ length: 4 }, (_, i) => ({
   itemId: `ITEM_${i + 1}`, number: i + 1, contentType: "Issue", type: "Task", title: `T00${i + 1} Task`, body: "Acceptance", plan: "demo",
   repoOwner: "owner", repoName: "repo", closed: false, assignees: [], status: cfg.columns.ready,
@@ -142,7 +142,7 @@ try {
     assert.equal(starts, index < 2 ? 3 : 4, "new work waits until occupancy falls BELOW the cap");
   }
   assert.equal(executor.activeCount(), 1);
-  assert.equal(stops, 0);
+  assert.equal(stops, 3, "terminal outcomes drain before releasing their execution slots");
   console.log("PASS: excess recovered builders resume within retained slots without eviction; new admissions wait until enough slots drain");
 } finally {
   contextRelease.resolve();

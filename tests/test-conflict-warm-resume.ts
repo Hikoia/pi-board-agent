@@ -35,26 +35,26 @@ try {
     try {
       await f.loop.tickNow(); await f.loop.tickNow(); await settle(f); await flush();
       const original = f.runs()[0]; assert.equal(f.calls(), 1); assert.equal(original.status, "paused");
-      for (const mode of ["author", "unknown", "revision", "late-revision"] as const) {
+      for (const mode of ["identity", "unknown", "revision", "late-revision"] as const) {
         const calls = f.calls(), writes = f.events.length;
-        if (mode === "author") { f.comments[0].author = "attacker"; await f.loop.tickNow(); }
-        if (mode === "unknown") f.setHook((event) => { if (event === "read:comments") throw new Error("offline comments unavailable"); });
+        if (mode === "identity") { f.setHook((event) => { if (event === "read:card") throw new Error("fresh identity unavailable"); }); await f.loop.tickNow(); }
+        if (mode === "unknown") f.setHook((event) => { if (event === "read:card") throw new Error("offline comments unavailable"); });
         if (mode === "revision") f.setRevision(false);
-        if (mode === "late-revision") f.setHook((event) => { if (event === "read:comments") f.setRevision(false); });
+        if (mode === "late-revision") f.setHook((event) => { if (event === "read:card") f.setRevision(false); });
         await fire(); await settle(f);
         assert.equal(f.calls(), calls, `${mode}: an already-armed timer must freshly authorize the bound repair`);
         assert.equal(f.executor.activeCount(), 1, "denied repair retains its occupied slot");
         assert.equal(f.store.read(f.card.itemId)?.activeRunId, original.runId);
         assert.equal(f.runs()[0].status, "paused"); assert.equal(f.runs().length, 1);
         assert.equal(f.events.length, writes, "denial cannot mutate the board");
-        f.comments[0].author = "bot"; f.setHook(() => {}); f.setRevision(true); f.loop.enableAdmissions();
+        f.setHook(() => {}); f.setHook(() => {}); f.setRevision(true); f.loop.enableAdmissions();
         await fire(); await settle(f); await flush();
         assert.equal(f.calls(), calls + 1, "confirmed recovery resumes the same run normally");
         assert.equal(f.runs()[0].runId, original.runId); assert.deepEqual(f.runs()[0].args, original.args);
         console.log(`PASS: warm ${mode} denial blocks the existing timer; confirmed recovery resumes the same occupied repair run`);
       }
       const stale = [...timers][0], calls = f.calls(), reading = deferred(), finishRead = deferred();
-      f.setHook(async (event) => { if (event === "read:comments") { reading.resolve(); await finishRead.promise; } });
+      f.setHook(async (event) => { if (event === "read:card") { reading.resolve(); await finishRead.promise; } });
       const firing = fire(); await reading.promise;
       try { await f.loop.stop(); assert.equal(timers.size, 0); }
       finally { finishRead.resolve(); await firing; }
@@ -76,11 +76,11 @@ try {
       const id = f.runs()[0].runId;
       assert.equal(raw.pause(id), true); await cleanup.promise;
       const pending = scheduled.resume(id); // actual upstream async settlement boundary
-      await flush(); f.comments[0].author = "attacker";
+      await flush(); f.setHook((event) => { if (event === "read:card") throw new Error("fresh identity unavailable"); });
       await f.loop.tickNow(); finish.resolve(); await pending; await settle(f); await flush();
       assert.equal(f.calls(), 1, "resume already awaiting cooperative settlement must reauthorize after the wait");
       assert.equal(f.executor.activeCount(), 1); assert.equal(f.store.read(f.card.itemId)?.activeRunId, id);
-      f.comments[0].author = "bot";
+      f.setHook(() => {});
       await f.loop.tickNow(); await settle(f);
       assert.equal(f.calls(), 2); assert.equal(f.runs()[0].runId, id); assert.equal(f.runs().length, 1);
       console.log("PASS: in-flight repair resume cannot outlive authority rejection; same run resumes after confirmation");

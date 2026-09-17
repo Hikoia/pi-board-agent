@@ -21,7 +21,6 @@ import { loadConfig, validateConfig, resolveOwner } from "./config.js";
 import {
   getProjectMetadata,
   validateProjectMetadata,
-  validateStatusOptions,
   whoami,
 } from "./gh.js";
 import { createLoopState, BoardLoop, type LoopDeps } from "./loop.js";
@@ -37,9 +36,9 @@ import {
   resolveStateRepoRoot,
 } from "./unsupported-state.js";
 import {
+  BOARD_AGENT_SOURCE,
   captureRuntimeIdentity,
   checkRuntimeRevisionAsync,
-  runtimeSettingsUnchanged,
   formatRevisionFailure,
   readRuntimeStatus,
   writeRuntimeStatus,
@@ -49,7 +48,7 @@ import {
 
 let loop: BoardLoop | null = null;
 // Retained only with this loop's owner, including incomplete cleanup.
-let loopWorktrees: { cwd: string; store: TicketWorktrees } | undefined;
+let loopWorktrees: { cwd: string; store: TicketWorktrees; cfg: ReturnType<typeof loadConfig> } | undefined;
 function stateRoot(cwd: string): string {
   return loopWorktrees?.cwd === resolve(cwd)
     ? loopWorktrees.store.repoRoot
@@ -71,7 +70,15 @@ const revisionLatch = (processRevisionState[REVISION_LATCH] ??= {
   mismatch: false,
 });
 let runtimeStartedAt = new Date().toISOString();
-let lastRevisionCheck: RevisionCheck | undefined;
+let lastRevisionCheck: RevisionCheck = {
+  ok: false,
+  expectedRevision: loadedRuntimeIdentity.expectedRevisionAtLoad,
+  loadedRevision: loadedRuntimeIdentity.loadedRevision,
+  diskRevision: loadedRuntimeIdentity.loadedRevision,
+  dirty: loadedRuntimeIdentity.loadedDirty,
+  reason: "Startup/lint revision check has not completed.",
+  repairCommand: `pi install "${BOARD_AGENT_SOURCE}@<FULL_GIT_SHA>"`,
+};
 
 function clearBoardWidget(ctx: ExtensionContext): void {
   if (ctx.hasUI) ctx.ui.setWidget(BOARD_WIDGET_ID, undefined);
@@ -83,33 +90,20 @@ function loadContextConfig(ctx: ExtensionContext) {
   );
 }
 
-function configuredStatuses(cfg: ReturnType<typeof loadConfig>): string[] {
-  return [
-    cfg.columns.backlog,
-    cfg.columns.ready,
-    cfg.columns.building,
-    cfg.columns.needs_design,
-    cfg.columns.needs_human,
-    cfg.columns.review,
-    cfg.columns.done,
-  ];
-}
-
 function hasRecoveryState(cwd: string, root: string): boolean {
-  assertSupportedState(cwd, root);
-  const stateDir = resolve(cwd, CONFIG_DIR_NAME, "board-agent");
+  assertSupportedState(cwd, root, true);
+  const stateDir = resolve(root, CONFIG_DIR_NAME, "board-agent");
   if (!existsSync(stateDir)) return false;
-  return (
-    loopWorktrees?.cwd === resolve(cwd)
-      ? loopWorktrees.store
-      : new TicketWorktrees(cwd)
-  )
-    .list()
+  const store = loopWorktrees?.cwd === resolve(cwd)
+    ? loopWorktrees.store
+    : new TicketWorktrees(cwd);
+  return store.hasCleanupReceipts() || store.list()
     .some(
       (record) =>
+        record.schemaVersion === 3 ||
         record.activeRunId !== undefined ||
         record.launchingAt !== undefined ||
-        record.finalization !== undefined,
+        record.finalization !== undefined || record.integration !== undefined || record.retry !== undefined,
     );
 }
 
@@ -181,11 +175,9 @@ async function startBoardLoop(
   const cwd = ctx.cwd;
   const generation = stopGeneration;
   if (loop?.isStopping())
-    throw new Error(
-      "Loop cleanup is pending; retry stop before starting again.",
-    );
+    throw new Error("Loop cleanup is pending; retry stop before starting again.");
   const root = stateRoot(cwd);
-  assertSupportedState(cwd, root);
+  assertSupportedState(cwd, root, true);
   const preflight = await currentRevision(cwd);
   if (!preflight.ok && admitNewWork) {
     saveRuntime(
@@ -218,13 +210,12 @@ async function startBoardLoop(
       projectOwner,
       cfg.project.number,
       cfg.status_field,
-      cfg.plan_field,
       cfg.type_field,
     );
     validateProjectMetadata(meta, cfg);
     if (generation !== stopGeneration)
       throw new Error("Startup cancelled by stop/shutdown.");
-    assertSupportedState(cwd, root);
+    assertSupportedState(cwd, root, true);
     // Promotion is an admission too: validate metadata before using a cached loop.
     if (loop?.isRunning()) {
       if (admitNewWork && !loop.isAdmittingNewWork()) {
@@ -292,10 +283,14 @@ async function startBoardLoop(
       updateWidget();
     };
     const revisionCheck = async () => {
-      // Busy-tick heartbeats must refresh activity too, not just runtime identity.
-      updateWidget();
-      const check = await currentRevision(cwd);
-      saveRuntime(ctx, liveRuntimeState(check), check, root);
+      updateWidget(); // Busy-tick heartbeat reflects live runs without package/config scans.
+      const check = lastRevisionCheck;
+      saveRuntime(
+        ctx,
+        liveRuntimeState(check),
+        check,
+        root,
+      );
       return {
         ok: check.ok,
         reason: check.ok ? undefined : formatRevisionFailure(check),
@@ -320,6 +315,14 @@ async function startBoardLoop(
         : undefined,
       sessionId: ctx.sessionManager.getSessionId(),
     });
+    // No manager exists yet. Acquisition rejects a live previous owner (even
+    // this PID); its shutdown retains the lock until all old work is drained.
+    const migration = await executor.migrateLegacy(ownerLock,
+      () => generation === stopGeneration);
+    for (const failure of migration.failures)
+      callback(`Legacy migration preserved ${failure.source}: ${failure.reason}`, "warn");
+    if (generation !== stopGeneration)
+      throw new Error("Startup cancelled by stop/shutdown.");
     const deps: LoopDeps = {
       cwd,
       repoRoot: root,
@@ -331,10 +334,8 @@ async function startBoardLoop(
       callback,
       revisionCheck,
       revisionCheckNow: () => {
-        if (!runtimeSettingsUnchanged(cwd, loadedRuntimeIdentity))
-          revisionLatch.mismatch = true;
         return {
-          ok: !revisionLatch.mismatch,
+          ok: lastRevisionCheck.ok && !revisionLatch.mismatch,
           reason: "Package revision/settings changed; restart is required.",
         };
       },
@@ -350,7 +351,7 @@ async function startBoardLoop(
       admitNewWork,
     );
     loop = nextLoop;
-    loopWorktrees = { cwd: resolve(cwd), store: worktrees };
+    loopWorktrees = { cwd: resolve(cwd), store: worktrees, cfg };
     await nextLoop.start();
     if (
       generation !== stopGeneration ||
@@ -412,7 +413,7 @@ export default function (pi: ExtensionAPI) {
     try {
       // Do this before even the heartbeat write, not only inside recovery discovery.
       const root = stateRoot(ctx.cwd);
-      assertSupportedState(ctx.cwd, root);
+      assertSupportedState(ctx.cwd, root, true);
       const cfg = loadContextConfig(ctx);
       validateConfig(cfg);
       const previous = readRuntimeStatus(ctx.cwd);
@@ -455,7 +456,7 @@ export default function (pi: ExtensionAPI) {
       mkdirSync(resolve(cwd, CONFIG_DIR_NAME), { recursive: true });
       writeFileSync(dest, template, { encoding: "utf8", flag: "wx" });
       ctx.ui.notify(
-        `Wrote: ${dest} (edit project.number + plan_field)`,
+        `Wrote: ${dest} (edit project.number)`,
         "info",
       );
     },
@@ -464,7 +465,7 @@ export default function (pi: ExtensionAPI) {
   // ----------- /board-agent lint -----------
   subcommands.set("lint", {
     description:
-      "Check preconditions: revision, config, gh auth, project exists, plan field present",
+      "Check preconditions: revision, config, gh auth, required Task Type and Status options",
     handler: async (_args, ctx) => {
       try {
         const cwd = ctx.cwd;
@@ -483,7 +484,6 @@ export default function (pi: ExtensionAPI) {
           projectOwner,
           cfg.project.number,
           cfg.status_field,
-          cfg.plan_field,
           cfg.type_field,
         );
         validateProjectMetadata(meta, cfg);
@@ -501,7 +501,7 @@ export default function (pi: ExtensionAPI) {
   // ----------- /board-agent init-project -----------
   subcommands.set("init-project", {
     description:
-      "Initialize the GitHub Project with the standard board (columns, Type, Plan, Board view)",
+      "Initialize the GitHub Project with the Task board (required Status options, Type: Task, Board view)",
     handler: async (_args, ctx) => {
       try {
         const cwd = ctx.cwd;
@@ -557,21 +557,18 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       try {
         const cwd = ctx.cwd;
-        const revision = await currentRevision(cwd);
+        const revision = lastRevisionCheck;
         const runtimeState = liveRuntimeState(revision);
         saveRuntime(ctx, runtimeState, revision);
         const runtime = readRuntimeStatus(cwd);
-        const cfg = loadContextConfig(ctx);
-        validateConfig(cfg);
+        const cfg = loopWorktrees?.cfg ?? loadContextConfig(ctx);
         const { projectOwner, repoOwner, repoName } = resolveOwner(cfg, cwd);
         const meta = await getProjectMetadata(
           projectOwner,
           cfg.project.number,
           cfg.status_field,
-          cfg.plan_field,
           cfg.type_field,
         );
-        validateStatusOptions(meta, configuredStatuses(cfg));
         const { listCards } = await import("./gh.js");
         const cards = await listCards(
           meta.projectId,
@@ -582,9 +579,7 @@ export default function (pi: ExtensionAPI) {
         const { summarizePlans } = await import("./plan.js");
         const plans = summarizePlans(cfg, cards);
         const execution = inspectTicketExecutions(
-          cwd,
-          cards,
-          cfg,
+          cwd, cards, cfg,
           loopWorktrees?.cwd === resolve(cwd) ? loopWorktrees.store : undefined,
         );
 
@@ -599,7 +594,7 @@ export default function (pi: ExtensionAPI) {
           `Revision: state=${runtime?.state ?? runtimeState} pid=${runtime?.pid ?? process.pid}`,
           `  expected=${revision.expectedRevision ?? "missing"}`,
           `  loaded=${revision.loadedRevision ?? "unknown"}`,
-          `  disk=${revision.diskRevision ?? "unknown"} dirty=${revision.dirty ? "yes" : "no"}`,
+          `  disk (last startup/lint check)=${revision.diskRevision ?? "unknown"} dirty=${revision.dirty ? "yes" : "no"}`,
           `  columns: ${Object.entries(colCounts)
             .map(([k, v]) => `${k}(${v})`)
             .join("  ")}`,
@@ -654,7 +649,7 @@ export default function (pi: ExtensionAPI) {
       stopGeneration++;
       if (!loop) {
         clearBoardWidget(ctx);
-        saveRuntime(ctx, "stopped", await currentRevision(ctx.cwd));
+        saveRuntime(ctx, "stopped", lastRevisionCheck);
         ctx.ui.notify("No loop is running.", "warning");
         return;
       }
@@ -675,7 +670,7 @@ export default function (pi: ExtensionAPI) {
           loopWorktrees = undefined;
         }
         if (!loop) clearBoardWidget(ctx);
-        const revision = await currentRevision(ctx.cwd);
+        const revision = lastRevisionCheck;
         saveRuntime(ctx, liveRuntimeState(revision), revision);
       }
     },
@@ -717,7 +712,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (!loop) clearBoardWidget(ctx);
       try {
-        const revision = await currentRevision(ctx.cwd);
+        const revision = lastRevisionCheck;
         saveRuntime(ctx, liveRuntimeState(revision), revision);
       } catch (error: any) {
         ctx.ui.notify(

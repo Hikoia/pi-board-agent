@@ -222,7 +222,6 @@ try {
     "unsupported-state.ts",
     "ticket-worktree.ts",
     "cleanup-snapshot.ts",
-    "repair.ts",
     "dispatch.ts",
     "process-runner.ts",
   ]) {
@@ -273,8 +272,6 @@ try {
     statusOptions: Object.fromEntries(
       Object.values(_DEFAULTS.columns).map((name) => [name, name]),
     ),
-    planFieldId: "PLAN",
-    planFieldType: "TEXT",
     typeFieldId: "TYPE",
     typeFieldType: "SINGLE_SELECT",
     typeOptions: { Task: "TASK", Story: "STORY" },
@@ -352,7 +349,7 @@ try {
     validateProjectMetadata: gh.validateProjectMetadata,
     createProductionTicketExecutor: () => {
       executors++;
-      return {};
+      return { migrateLegacy: async () => ({ converted: [], failures: [] }) };
     },
     inspectTicketExecutions: () => ({ active: [], orphans: 0, needsHuman: 0 }),
   };
@@ -435,22 +432,9 @@ try {
   }
   rmSync(join(state, "inflight"), { recursive: true });
   for (const [label, patch, error] of [
-    ["missing Plan", { planFieldId: undefined }, /Plan.*TEXT.*SINGLE_SELECT/],
-    ["wrong Plan", { planFieldType: "NUMBER" }, /Plan.*TEXT.*SINGLE_SELECT/],
-    [
-      "unknown Plan type",
-      { planFieldType: undefined },
-      /Plan.*TEXT.*SINGLE_SELECT/,
-    ],
-    [
-      "missing Plan options",
-      { planFieldType: "SINGLE_SELECT", planOptions: undefined },
-      /Plan.*option/,
-    ],
     ["missing Type", { typeFieldId: undefined }, /Type.*SINGLE_SELECT/],
     ["wrong Type", { typeFieldType: "TEXT" }, /Type.*SINGLE_SELECT/],
     ["missing Task", { typeOptions: { Story: "STORY" } }, /Type.*Task/],
-    ["missing Story", { typeOptions: { Task: "TASK" } }, /Type.*Story/],
     ["missing Status", { statusFieldId: "" }, /Status.*SINGLE_SELECT/],
     ["wrong Status", { statusFieldType: "TEXT" }, /Status.*SINGLE_SELECT/],
     [
@@ -539,7 +523,7 @@ try {
     "cached promotion must still reject removed configuration",
   );
   writeFileSync(configFile, configText);
-  metadata = { ...validMetadata, planFieldId: undefined };
+  metadata = { ...validMetadata, typeFieldId: undefined };
   const promotionStart = messages.length;
   await command("run");
   assert.equal(
@@ -549,7 +533,7 @@ try {
   );
   assert.equal(recovery.ticks, 0);
   assert.ok(
-    messages.slice(promotionStart).some((message) => /Plan/.test(message)),
+    messages.slice(promotionStart).some((message) => /Type/.test(message)),
   );
   assert.ok(
     existsSync(recovery.lock.path),
@@ -629,20 +613,15 @@ try {
 
   metadataWait = Promise.resolve();
   for (const refine of [true, false]) {
-    for (const planFieldType of ["TEXT", "SINGLE_SELECT"]) {
+    {
       metadata = {
         ...validMetadata,
-        planFieldType,
-        planOptions:
-          planFieldType === "SINGLE_SELECT"
-            ? { Release: "RELEASE_ID" }
-            : undefined,
         typeOptions: refine
           ? { Task: "TASK", Story: "STORY" }
           : { task: "TASK" },
         statusOptions: Object.fromEntries(
           Object.entries(validMetadata.statusOptions).filter(
-            ([name]) => refine || name !== "Needs Design",
+            ([name]) => refine || !["Backlog", "Needs Design"].includes(name),
           ),
         ),
       };
@@ -661,25 +640,7 @@ try {
       assert.equal(loops.length, count + 1);
       await command("stop");
       console.log(
-        `PASS: lint/run accept ${planFieldType} Plan with refine=${refine}; disabled design omits Story/Needs Design but still requires Backlog`,
-      );
-      delete metadata.statusOptions.Backlog;
-      const beforeMissing = messages.length;
-      const beforeLoops: number = loops.length;
-      await command("lint");
-      await command("run");
-      assert.equal(
-        loops.length,
-        beforeLoops,
-        "missing Backlog cannot start a loop",
-      );
-      assert.ok(
-        messages
-          .slice(beforeMissing)
-          .some((message) => /missing.*Backlog/.test(message)),
-      );
-      console.log(
-        `PASS: missing Backlog fails preflight with refine=${refine}, ${planFieldType} Plan`,
+        `PASS: lint/run accept absent Plan with legacy refine=${refine}; no Story/Needs Design/Backlog required`,
       );
     }
   }

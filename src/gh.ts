@@ -1,15 +1,4 @@
-/**
- * Thin wrapper around the `gh` CLI for the operations we need:
- *  - resolve the project + its Status / Plan field option IDs (GraphQL)
- *  - list cards in a column, optionally filtered by Plan
- *  - move a card to a column
- *  - claim / release an Issue via assignee with fresh-state verification
- *  - inspect PR health and post comments/labels
- *
- * Everything goes through `gh api graphql` for ProjectsV2 (the REST API does
- * not cover v2) and `gh pr` for pull requests. We never call git remotes
- * directly — `gh` handles auth.
- */
+/** Read-only Project discovery and guarded Task Issue status/claim/comment I/O. */
 import type { Config } from "./config.js";
 import {
   GIT_GH_TIMEOUT_MS,
@@ -32,7 +21,7 @@ export interface Card {
   status?: string;
   /** Current Plan option name (e.g. "001-auth"). */
   plan?: string;
-  /** Current Type option name ("Story" | "Task"), when a Type field exists. */
+  /** Current Type option name; only Task executes. */
   type?: string;
   /** Current assignees (logins). Empty array if none. */
   assignees: string[];
@@ -50,9 +39,6 @@ export interface ProjectMetadata {
   statusFieldId: string;
   statusFieldType?: string;
   statusOptions: Record<string, string>; // name -> optionId
-  planFieldId?: string;
-  planFieldType?: string;
-  planOptions?: Record<string, string>; // name -> optionId
   typeFieldId?: string;
   typeFieldType?: string;
   typeOptions?: Record<string, string>; // name -> optionId
@@ -159,7 +145,6 @@ export async function getProjectMetadata(
   owner: string,
   number: number,
   statusFieldName: string,
-  planFieldName?: string,
   typeFieldName?: string,
 ): Promise<ProjectMetadata> {
   // Project ownership is independent of the target repository. Resolve user/org
@@ -182,7 +167,6 @@ export async function getProjectMetadata(
     projectId,
     await listProjectFields(projectId),
     statusFieldName,
-    planFieldName,
     typeFieldName,
   );
 }
@@ -200,7 +184,6 @@ function resolveFields(
   projectId: string,
   fields: RawProject["fields"],
   statusFieldName: string,
-  planFieldName?: string,
   typeFieldName?: string,
 ): ProjectMetadata {
   const status = fields.find(
@@ -219,20 +202,6 @@ function resolveFields(
       status.options.map((o) => [o.name, o.id]),
     ),
   };
-  if (planFieldName) {
-    const plan = fields.find(
-      (f) => f.name.toLowerCase() === planFieldName.toLowerCase(),
-    );
-    if (plan) {
-      meta.planFieldId = plan.id;
-      meta.planFieldType = plan.dataType;
-      if (plan.options) {
-        meta.planOptions = Object.fromEntries(
-          plan.options.map((o) => [o.name, o.id]),
-        );
-      }
-    }
-  }
   if (typeFieldName) {
     const type = fields.find(
       (f) => f.name.toLowerCase() === typeFieldName.toLowerCase(),
@@ -263,8 +232,7 @@ export function validateStatusOptions(
   }
 }
 
-/** Read-only preflight for the enabled lanes. Builders always need Plan + Task;
- * Story/Needs Design requirements apply only when refinement is enabled. */
+/** Read-only preflight. Plan and manual holding columns are never required. */
 export function validateProjectMetadata(
   meta: ProjectMetadata,
   cfg: Config,
@@ -280,41 +248,17 @@ export function validateProjectMetadata(
     cfg.columns.review,
     cfg.columns.done,
     cfg.columns.needs_human,
-    ...(cfg.refine.enabled ? [cfg.columns.needs_design] : []),
   ]);
-  if (
-    !meta.planFieldId ||
-    !["TEXT", "SINGLE_SELECT"].includes(meta.planFieldType ?? "")
-  )
-    throw new Error(
-      `Project Plan field '${cfg.plan_field}' is required and must be TEXT or SINGLE_SELECT.`,
-    );
-  if (meta.planFieldType === "SINGLE_SELECT" && !meta.planOptions)
-    throw new Error(
-      `Project Plan field '${cfg.plan_field}' is missing option metadata.`,
-    );
   if (!meta.typeFieldId || meta.typeFieldType !== "SINGLE_SELECT")
     throw new Error(
       `Project Type field '${cfg.type_field}' is required and must be SINGLE_SELECT.`,
     );
-  const missing = ["Task", ...(cfg.refine.enabled ? ["Story"] : [])].filter(
+  const missing = ["Task"].filter(
     (name) => !findCaseInsensitive(meta.typeOptions ?? {}, name),
   );
   if (missing.length)
     throw new Error(
       `Project Type field '${cfg.type_field}' is missing option(s): ${missing.join(", ")}.`,
-    );
-}
-
-/** Resolve before model/child creation; never add options to the Project. */
-export function validatePlanOption(meta: ProjectMetadata, plan: string): void {
-  if (!plan.trim()) throw new Error("A Story Plan value is required.");
-  if (
-    meta.planFieldType === "SINGLE_SELECT" &&
-    !findCaseInsensitive(meta.planOptions ?? {}, plan)
-  )
-    throw new Error(
-      `Project Plan option '${plan}' is missing. Check the Project options manually and restart Board Agent to refresh metadata; no schema changes were made.`,
     );
 }
 
@@ -340,15 +284,6 @@ const CARD_FIELDS = `
       assignees(first: 10) { nodes { login } }
       repository { owner { login } name }
     }
-    ... on PullRequest {
-      number title body url closed
-      assignees(first: 10) { nodes { login } }
-      repository { owner { login } name }
-    }
-    ... on DraftIssue {
-      title body
-      assignees(first: 10) { nodes { login } }
-    }
   }
 `;
 
@@ -369,7 +304,7 @@ function hydrateCard(
     else if (typeof fv.text === "string") fieldByName.set(key, fv.text);
   }
   const content = item.content ?? {};
-  if (content.__typename === "Issue" || content.__typename === "PullRequest") {
+  if (content.__typename === "Issue") {
     if (
       !Number.isSafeInteger(content.number) ||
       content.number <= 0 ||
@@ -412,7 +347,7 @@ export function isTargetIssue(
   card: Card,
   repoOwner: string,
   repoName: string,
-  expectedType?: "Story" | "Task",
+  expectedType?: "Task",
 ): card is Card & {
   contentType: "Issue";
   number: number;
@@ -544,7 +479,7 @@ export async function setStatus(
 }
 
 /** Set a single-select field value on an item (generic). */
-export async function setSingleSelect(
+async function setSingleSelect(
   meta: ProjectMetadata,
   itemId: string,
   fieldId: string,
@@ -570,32 +505,6 @@ export async function setSingleSelect(
   });
   if (data?.updateProjectV2ItemFieldValue?.projectV2Item?.id !== itemId)
     throw new Error("Unable to confirm Project field mutation.");
-}
-
-/** Set a text field value on an item (generic). */
-export async function setTextField(
-  meta: ProjectMetadata,
-  itemId: string,
-  fieldId: string,
-  text: string,
-): Promise<void> {
-  const mutation = `
-    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
-      updateProjectV2ItemFieldValue(input: {
-        projectId: $projectId
-        itemId: $itemId
-        fieldId: $fieldId
-        value: { text: $text }
-      }) { projectV2Item { id } }
-    }`;
-  const data = await graphql<any>(mutation, {
-    projectId: meta.projectId,
-    itemId,
-    fieldId,
-    text,
-  });
-  if (data?.updateProjectV2ItemFieldValue?.projectV2Item?.id !== itemId)
-    throw new Error("Unable to confirm Project text mutation.");
 }
 
 function findCaseInsensitive(
@@ -643,14 +552,14 @@ async function readClaimState(
   };
 }
 
-export async function tryClaim(card: Card, botLogin: string): Promise<boolean> {
-  if (!isTargetIssue(card, card.repoOwner ?? "", card.repoName ?? ""))
+export async function tryClaim(card: Card, botLogin: string, allowClosed = false): Promise<boolean> {
+  if (!isTargetIssue(card, card.repoOwner ?? "", card.repoName ?? "", allowClosed ? undefined : "Task"))
     return false;
   requiredString(botLogin, "claim login");
   const bot = botLogin.toLowerCase();
   const before = await readClaimState(card);
   if (
-    !before.open ||
+    (!before.open && !allowClosed) ||
     before.assignees.some((assignee) => assignee.toLowerCase() !== bot)
   )
     return false;
@@ -674,7 +583,8 @@ export async function tryClaim(card: Card, botLogin: string): Promise<boolean> {
 
   const after = await readClaimState(card);
   const won =
-    after.open &&
+    after.open === before.open &&
+    (after.open || allowClosed) &&
     after.assignees.some((assignee) => assignee.toLowerCase() === bot) &&
     after.assignees.every((assignee) => assignee.toLowerCase() === bot);
   if (!won) await release(card, botLogin);
@@ -684,7 +594,7 @@ export async function tryClaim(card: Card, botLogin: string): Promise<boolean> {
 
 /** Failures propagate; callers choosing best-effort cleanup must catch and warn. */
 export async function release(card: Card, botLogin: string): Promise<void> {
-  if (!isTargetIssue(card, card.repoOwner ?? "", card.repoName ?? "")) return;
+  if (!isTargetIssue(card, card.repoOwner ?? "", card.repoName ?? "", card.closed ? undefined : "Task")) return;
   requiredString(botLogin, "release login");
   await runGh([
     "issue",
@@ -697,61 +607,15 @@ export async function release(card: Card, botLogin: string): Promise<void> {
   ]);
 }
 
-export async function updateIssueBody(
-  repoOwner: string,
-  repoName: string,
-  number: number,
-  body: string,
-): Promise<void> {
-  if (!body.trim()) throw new Error("Issue body cannot be empty.");
-  await runGh(
-    [
-      "issue",
-      "edit",
-      String(number),
-      "--repo",
-      `${repoOwner}/${repoName}`,
-      "--body-file",
-      "-",
-    ],
-    { input: body },
-  );
-}
-
-export async function ensureLabels(
-  repoOwner: string,
-  repoName: string,
-  labels: string[],
-): Promise<void> {
-  for (const label of labels) {
-    try {
-      await runGh([
-        "label",
-        "create",
-        label,
-        "--repo",
-        `${repoOwner}/${repoName}`,
-        "--color",
-        "8a2be2",
-        "--description",
-        "Managed by pi-board-agent",
-        "--force",
-      ]);
-    } catch {
-      // ignore — label exists or insufficient perms; PR creation will surface the real error
-    }
-  }
-}
-
 export { runGh as _runGh, graphql as _graphql };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase C — project standard, issues/sub-issues, comments, field values
+// Explicit Project initialization and Issue comments
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface StandardFieldSpec {
   name: string;
-  kind: "single" | "text";
+  kind: "single";
   options?: string[];
   colors?: string[];
 }
@@ -764,7 +628,7 @@ export async function ensureStandardFields(
 ): Promise<{ created: string[]; existing: string[] }> {
   const created: string[] = [];
   const existing: string[] = [];
-  // Re-fetch all project fields (the metadata only carries status/plan/type).
+  // Never rewrite an existing option list.
   const fields = await listProjectFields(meta.projectId);
 
   for (const spec of specs) {
@@ -842,47 +706,29 @@ async function createField(
   projectId: string,
   spec: StandardFieldSpec,
 ): Promise<string> {
-  const dataType = spec.kind === "single" ? "SINGLE_SELECT" : "TEXT";
-  if (spec.kind === "single") {
-    if (!spec.options || spec.options.length === 0) {
-      throw new Error(
-        `Single-select field '${spec.name}' needs at least one option.`,
-      );
-    }
-    const literals = spec.options
-      .map(
-        (name, i) =>
-          `{ name: ${JSON.stringify(name)}, color: ${fieldColor(spec, i)}, description: "" }`,
-      )
-      .join(", ");
-    const mutation = `
-      mutation($projectId: ID!, $name: String!) {
-        createProjectV2Field(input: {
-          projectId: $projectId
-          name: $name
-          dataType: SINGLE_SELECT
-          singleSelectOptions: [${literals}]
-        }) {
-          projectV2Field { ... on ProjectV2SingleSelectField { id } }
-        }
-      }`;
-    const data = await graphql<any>(mutation, { projectId, name: spec.name });
-    return requiredString(
-      data?.createProjectV2Field?.projectV2Field?.id,
-      "created Project field id",
+  if (!spec.options || spec.options.length === 0) {
+    throw new Error(
+      `Single-select field '${spec.name}' needs at least one option.`,
     );
   }
+  const literals = spec.options
+    .map(
+      (name, i) =>
+        `{ name: ${JSON.stringify(name)}, color: ${fieldColor(spec, i)}, description: "" }`,
+    )
+    .join(", ");
   const mutation = `
-    mutation($projectId: ID!, $name: String!, $dataType: ProjectV2CustomFieldType!) {
-      createProjectV2Field(input: { projectId: $projectId, name: $name, dataType: $dataType }) {
-        projectV2Field { ... on ProjectV2Field { id } }
+    mutation($projectId: ID!, $name: String!) {
+      createProjectV2Field(input: {
+        projectId: $projectId
+        name: $name
+        dataType: SINGLE_SELECT
+        singleSelectOptions: [${literals}]
+      }) {
+        projectV2Field { ... on ProjectV2SingleSelectField { id } }
       }
     }`;
-  const data = await graphql<any>(mutation, {
-    projectId,
-    name: spec.name,
-    dataType,
-  });
+  const data = await graphql<any>(mutation, { projectId, name: spec.name });
   return requiredString(
     data?.createProjectV2Field?.projectV2Field?.id,
     "created Project field id",
@@ -922,19 +768,6 @@ async function createBoardView(
   });
 }
 
-/** Resolve repository node id from owner/name. */
-export async function resolveRepositoryId(
-  repoOwner: string,
-  repoName: string,
-): Promise<string> {
-  const query = `
-    query($owner: String!, $name: String!) {
-      repository(owner: $owner, name: $name) { id }
-    }`;
-  const data = await graphql<any>(query, { owner: repoOwner, name: repoName });
-  return requiredString(data?.repository?.id, "repository id");
-}
-
 /** Resolve issue node id from owner/name/number. */
 export async function resolveIssueId(
   repoOwner: string,
@@ -951,192 +784,6 @@ export async function resolveIssueId(
     number,
   });
   return requiredString(data?.repository?.issue?.id, "Issue id");
-}
-
-/** PRs have their own GraphQL identity; issue(number:) does not resolve them. */
-export async function resolvePullRequestId(
-  repoOwner: string,
-  repoName: string,
-  number: number,
-): Promise<string> {
-  const data = await graphql<any>(
-    `
-    query($owner: String!, $name: String!, $number: Int!) {
-      repository(owner: $owner, name: $name) { pullRequest(number: $number) { id } }
-    }`,
-    { owner: repoOwner, name: repoName, number },
-  );
-  return requiredString(data?.repository?.pullRequest?.id, "PullRequest id");
-}
-
-export interface SubIssue {
-  id: string;
-  number: number;
-  closed: boolean;
-  title: string;
-  body: string;
-  url: string;
-  repoOwner: string;
-  repoName: string;
-}
-
-/** List all direct sub-issues so a creation journal can reconcile after a crash. */
-export async function listSubIssues(
-  repoOwner: string,
-  repoName: string,
-  number: number,
-): Promise<SubIssue[]> {
-  const issues: SubIssue[] = [];
-  const seen = new Set<string>();
-  let after: string | null = null;
-  while (true) {
-    const data = await graphql<any>(
-      `
-      query($owner: String!, $name: String!, $number: Int!, $after: String) {
-        repository(owner: $owner, name: $name) {
-          issue(number: $number) {
-            subIssues(first: 100, after: $after) {
-              pageInfo { hasNextPage endCursor }
-              nodes { id number closed title body url repository { owner { login } name } }
-            }
-          }
-        }
-      }`,
-      { owner: repoOwner, name: repoName, number, after },
-    );
-    const page = connectionPage(
-      data?.repository?.issue?.subIssues,
-      `sub-issues for #${number}`,
-      seen,
-    );
-    for (const issue of page.nodes) {
-      if (
-        !Number.isSafeInteger(issue.number) ||
-        issue.number <= 0 ||
-        typeof issue.closed !== "boolean" ||
-        typeof issue.body !== "string"
-      )
-        throw new Error(`GitHub returned an invalid sub-issue for #${number}.`);
-      issues.push({
-        id: requiredString(issue.id, "sub-issue id"),
-        number: issue.number,
-        closed: issue.closed,
-        title: requiredString(issue.title, "sub-issue title"),
-        body: issue.body,
-        url: requiredString(issue.url, "sub-issue URL"),
-        repoOwner: requiredString(
-          issue.repository?.owner?.login,
-          "sub-issue repository owner",
-        ),
-        repoName: requiredString(
-          issue.repository?.name,
-          "sub-issue repository name",
-        ),
-      });
-    }
-    if (!page.next) break;
-    after = page.next;
-  }
-  uniqueIds(issues, "sub-issue");
-  return issues;
-}
-
-/** Find an existing Project item for a content node without adding it twice. */
-export async function findProjectItemByContent(
-  projectId: string,
-  contentId: string,
-): Promise<string | undefined> {
-  requiredString(contentId, "content id");
-  const matches: string[] = [];
-  const seen = new Set<string>();
-  let after: string | null = null;
-  while (true) {
-    const data = await graphql<any>(
-      `
-      query($projectId: ID!, $after: String) {
-        node(id: $projectId) { ... on ProjectV2 {
-          items(first: 100, after: $after) {
-            pageInfo { hasNextPage endCursor }
-            nodes { id content { __typename ... on Issue { id } } }
-          }
-        } }
-      }`,
-      { projectId, after },
-    );
-    const page = connectionPage(data?.node?.items, "Project items", seen);
-    for (const item of page.nodes) {
-      requiredString(item.id, "Project item id");
-      const kind = requiredString(
-        item.content?.__typename,
-        "Project content type",
-      );
-      if (
-        kind === "Issue" &&
-        requiredString(item.content.id, "Issue id") === contentId
-      )
-        matches.push(item.id);
-    }
-    if (!page.next) break;
-    after = page.next;
-  }
-  if (matches.length > 1)
-    throw new Error(`Ambiguous Project items for ${contentId}.`);
-  return matches[0];
-}
-
-/** Create an issue; when parentId is given, it becomes a sub-issue of it. */
-export async function createIssue(opts: {
-  repoOwner: string;
-  repoName: string;
-  title: string;
-  body: string;
-  parentIssueId?: string;
-}): Promise<{ number: number; id: string; url: string }> {
-  const repoId = await resolveRepositoryId(opts.repoOwner, opts.repoName);
-  // GitHub rejects declared-but-unused variables: build the mutation without
-  // $parentId when there is no parent (no sub-issue).
-  const hasParent = !!opts.parentIssueId;
-  const mutation = hasParent
-    ? `mutation($repoId: ID!, $title: String!, $body: String!, $parentId: ID) {
-        createIssue(input: { repositoryId: $repoId, title: $title, body: $body, parentIssueId: $parentId }) {
-          issue { number id url }
-        }
-      }`
-    : `mutation($repoId: ID!, $title: String!, $body: String!) {
-        createIssue(input: { repositoryId: $repoId, title: $title, body: $body }) {
-          issue { number id url }
-        }
-      }`;
-  const data = await graphql<any>(mutation, {
-    repoId,
-    title: opts.title,
-    body: opts.body,
-    ...(hasParent ? { parentId: opts.parentIssueId } : {}),
-  });
-  const issue = data?.createIssue?.issue;
-  if (!issue || !Number.isSafeInteger(issue.number) || issue.number <= 0)
-    throw new Error("createIssue failed (invalid response).");
-  requiredString(issue.id, "created Issue id");
-  requiredString(issue.url, "created Issue URL");
-  return { number: issue.number, id: issue.id, url: issue.url };
-}
-
-/** Add an existing issue/PR to the project as an item. */
-export async function addIssueToProject(
-  projectId: string,
-  contentId: string,
-): Promise<string> {
-  const mutation = `
-    mutation($projectId: ID!, $contentId: ID!) {
-      addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
-        item { id }
-      }
-    }`;
-  const data = await graphql<any>(mutation, { projectId, contentId });
-  return requiredString(
-    data?.addProjectV2ItemById?.item?.id,
-    "added Project item id",
-  );
 }
 
 /** Post a comment on an issue. Returns the comment node id. */
@@ -1157,37 +804,13 @@ export async function createComment(
   );
 }
 
-/** Edit only a known issue comment; callers must verify actual author and data. */
-export async function updateIssueComment(
-  id: string,
-  body: string,
-): Promise<void> {
-  requiredString(id, "comment id");
-  requiredString(body, "comment body");
-  const data = await graphql<any>(
-    `mutation($id: ID!, $body: String!) {
-    updateIssueComment(input: { id: $id, body: $body }) { issueComment { id } }
-  }`,
-    { id, body },
-  );
-  if (data?.updateIssueComment?.issueComment?.id !== id)
-    throw new Error("GitHub returned mismatched updated comment id.");
-}
-
 /** Reopening is a handoff write, never approval or a builder launch. */
 export async function reopenIssue(issueId: string): Promise<void> {
   requiredString(issueId, "issue id");
-  const data = await graphql<any>(
-    `mutation($id: ID!) {
+  const data = await graphql<any>(`mutation($id: ID!) {
     reopenIssue(input: { issueId: $id }) { issue { id closed } }
-  }`,
-    { id: issueId },
-  );
-  if (
-    data?.reopenIssue?.issue?.id !== issueId ||
-    data.reopenIssue.issue.closed !== false
-  )
-    throw new Error("GitHub returned unconfirmed issue reopen.");
+  }`, { id: issueId });
+  if (data?.reopenIssue?.issue?.id !== issueId || data.reopenIssue.issue.closed !== false) throw new Error("GitHub returned unconfirmed issue reopen.");
 }
 
 export interface IssueComment {
@@ -1249,156 +872,4 @@ function validateComments(comments: IssueComment[]): IssueComment[] {
       throw new Error("GitHub returned an invalid comment.");
   }
   return comments.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Phase D — watchdog helpers (PR checks, PR listing)
-// ─────────────────────────────────────────────────────────────────────────────
-
-export interface AgentPr {
-  number: number;
-  title: string;
-  headRefName: string;
-  headRefOid: string;
-  url: string;
-  isCrossRepository: boolean;
-}
-
-/** List open PRs with a given label (created by the bot). */
-export async function listPrsWithLabel(
-  repoOwner: string,
-  repoName: string,
-  label: string,
-): Promise<AgentPr[]> {
-  const prs: AgentPr[] = [];
-  const seen = new Set<string>();
-  let after: string | null = null;
-  while (true) {
-    const data = await graphql<any>(
-      `
-      query($owner: String!, $name: String!, $label: String!, $after: String) {
-        repository(owner: $owner, name: $name) {
-          pullRequests(first: 100, after: $after, states: OPEN, labels: [$label]) {
-            pageInfo { hasNextPage endCursor }
-            nodes { number title headRefName headRefOid url isCrossRepository }
-          }
-        }
-      }`,
-      { owner: repoOwner, name: repoName, label, after },
-    );
-    const page = connectionPage(
-      data?.repository?.pullRequests,
-      "pull requests",
-      seen,
-    );
-    for (const pr of page.nodes) {
-      if (
-        !Number.isSafeInteger(pr.number) ||
-        pr.number <= 0 ||
-        !/^[a-f0-9]{40}$/i.test(pr.headRefOid) ||
-        typeof pr.isCrossRepository !== "boolean"
-      )
-        throw new Error("GitHub returned an invalid pull request.");
-      requiredString(pr.headRefName, "PR head branch");
-      requiredString(pr.url, "PR URL");
-      prs.push(pr);
-    }
-    if (!page.next) break;
-    after = page.next;
-  }
-  uniqueIds(
-    prs.map((pr) => ({ id: String(pr.number) })),
-    "PR",
-  );
-  return prs;
-}
-
-export interface CheckRunInfo {
-  name: string;
-  conclusion: string | null;
-  status: string;
-}
-
-/** Check-runs of a commit (REST). */
-export async function getCheckRuns(
-  repoOwner: string,
-  repoName: string,
-  headSha: string,
-): Promise<CheckRunInfo[]> {
-  const out = await runGh([
-    "api",
-    `repos/${repoOwner}/${repoName}/commits/${headSha}/check-runs?per_page=100&filter=latest`,
-    "--paginate",
-    "--slurp",
-  ]);
-  const pages = parseGhJson<any[]>(out, "api check-runs");
-  if (
-    !Array.isArray(pages) ||
-    !pages.length ||
-    pages.some((page) => !Array.isArray(page?.check_runs))
-  )
-    throw new Error("GitHub returned invalid check-run pages.");
-  const checks: CheckRunInfo[] = pages.flatMap((page) => page.check_runs);
-  if (
-    checks.some(
-      (check) =>
-        !check ||
-        typeof check.name !== "string" ||
-        typeof check.status !== "string" ||
-        (check.conclusion !== null && typeof check.conclusion !== "string"),
-    )
-  )
-    throw new Error("GitHub returned an invalid check-run.");
-  return checks;
-}
-
-/** Issue comments via REST (PRs are issues). gh follows every Link page. */
-export async function listPrComments(
-  repoOwner: string,
-  repoName: string,
-  number: number,
-): Promise<IssueComment[]> {
-  const out = await runGh([
-    "api",
-    `repos/${repoOwner}/${repoName}/issues/${number}/comments?per_page=100`,
-    "--paginate",
-    "--slurp",
-  ]);
-  const pages = parseGhJson<any[]>(out, "api PR comments");
-  if (
-    !Array.isArray(pages) ||
-    !pages.length ||
-    pages.some((page) => !Array.isArray(page))
-  )
-    throw new Error("GitHub returned invalid PR comment pages.");
-  const comments = pages.flat().map((comment): IssueComment => {
-    if (!comment || !Number.isSafeInteger(comment.id) || comment.id <= 0)
-      throw new Error("GitHub returned an invalid REST comment id.");
-    return {
-      id: String(comment.id),
-      body: comment.body,
-      createdAt: comment.created_at,
-      author: comment.user?.login,
-      authorAssociation: comment.author_association,
-    };
-  });
-  return validateComments(comments);
-}
-
-/** Add a label to a PR (best-effort). */
-export async function addPrLabel(
-  repoOwner: string,
-  repoName: string,
-  prNumber: number,
-  label: string,
-): Promise<void> {
-  await runGh([
-    "pr",
-    "edit",
-    String(prNumber),
-    "--repo",
-    `${repoOwner}/${repoName}`,
-    "--add-label",
-    label,
-  ]).catch(() => undefined);
 }

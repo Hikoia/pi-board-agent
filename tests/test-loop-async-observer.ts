@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { _DEFAULTS } from "../src/config.js";
 import type { Card } from "../src/gh.js";
 import { BoardLoop, createLoopState } from "../src/loop.js";
@@ -11,8 +12,8 @@ const cwd = process.env.TMP_DIR!;
 assert.ok(cwd, "Run via bash tests/run-offline.sh");
 execFileSync("git", ["init", "-b", "main", cwd], { stdio: "ignore" });
 const cfg = structuredClone(_DEFAULTS);
-cfg.safety.require_clean_worktree = cfg.context.enabled = cfg.review.enabled = cfg.watchdog.enabled = false;
-const card: Card = { itemId: "ITEM", number: 1, contentType: "Issue", type: "Task", title: "Task", body: "Acceptance", plan: "demo", status: cfg.columns.needs_design, closed: false, assignees: [], repoOwner: "owner", repoName: "repo" };
+cfg.safety.require_clean_worktree = cfg.context.enabled =  false;
+const card: Card = { itemId: "ITEM", number: 1, contentType: "Issue", type: "Task", title: "Task", body: "Acceptance", plan: "demo", status: cfg.columns.review, closed: false, assignees: [], repoOwner: "owner", repoName: "repo" };
 let enter!: () => void, finish!: () => void;
 const observing = new Promise<void>((done) => { enter = done; });
 const observer = new Promise<void>((done) => { finish = done; });
@@ -22,21 +23,23 @@ process.on("unhandledRejection", onUnhandled);
 const state = createLoopState();
 const owner = acquireOwnerLock(cwd, "bot");
 let mutations = 0, released = false;
+const worktrees = new TicketWorktrees(cwd);
+writeFileSync(worktrees.recordPath(card.itemId), JSON.stringify({
+  schemaVersion: 4, itemId: card.itemId, issueNumber: 1, taskKey: "issue-1", plan: "demo",
+  taskBranch: "task/issue-1", baseBranch: "main", path: join(cwd, ".pi", "worktrees", "item"), createdAt: 1,
+}));
 const loop = new BoardLoop({
   cwd, cfg, repoOwner: "owner", repoName: "repo", botLogin: "bot",
   meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
   callback: (message) => messages.push(message), listCards: async () => [structuredClone(card)],
   onTick: async () => { if (state.foreground) { enter(); await observer; } },
-  taskDesignOps: {
+  review: async () => { throw new Error("early model failure"); },
+  boardOps: {
     claim: async () => { card.assignees = ["bot"]; return true; },
     refresh: async () => structuredClone(card),
     release: async () => { released = true; },
-    listComments: async () => [
-      { id: "gate", author: "bot", body: "<!-- board-agent-requirements-gate:1 -->\nApprove", createdAt: "2025-01-01" },
-      { id: "decision", author: "owner", authorAssociation: "OWNER", body: "Approved", createdAt: "2025-01-02" },
-    ],
-    design: async () => { throw new Error("early model failure"); },
-    updateBody: async () => { mutations++; }, comment: async () => { mutations++; }, setReady: async () => { mutations++; },
+    listComments: async () => [],
+    comment: async () => { mutations++; return "comment"; }, setStatus: async () => { mutations++; },
   },
 }, state, {
   reconcile: async () => ({ active: [], resumed: 0, adopted: 0, needsHuman: 0, orphans: 0, errors: 0 }),

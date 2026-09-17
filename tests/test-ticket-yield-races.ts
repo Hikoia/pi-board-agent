@@ -31,7 +31,7 @@ git(repo, 'add', '.'); git(repo, 'commit', '-m', 'offline fixture'); git(repo, '
 let sequence = 0;
 function fixture() {
   const cfg = structuredClone(_DEFAULTS); cfg.max_workers = 1; cfg.tick_seconds = 0.02;
-  cfg.refine.enabled = cfg.review.enabled = cfg.context.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = false;
+  cfg.context.enabled = cfg.telegram.enabled = false;
   const number = ++sequence;
   const card: any = { itemId: `AUDIT_${number}`, number, type: 'Task', contentType: 'Issue', title: `T00${number} contract`, body: 'Approved scope', repoOwner: 'owner', repoName: 'repo', plan: 'demo', status: cfg.columns.ready, closed: false, assignees: [] };
   const writes: string[] = [], notices: string[] = [];
@@ -86,8 +86,9 @@ try {
       assert.deepEqual(f.store.read(f.task.itemId), evidence, 'failed prepare never deletes uncertain recovery evidence');
       if (evidence) assert.ok(existsSync(evidence.path));
       if (change === 'unchanged' || change === 'release-error') {
-        assert.equal(f.card.status, f.cfg.columns.needs_human);
-        assert.deepEqual(f.writes, ['comment', f.cfg.columns.needs_human, 'release']);
+        assert.equal(f.card.status, f.cfg.columns.ready, 'transport failure is technical, never a decision');
+        assert.deepEqual(f.writes, ['release']);
+        assert.ok(f.notices.some((message) => message.includes('Worktree preparation failed')));
         if (change === 'release-error') {
           assert.match(error?.message ?? '', /release unavailable/);
           assert.deepEqual(f.card.assignees, ['bot']);

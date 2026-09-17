@@ -610,6 +610,23 @@ try {
     cleaned(repo, path);
   });
 
+  for (const failure of ["setup", "model"]) {
+    await test(`${failure} failure retains the first pinned SHA across a later remote task push`, async (repo, input) => {
+      let pinned: string | undefined;
+      await assert.rejects(runReview({ ...input,
+        onPinnedTaskSha: async (sha) => { pinned = sha; },
+        ...(failure === "setup" ? { canStartWork: async () => { throw new Error("offline setup failure"); } } : {}),
+      }, async () => { throw new Error("offline model failure"); }), /offline .* failure/);
+      assert.ok(pinned);
+      const newer = git(repo, "commit-tree", `${pinned}^{tree}`, "-p", pinned, "-m", "later task push");
+      git(repo, "push", "origin", `${newer}:refs/heads/task/issue-42`);
+      const result = await runReview({ ...input, taskSha: pinned }, async (_source, { cwd }) => {
+        assert.equal(git(cwd, "rev-parse", "HEAD"), pinned);
+        return pass;
+      });
+      assert.equal(result.taskSha, pinned, "a technical retry cannot silently review a replacement commit");
+    });
+  }
   assert.ok(cases > 0, "test filter must select at least one case");
 } finally {
   for (const key of Object.keys(process.env))

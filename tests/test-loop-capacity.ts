@@ -31,18 +31,14 @@ const summary = () => ({
   orphans: 0,
   errors: 0,
 });
-type Lane = "design" | "refine" | "review";
+type Lane = "review";
 function harness(max: number, lanes: Lane[], builders = max + 1) {
   const cwd = mkdtempSync(join(root, "capacity-"));
   const cfg = structuredClone(_DEFAULTS);
   cfg.max_workers = max;
   cfg.safety.require_clean_worktree =
     cfg.context.enabled =
-    cfg.telegram.enabled =
-    cfg.watchdog.enabled =
-      false;
-  cfg.refine.enabled = lanes.some((lane) => lane !== "review");
-  cfg.review.enabled = lanes.includes("review");
+    cfg.telegram.enabled = false;
   const card = (number: number, patch: Partial<Card> = {}): Card => ({
     itemId: `ITEM_${number}`,
     contentType: "Issue",
@@ -59,18 +55,7 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
     ...patch,
   });
   const cards = Array.from({ length: builders }, (_, i) => card(i + 1));
-  for (const lane of lanes)
-    cards.push(
-      card({ design: 101, refine: 102, review: 103 }[lane], {
-        type: lane === "refine" ? "Story" : "Task",
-        status:
-          lane === "design"
-            ? cfg.columns.needs_design
-            : lane === "review"
-              ? cfg.columns.review
-              : cfg.columns.ready,
-      }),
-    );
+  for (const lane of lanes) cards.push(card(103, { status: cfg.columns.review }));
   const worktrees = new TicketWorktrees(cwd);
   if (lanes.includes("review")) {
     const dir = join(cwd, ".pi", "board-agent", "ticket-worktrees");
@@ -78,7 +63,7 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
     writeFileSync(
       join(dir, "item_103.json"),
       JSON.stringify({
-        schemaVersion: 3,
+        schemaVersion: 4,
         itemId: "ITEM_103",
         issueNumber: 103,
         taskKey: "T103",
@@ -92,21 +77,6 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
   }
   const current = (c: Card) =>
     cards.find((candidate) => candidate.itemId === c.itemId)!;
-  const comments: IssueComment[] = [
-    {
-      id: "gate",
-      author: "bot",
-      createdAt: "2025-01-01",
-      body: "<!-- board-agent-requirements-gate:101 -->\nApprove scope",
-    },
-    {
-      id: "decision",
-      author: "owner",
-      authorAssociation: "OWNER",
-      createdAt: "2025-01-02",
-      body: "Approved",
-    },
-  ];
   const events: string[] = [];
   const board: LoopBoardOps = {
     claim: async (c) => {
@@ -117,7 +87,7 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
     release: async (c) => {
       current(c).assignees = [];
     },
-    listComments: async (c) => (c.number === 101 ? comments : []),
+    listComments: async () => [],
     comment: async () => "comment",
     setStatus: async (c, status) => {
       current(c).status = status;
@@ -175,8 +145,6 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
       statusOptions: Object.fromEntries(
         Object.values(cfg.columns).map((name) => [name, name]),
       ),
-      planFieldId: "PLAN",
-      planFieldType: "TEXT",
       typeFieldId: "TYPE",
       typeFieldType: "SINGLE_SELECT",
       typeOptions: { Task: "TASK", Story: "STORY" },
@@ -185,15 +153,7 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
     listCards: async () => structuredClone(cards),
     boardOps: board,
     revisionCheck: () => ({ ok: revision }),
-    refine: () => model("refine"),
     review: () => model("review"),
-    taskDesignOps: {
-      ...board,
-      design: () => model("design"),
-      updateBody: async () => {},
-      comment: async () => {},
-      setReady: async () => {},
-    },
   };
   const loop = new BoardLoop(deps, state, executor, worktrees);
   return {
@@ -217,7 +177,7 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
 }
 
 for (const max of [1, 2, 4]) {
-  for (const lane of ["design", "refine", "review"] as const) {
+  for (const lane of ["review"] as const) {
     const h = harness(max, [lane]);
     let settled = false;
     const tick = h.loop.tickNow().then(() => {
@@ -250,12 +210,7 @@ for (const max of [1, 2, 4]) {
         h.state.foreground,
         {
           kind: lane,
-          label:
-            lane === "review"
-              ? "T103"
-              : lane === "design"
-                ? "Task #101"
-                : "Story #102",
+          label: "T103",
         },
         "one transient foreground model is visible while held",
       );
@@ -282,56 +237,10 @@ for (const max of [1, 2, 4]) {
   }
 }
 
-for (const lanes of [
-  ["design", "refine", "review"],
-  ["refine", "review"],
-] as Lane[][]) {
-  const h = harness(4, lanes);
-  const tick = h.loop.tickNow();
-  await Promise.race([h.entered.promise, tick]);
-  h.finish.resolve();
-  await tick;
-  await h.loop.stop();
-  assert.deepEqual(
-    h.events.filter((event) => ["design", "refine", "review"].includes(event)),
-    [lanes[0]],
-    "only one primary foreground model per tick, in Task-design -> Story -> Review priority",
-  );
-  console.log(
-    `PASS: ${lanes[0]} is the sole primary foreground ahead of lower-priority lanes`,
-  );
-}
-
-// Read-only design waiting falls through to the next primary lane, but a stale
-// foreground candidate returns its reservation to Ready builders.
-{
-  const h = harness(2, ["design", "refine", "review"]);
-  h.deps.taskDesignOps!.listComments = async () => [
-    {
-      id: "gate",
-      author: "bot",
-      createdAt: "2025-01-01",
-      body: "<!-- board-agent-requirements-gate:101 -->\nWaiting",
-    },
-  ];
-  const tick = h.loop.tickNow();
-  await Promise.race([h.entered.promise, tick]);
-  assert.equal(h.state.foreground?.kind, "refine");
-  h.finish.resolve();
-  await tick;
-  await h.loop.stop();
-  assert.deepEqual(
-    h.events.filter((event) => ["design", "refine", "review"].includes(event)),
-    ["refine"],
-  );
-  console.log(
-    "PASS: waiting Task design does not consume the primary model turn ahead of an actionable Story",
-  );
-}
-for (const lane of ["design", "refine", "review"] as const) {
+for (const lane of ["review"] as const) {
   for (const change of ["stale", "full", "revision", "stop"] as const) {
     const h = harness(2, [lane]);
-    const ops = lane === "design" ? h.deps.taskDesignOps! : h.board;
+    const ops = h.board;
     const refresh = ops.refresh;
     let stopping: Promise<void> | undefined;
     ops.refresh = async (card) => {
@@ -375,7 +284,7 @@ for (const lane of ["design", "refine", "review"] as const) {
 }
 
 {
-  const h = harness(2, ["design"]);
+  const h = harness(2, ["review"]);
   // Real branch evidence keeps this recovery-order check in the finalizer lane.
   execFileSync("git", ["init", "-b", "main", h.deps.cwd], { stdio: "ignore" });
   execFileSync(

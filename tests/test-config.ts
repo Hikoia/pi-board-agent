@@ -54,12 +54,12 @@ try {
   const cfg = loadConfig(cwd);
   check(
     cfg.max_workers === 2 &&
-      cfg.watchdog.respond_to_mentions === false &&
+      !Object.hasOwn(cfg, "watchdog") &&
       !("pr" in cfg) &&
       !("builder_tier" in cfg) &&
       !("plan_prefix" in cfg.branches) &&
-      !("interval_seconds" in cfg.watchdog),
-    "0.2.0 defaults omit removed surfaces and disable mention replies",
+      !Object.hasOwn(cfg.models, "refine"),
+    "0.2.0 defaults omit removed surfaces and disable all retired lanes",
   );
 
   const template = readConfigTemplate();
@@ -72,7 +72,7 @@ try {
   rmSync(file);
   check(
     !/\bpr:|builder_tier|plan_prefix|interval_seconds/.test(template) &&
-      parsedTemplate.watchdog.respond_to_mentions === false,
+      !Object.hasOwn(parsedTemplate, "watchdog"),
     "the actual packaged YAML validates as 0.2.0 config",
   );
 
@@ -158,11 +158,7 @@ try {
     ["tick_seconds", 1, Math.floor(2_147_483_647 / 1000)],
     ["builder_timeout_ms", 1, 2_147_483_647],
     ["builder_retries", 0, 10],
-    ["refine.timeout_ms", 1, 2_147_483_647],
-    ["refine.max_tasks", 1, 12],
     ["review.timeout_ms", 1, 2_147_483_647],
-    ["watchdog.fix_rounds_max", 0, 10],
-    ["watchdog.fix_cooldown_minutes", 0, Math.floor(2_147_483_647 / 60_000)],
     ["context.max_chars", 1, 2_147_483_647],
   ];
   const set = (cfg: Config, path: string, value: unknown) => {

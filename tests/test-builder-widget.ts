@@ -70,7 +70,7 @@ const runId = manager.start(
   { maxAgents: 1, concurrency: 1, agentRetries: 0 },
 );
 const record: TicketExecutionRecord = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   itemId: "ITEM_1",
   issueNumber: 1,
   taskKey: "T001",
@@ -212,6 +212,9 @@ try {
   );
   assert.ok(widget?.includes("  T001 [paused]"));
   agentEntered = deferred();
+  // Explicit offline manual authority: this fixture tests display, while the
+  // first board list is held. Resume admission has separate lifecycle coverage.
+  manager.setResumeGuard!(async () => () => true);
   assert.equal(await manager.resume(runId), true);
   await agentEntered.promise;
   await pulse();

@@ -1,227 +1,44 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
-import { fixture, git } from "./conflict-handoff-fixture.js";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { fixture, git, calls, dispose } from "./finalization-fixture.js";
+import { acquireOwnerLock } from "../src/owner-lock.js";
 
-{
-  const f = await fixture(false);
-  f.store.update(f.card.itemId, (r) => ({
-    ...r,
-    finalization: {
-      targetBranch: "main",
-      baseSha: "0".repeat(40),
-      taskSha: f.taskSha,
-    },
-  }));
-  const file = join(
-      f.repo,
-      ".pi/board-agent/ticket-worktrees",
-      `${f.card.itemId.toLowerCase()}.json`,
-    ),
-    bytes = readFileSync(file);
-  try {
-    await f.loop.tickNow();
-    assert.equal(
-      existsSync(file),
-      true,
-      "unknown legacy base cannot authorize even a clean new integration/cleanup",
-    );
-    assert.deepEqual(readFileSync(file), bytes);
-    assert.equal(f.calls(), 0);
-    assert.equal(f.comments.length, 0);
-    assert.equal(git(f.origin, "rev-parse", "refs/heads/main"), f.baseSha);
-    console.log(
-      "PASS: unknown no-result base remains blocking even when current branches would merge cleanly",
-    );
-  } finally {
-    await f.loop.stop();
-  }
-}
-
-{
-  const f = await fixture();
-  f.store.update(f.card.itemId, (r) => ({
-    ...r,
-    reviewedTaskSha: f.taskSha,
-    finalization: {
-      targetBranch: "main",
-      baseSha: f.baseSha,
-      taskSha: f.taskSha,
-    },
-  }));
-  const file = join(
-      f.repo,
-      ".pi/board-agent/ticket-worktrees",
-      `${f.card.itemId.toLowerCase()}.json`,
-    ),
-    original = readFileSync(file);
-  assert.throws(
-    () =>
-      f.store.update(f.card.itemId, (r) => ({ ...r, finalization: undefined })),
-    /pending finalization/,
-  );
-  try {
-    await f.loop.tickNow();
-    assert.equal(f.card.status, f.cfg.columns.ready, f.notices.join("\n"));
-    assert.equal(f.card.closed, false);
-    assert.equal(f.store.read(f.card.itemId)?.finalization, undefined);
-    const backups = join(f.repo, ".pi/board-agent/repair-intent-backups");
-    assert.equal(readdirSync(backups).length, 1);
-    assert.deepEqual(
-      readFileSync(join(backups, readdirSync(backups)[0])),
-      original,
-      "archive original bytes durably BEFORE dedicated checked clear",
-    );
-    assert.equal(git(f.origin, "rev-parse", "refs/heads/main"), f.baseSha);
-    assert.equal(f.calls(), 0);
-    console.log(
-      "PASS: proven old pre-result conflict intent is archived exactly, dedicated-cleared then requested; ordinary update protection remains",
-    );
-  } finally {
-    await f.loop.stop();
-  }
-}
-
-for (const mode of [
-  "never-pushed-result",
-  "pushed-then-rewritten",
-  "unknown-result",
-  "review-mismatch",
-  "old-task-mismatch",
-  "rewritten-base",
-] as const) {
-  const f = await fixture(
-    mode === "review-mismatch" || mode === "old-task-mismatch",
-  );
-  let resultSha: string | undefined;
-  let oldBase = f.baseSha;
-  if (["never-pushed-result", "pushed-then-rewritten"].includes(mode)) {
-    resultSha = git(
-      f.repo,
-      "commit-tree",
-      `${f.taskSha}^{tree}`,
-      "-p",
-      f.originalBase,
-      "-m",
-      "old result",
-    );
-    oldBase = f.originalBase;
-    if (mode === "pushed-then-rewritten") {
-      git(f.repo, "push", "origin", `${resultSha}:refs/heads/main`);
-      // Disposable origin only: simulate history rewrite, NOT proof of never pushed.
-      git(f.origin, "update-ref", "refs/heads/main", f.baseSha);
-    }
-  }
-  if (mode === "unknown-result") resultSha = "0".repeat(40);
-  if (mode === "rewritten-base")
-    oldBase = git(
-      f.repo,
-      "commit-tree",
-      `${f.baseSha}^{tree}`,
-      "-m",
-      "unrelated historical base",
-    );
-  f.store.update(f.card.itemId, (r) => ({
-    ...r,
-    ...(mode === "review-mismatch" ? { reviewedTaskSha: f.baseSha } : {}),
-    finalization: {
-      targetBranch: "main",
-      baseSha: oldBase,
-      taskSha: mode === "old-task-mismatch" ? f.baseSha : f.taskSha,
-      ...(resultSha ? { resultSha } : {}),
-    },
-  }));
-  const file = join(
-      f.repo,
-      ".pi/board-agent/ticket-worktrees",
-      `${f.card.itemId.toLowerCase()}.json`,
-    ),
-    bytes = readFileSync(file);
-  try {
-    await f.loop.tickNow();
-    await f.loop.stop();
-    const next = f.make();
+try {
+  for (const kind of ["unknown-base", "rewritten-base", "unknown-result", "wrong-result", "review-mismatch", "old-task-mismatch"] as const) {
+    const f = await fixture(true);
+    const baseSha = kind === "unknown-base" ? "0".repeat(40) : kind === "rewritten-base" ? git(f.repo, "commit-tree", `${f.base}^{tree}`, "-m", "unrelated") : f.base;
+    f.store.update(f.task.itemId, (r) => ({ ...r, reviewedTaskSha: kind === "review-mismatch" ? f.base : f.taskSha,
+      finalization: { targetBranch: "main", baseSha, taskSha: kind === "old-task-mismatch" ? f.base : f.taskSha,
+        ...(kind === "unknown-result" ? { resultSha: "0".repeat(40) } : kind === "wrong-result" ? { resultSha: f.base } : {}) } }));
+    const bytes = readFileSync(f.recordFile), owner = acquireOwnerLock(f.repo, "bot");
     try {
-      await next.loop.tickNow();
-      assert.deepEqual(
-        readFileSync(file),
-        bytes,
-        `${mode}: never clear uncertain intent`,
-      );
-      assert.equal(f.card.closed, true);
-      assert.equal(f.card.status, f.cfg.columns.done);
-      assert.equal(f.comments.length, 0);
-      assert.equal(f.calls(), 0);
-      assert.equal(git(f.origin, "rev-parse", "refs/heads/main"), f.baseSha);
-      assert.equal(existsSync(f.record.path), true);
-      console.log(
-        `PASS: legacy ${mode} stays intact and blocking across restart, never interpreted as pre-push`,
-      );
-    } finally {
-      await next.loop.stop();
-    }
-  } finally {
-    await f.loop.stop();
+      calls.length = 0;
+      const report = await f.executor.migrateLegacy(owner);
+      assert.equal(report.failures.length, 1, kind);
+      assert.deepEqual(readFileSync(f.recordFile), bytes);
+      assert.notEqual((await f.executor.finalizeClosed(f.card)).status, "finalized");
+      assert.equal(f.tip(), f.base); assert.equal(f.comments.length, 0); assert.ok(existsSync(f.record.path));
+      assert.equal(calls.some((a) => ["push", "commit-tree", "update-ref"].includes(a[0])), false);
+      console.log(`PASS: legacy ${kind} stays byte-identical and blocked without inventing integration or cleanup authority`);
+    } finally { owner.release(); }
   }
-}
-
-for (const strategy of ["merge", "squash"] as const) {
-  const f = await fixture(false);
-  const result = git(
-    f.repo,
-    "commit-tree",
-    `${f.taskSha}^{tree}`,
-    "-p",
-    f.originalBase,
-    ...(strategy === "merge" ? ["-p", f.taskSha] : []),
-    "-m",
-    "old confirmed integration",
-  );
-  git(f.repo, "push", "origin", `${result}:refs/heads/main`);
-  const later = git(
-    f.repo,
-    "commit-tree",
-    `${f.originalBase}^{tree}`,
-    "-p",
-    result,
-    "-m",
-    "later base edits",
-  );
-  git(f.repo, "push", "origin", `${later}:refs/heads/main`);
-  f.store.update(f.card.itemId, (r) => ({
-    ...r,
-    finalization: {
-      targetBranch: "main",
-      baseSha: f.originalBase,
-      taskSha: f.taskSha,
-      resultSha: result,
-    },
-  }));
-  try {
-    await f.loop.tickNow();
-    await f.loop.tickNow();
-    assert.equal(f.calls(), 0);
-    assert.equal(f.comments.length, 0);
-    assert.deepEqual(f.events, [`status:${f.cfg.columns.backlog}`]);
-    assert.equal(f.card.closed, true);
-    assert.equal(f.card.status, f.cfg.columns.backlog);
-    assert.equal(existsSync(f.record.path), false);
-    assert.equal(f.store.read(f.card.itemId), undefined);
-    assert.equal(f.store.hasCleanupReceipt(f.card.itemId), false);
-    assert.equal(
-      git(f.origin, "rev-parse", "refs/heads/main"),
-      later,
-      "cleanup never creates another integration",
-    );
-    assert.equal(
-      readdirSync(join(f.repo, ".pi/board-agent/cleanup-backups")).length,
-      1,
-      "T12 durable backup retained",
-    );
-    console.log(
-      `PASS: confirmed legacy ${strategy} result ancestor takes T12 backup/cleanup ONLY despite later base edits, never a repair builder`,
-    );
-  } finally {
-    await f.loop.stop();
+  {
+    const f = await fixture(true);
+    writeFileSync(join(f.record.path, "base.txt"), "task side"); git(f.record.path, "add", "."); git(f.record.path, "commit", "-m", "task"); git(f.record.path, "push", "origin", f.task.taskBranch);
+    const taskSha = git(f.record.path, "rev-parse", "HEAD"); f.store.setReviewedTaskSha(f.task.itemId, taskSha);
+    writeFileSync(join(f.repo, "base.txt"), "base side"); git(f.repo, "add", "base.txt"); git(f.repo, "commit", "-m", "base"); git(f.repo, "push", "origin", "main");
+    const baseSha = f.tip();
+    f.store.update(f.task.itemId, (r) => ({ ...r, finalization: { targetBranch: "main", baseSha, taskSha } }));
+    const bytes = readFileSync(f.recordFile), owner = acquireOwnerLock(f.repo, "bot");
+    try {
+      assert.deepEqual((await f.executor.migrateLegacy(owner)).failures, []);
+      assert.deepEqual(readFileSync(join(f.repo, ".pi/board-agent/legacy-v3", basename(f.recordFile))), bytes);
+      await f.executor.finalizeClosed(f.card);
+      assert.equal(f.card.closed, false); assert.equal(f.card.status, f.cfg.columns.ready);
+      assert.equal(f.recordNow().retry?.stage, "build"); assert.equal(f.recordNow().integration, undefined);
+      assert.equal(f.starts(), 0); assert.equal(f.tip(), baseSha);
+      console.log("PASS: valid pre-result v3 intent archives raw bytes before v4 conversion, then a real conflict reopens for original-branch build and renewed approval");
+    } finally { owner.release(); }
   }
-}
+} finally { dispose(); }

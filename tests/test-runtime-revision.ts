@@ -288,9 +288,7 @@ try {
   const cfg: Config = {
     ...structuredClone(_DEFAULTS),
     project: { owner: "test", number: 1 },
-    refine: { ..._DEFAULTS.refine, enabled: false },
-    watchdog: { ..._DEFAULTS.watchdog, enabled: false },
-    review: { ..._DEFAULTS.review, enabled: false },
+    review: { ..._DEFAULTS.review },
     safety: { ..._DEFAULTS.safety, require_clean_worktree: false },
   };
   const ready: Card = {
@@ -512,7 +510,9 @@ try {
   console.log("owned");
   process.stdin.once("data", () => { lock.release(); process.exit(0); });
 } catch (error) {
-  if (!/already running locally|recovery is busy or interrupted/.test(error.message)) { console.error(error); process.exit(2); }
+  // Another contender can observe exclusive-create before its JSON write.
+  // Corrupt/partial bytes must reject takeover too, not crash this test oracle.
+  if (!/already running locally|recovery is busy or interrupted|owner lock is corrupt/.test(error.message)) { console.error(error); process.exit(2); }
   console.log("rejected");
 }
 `,
@@ -562,6 +562,10 @@ try {
     1,
     verdicts.join(", "),
   );
+  const winner = contenders[verdicts.indexOf("owned")].child;
+  assert.equal(JSON.parse(readFileSync(lock.path, "utf8")).pid, winner.pid,
+    "all losing contenders preserve the winner's live lock, including transient partial-write denial");
+  assert.equal(ownerLockHeldByOther(projectRoot), true);
   await Promise.all(
     contenders.map((contender, index) => {
       if (verdicts[index] !== "owned") {

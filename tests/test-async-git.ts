@@ -51,7 +51,7 @@ const observations: Array<{
 }> = [];
 let pending = 0;
 let fault:
-  | { source: string; command: string; kind: "timeout" | "exit" }
+  | { source: string; command: string; kind: "timeout" | "exit"; afterPush?: boolean }
   | undefined;
 const globals = globalThis as any;
 const worktreeUrl = new URL("../src/ticket-worktree.ts", import.meta.url).href;
@@ -90,7 +90,8 @@ function observed(
   );
   if (
     fault?.source === source &&
-    fault.command === args.slice(0, fault.command.split(" ").length).join(" ")
+    fault.command === args.slice(0, fault.command.split(" ").length).join(" ") &&
+    (!fault.afterPush || git(origin, "rev-parse", "refs/heads/main") !== git(repo, "rev-parse", "HEAD"))
   ) {
     const kind = fault.kind;
     fault = undefined; // Fail only this command; normal cleanup still uses real Git.
@@ -205,7 +206,8 @@ try {
   );
 
   let from = observations.length;
-  assert.equal(await store.hasTaskDelta(record), false);
+  await store.fetchRequired(record.baseBranch);
+  assert.equal(store.fetchedSha(record.baseBranch), git(record.path, "rev-parse", "HEAD"));
   await responsive(from);
   writeFileSync(join(record.path, "feature.txt"), "feature\n");
   git(record.path, "add", ".");
@@ -213,16 +215,17 @@ try {
   git(record.path, "push", "origin", task.taskBranch);
   const taskSha = git(record.path, "rev-parse", "HEAD");
   from = observations.length;
-  assert.equal(await store.hasTaskDelta(record), true);
+  await store.fetchRequired(record.baseBranch);
+  assert.notEqual(store.fetchedSha(record.baseBranch), taskSha);
   await responsive(from);
   console.log(
-    "PASS: hasTaskDelta awaits fresh fetch and distinguishes an unchanged branch from local work",
+    "PASS: fetchRequired yields and observes fresh base independently of local task work",
   );
 
   fault = { source: "worktree", command: "fetch", kind: "exit" };
   await assert.rejects(
-    store.hasTaskDelta(record),
-    /git fetch failed: controlled runner failure/,
+    store.fetchRequired(record.baseBranch),
+    /controlled runner failure/,
     "failed observation must preserve retryable launch evidence, not settle as either delta result",
   );
   fault = { source: "worktree", command: "fetch", kind: "timeout" };
@@ -324,6 +327,7 @@ try {
     "PASS: rejected async review setup/cleanup stays observable, aggregates errors, and still cleans after model abort",
   );
 
+  store.setReviewedTaskSha(task.itemId, taskSha);
   const baseSha = git(repo, "rev-parse", "origin/main");
   fault = { source: "worktree", command: "push", kind: "exit" };
   await assert.rejects(
@@ -341,7 +345,7 @@ try {
     "PASS: rejected async push preserves branch, worktree and retry evidence before cleanup",
   );
 
-  fault = { source: "worktree", command: "ls-remote", kind: "exit" };
+  fault = { source: "worktree", command: "ls-remote", kind: "exit", afterPush: true };
   await assert.rejects(
     store.finalizeAccepted(task, "merge"),
     /git ls-remote .*failed: controlled runner failure/,
@@ -368,6 +372,8 @@ try {
   );
   assert.equal(store.localBranchSha(task.taskBranch), undefined);
   assert.equal(existsSync(record.path), false);
+  assert.equal(store.has(task.itemId), true, "integration receipt remains until Project Done is confirmed");
+  await store.completeFinalization(task, resultSha!, async () => {});
   assert.equal(store.has(task.itemId), false);
   await responsive(from);
   console.log(

@@ -8,82 +8,61 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
-- `max_workers` is a total model budget, including conservative builder
-  reservations and the single foreground design/refine/review/watchdog slot.
-  Builders pre-fill before one primary model, back-fill before watchdog work.
-- Runtime network Git and package-revision checks are asynchronous; UI snapshots
-  are observational only. Closed-Done history uses a negative-only per-tick
-  local-ref filter; actual finalization still revalidates approval and refs.
-- New builder missions render navigation context from their prepared worktree;
-  durable resumes keep their persisted mission. The packaged builder agent path
-  is retained as a non-production pointer to the skill and actual mission.
-- Startup/lint/recovery promotion validate enabled-lane Project metadata. Story
-  Plan supports text or existing single-select options; no automatic schema
-  changes. Restart the loop after manual metadata/config edits.
-- Verified merge conflicts can automatically move the Task to Ready and reopen
-  its Issue after fresh original-record/Plan, SHA, ownership and revision checks.
-  An actual-author-verified comment (`requested` → `queued` → `consumed`) and
-  retained `.pi/board-agent/repair/` ledger bind one repair run of the existing
-  builder in the original task branch/worktree. Restarts reuse that run; failed
-  or ambiguous writes stop rather than blind replay, and human lane/owner changes
-  are protected. The Issue body is unchanged.
-- Repair preserves original work and requirements, merges the specified base,
-  runs existing integration tests on the committed result, and pushes the task
-  normally. Host checks both ancestries, clean state with no unmerged entries,
-  exact pushed SHA and actual persisted passing test execution. Success returns
-  to Review; `review.enabled` is unchanged and humans must validate and **close
-  the Issue again**. Repair/evidence failure or repair Review findings go to Needs Human
-  when still authorized, not automatic Ready. Consumed requests are not reused
-  automatically; a deliberate maintainer reopen/Ready uses ordinary retry flow.
-  Ordinary Review is not proof of latest-main integrated tests; normal merges
-  have no blanket integration test gate.
+- Task-only model execution: optional Plan and isolated exact-SHA AI review.
+  Human-closed Done Issues of any Type finalize without review-marker prerequisites
+  and move to Backlog. Local-only, remote-only and divergent task refs are supported;
+  no-ref history preserves idle records and leftovers.
+- One v4 ticket record retains build/review/integrate/cleanup retry stages and
+  pre-push integration progress. Dirty partial work and interrupted MERGE_HEAD
+  continue on the original task branch/worktree. I/O failures retry I/O, not models.
+- Only complete product/requirement/cost/authorization decisions enter Needs Human.
+  Trusted maintainer reply **and manual Ready** are required; no comment listener.
+- Real conflicts reopen Ready for original-branch resolution, tests, review and
+  renewed human close. Nonconflicting base-advance push rejection stays
+  integration-only; ambiguous push responses require fresh remote observation.
+- Ordered cleanup verifies integration, expected remote deletion, normal worktree
+  removal, expected local deletion, Project Backlog and record deletion last.
+  Ignored task-worktree files are cleaned before ref/registration removal; nested
+  repositories and external junction targets remain protected.
+- Exclusive stopped/drained owner upgrade converts supported v3 Tasks without
+  finishing all tasks first. Exact raw backup precedes atomic v4 publication;
+  active/paused/uncertain original runs and existing old merge/squash results
+  continue conservatively. Old ledgers and v1/v2 cleanup receipts, including
+  recordless receipts, remain read-only without GC.
+- Finite removed lane config warns without rewriting files or Project schema.
+  Legacy squash normalizes to merge and review cannot be disabled. Unknown keys,
+  invalid input and unsupported v1/v2/corrupt data still fail closed.
+- Package/config consistency checks are startup/lint/deployment-only. Heartbeat,
+  UI, stop and ordinary admission reuse the checked identity/latch without package
+  HEAD/status/settings scans. Hot update is unsupported; restart after upgrade.
 
 ### Fixed
 
-- Failed fresh reads no longer authorize mutation from stale board snapshots;
-  failed assignee releases preserve unsettled execution evidence for retry.
-- Story refinement rejects over-limit/invalid plans without dropping tasks or
-  automatic schema repair, and requires base-independent implementation and
-  verification. Truncated legacy journals block only the affected Story while
-  preserving the original bytes and healthy updates in a same-format companion.
-- Refine/design use private definitions plus the effective SDK
-  `structured_output`-only allowlist, excluding coding/shared-store tools.
-- Reentrant stop/shutdown drains foreground cleanup and managed leases before
-  owner release; failed cleanup retains the loop/managers for retry. Model
-  cancellation does not interrupt destructive Git or discard recovery work.
-- Finalization publishes a late destructive cleanup receipt in
-  `.pi/board-agent/cleanup/` only after confirmed remote integration and ready
-  cleanup preconditions, not an early merge intent. Exact path/content/link/Git
-  identity checks include ignored files. Normal registered Git removal or checked
-  item-by-item leftovers must finish before local-ref, record and receipt deletion.
-  Pending receipts retry even without a local ref; changed/unknown/locked paths
-  block, with no forced cleanup or success while managed directories remain.
-- Proven legacy integrated residuals require verified full content/layout backups
-  in `.pi/board-agent/cleanup-backups/`. Confirmed old results are cleanup-only;
-  missing results require narrow old persistence-order proof, exact-byte archive
-  in `.pi/board-agent/repair-intent-backups/` and dedicated checked intent clear
-  before conflict repair. Present unknown/unconfirmed results, rewritten base or
-  other uncertainty block/preserve; ordinary pending-intent guards remain intact.
-- Repeated per-ticket finalization/repair blockers warn once per loop lifetime
-  while checks and safe retries still run every tick. Changed reasons/SHAs,
-  recovery, different tickets and restart can warn again; dedup does not authorize
-  replaying unconfirmed writes.
+- Stop during asynchronous worktree preparation no longer creates a manager or
+  posts a false builder-failure comment. Reentrant stop, foreground/lease drain,
+  owner retention after failure and startup-stop generation barriers remain.
+- Conflict writeback rechecks duplicate branch/path ownership after board awaits.
+  Production conflict recovery can claim an approved closed Issue for reopening
+  without permitting closed builder admission.
+- Legacy pre-result conversion rejects unknown/rewritten base history, changed
+  task identity and unsafe original worktrees instead of guessing authority.
+- Retained lifecycle, dirty/path/lock/ownership/recovery/retry/ref-safety tests are
+  ported to v4; only the retired repair-evidence protocol tests are removed.
 
-Backups, intent archives and consumed repair ledgers are not automatically
-garbage-collected. Do not blindly downgrade while a cleanup receipt or repair is
-pending; keep stopped backups including external workflow journals. There is no
-new manual recovery command.
+### Removed
 
-### Deprecated
+- Story refinement/child publication, designer/Needs Design model and PR watchdog.
+- New-path repair requested/queued/consumed ledgers, test-telemetry gates and
+  full-tree cleanup snapshot/backup protocols. Existing legacy evidence remains
+  readable only through the legacy adapter; unknown leftovers are not deleted.
 
-- Explicit `safety.skip_closed_issues` in either config scope now warns for both
-  boolean values. Remove it; closed Issues never start builders/design. Its
-  boolean shape remains compatible, with unchanged strict validation. Templates
-  omit it and absent/default-only values do not warn.
+Worker limits, configured builder/review models, timeouts, context, notifications,
+WorkflowManager and provider backoff are retained. No force task cleanup, broad
+prune/unlock, recursive-delete fallback or force base push is introduced.
 
-Current behavior/recovery constraints are in [architecture](docs/architecture.md)
-and the [runbook](docs/runbook.md). Historical release notes below and audit
-bodies retain their original baseline claims; they are not current specifications.
+Current behavior is in [architecture](docs/architecture.md) and the
+[runbook](docs/runbook.md). Historical notes and audit reports below retain their
+original baseline claims and are not current specifications.
 
 ## [0.2.0] - 2026-09-10
 

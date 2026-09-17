@@ -1,10 +1,9 @@
-// T14: public executor + installed durable WorkflowManager + real disposable Git.
+// T14 safety port: ordinary v4 build retry, same-run dirty recovery and real disposable Git.
+// Retired request/test-history proof assertions are mapped in docs/test-v4-mapping.md.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { createRunPersistence, compactAgentHistory, type WorkflowManagerOptions, type WorkflowRunOptions } from "@quintinshaw/pi-dynamic-workflows";
-import { createBashTool } from "@earendil-works/pi-coding-agent";
-import { repairReviewInput } from "../src/repair.js";
+import { createRunPersistence, type WorkflowManagerOptions, type WorkflowRunOptions } from "@quintinshaw/pi-dynamic-workflows";
 import { BoardLoop, createLoopState } from "../src/loop.js";
 import { runReview } from "../src/review.js";
 import { join } from "node:path";
@@ -39,7 +38,7 @@ console.log('PASS: both original task and base behavior at ' + sha);
   git(repo, "remote", "add", "origin", origin); git(repo, "push", "origin", "main");
   const cfg = structuredClone(_DEFAULTS);
   cfg.max_workers = 1; cfg.builder_retries = 0;
-  cfg.context.enabled = cfg.review.enabled = cfg.refine.enabled = cfg.watchdog.enabled = cfg.telegram.enabled = cfg.safety.require_clean_worktree = false;
+  cfg.context.enabled = cfg.telegram.enabled = cfg.safety.require_clean_worktree = false;
   const card: Card = { itemId: `REPAIR_${sequence}`, number: sequence, contentType: "Issue", type: "Task", title: "T014 preserve original work", body: "Original acceptance: retain task behavior and all prior edits.", plan: "demo", status: cfg.columns.ready, closed: false, assignees: [], repoOwner: "owner", repoName: "repo" };
   const task = buildTasksForWave(cfg, "demo", [card])[0];
   const store = new TicketWorktrees(repo), record = await store.ensure(task, "demo");
@@ -51,7 +50,8 @@ console.log('PASS: both original task and base behavior at ' + sha);
   writeFileSync(join(repo, "base-only.txt"), "base edit\n");
   git(repo, "add", "."); git(repo, "commit", "-m", "base changed"); git(repo, "push", "origin", "main");
   const baseSha = git(repo, "rev-parse", "HEAD");
-  const repair = { requestKey: `repair-${sequence}`, baseSha, taskSha };
+  const repair = { baseSha, taskSha };
+  store.update(card.itemId, (r) => ({ ...r, retry: { stage: "build", reason: `Merge base ${baseSha} into original task ${taskSha}; preserve both requirements, run existing tests.` } }));
   const comments: string[] = [];
   const board: TicketBoardAdapter = {
     getCard: async () => structuredClone(card),
@@ -70,17 +70,6 @@ console.log('PASS: both original task and base behavior at ' + sha);
   return { repo, origin, cfg, card, task, store, record, repair, comments, board, executor, makeExecutor, setBuilder: (value: Builder) => { builder = value; }, calls: () => calls };
 }
 
-const f = await fixture();
-try {
-  const result = await f.executor.launch(f.card, "demo", undefined, undefined, { ...f.repair, taskSha: f.repair.baseSha });
-  assert.equal(result.status, "needs-human", "repair must reject a different initial task SHA before invoking any model");
-  assert.equal(f.calls(), 0);
-  assert.equal(f.card.status, f.cfg.columns.needs_human);
-  assert.equal(git(f.record.path, "rev-parse", "HEAD"), f.repair.taskSha);
-  assert.equal(git(f.origin, "rev-parse", "refs/heads/main"), f.repair.baseSha);
-  console.log("PASS: bad initial repair task SHA fails closed before builder invocation");
-} finally { await f.executor.shutdown(); }
-
 async function settled(f: Awaited<ReturnType<typeof fixture>>, runId: string) {
   const persistence = createRunPersistence(f.record.path);
   for (let i = 0; i < 300; i++) {
@@ -89,35 +78,6 @@ async function settled(f: Awaited<ReturnType<typeof fixture>>, runId: string) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error("Builder did not settle (not a passing test)");
-}
-// Independent literal wrapper from the builder protocol, NOT the implementation helper.
-function testCommand(sha: string, command = "node test.cjs") {
-  return `set -euo pipefail
-export GIT_NO_REPLACE_OBJECTS=1
-head=$(git rev-parse HEAD)
-status=$(git status --porcelain=v1 --untracked-files=all)
-test "$head" = '${sha}'
-test -z "$status"
-printf '%s\\n' 'BOARD_AGENT_REPAIR_TEST_BEGIN ${sha}'
-(
-${command}
-)
-head=$(git rev-parse HEAD)
-status=$(git status --porcelain=v1 --untracked-files=all)
-test "$head" = '${sha}'
-test -z "$status"
-printf '%s\\n' 'BOARD_AGENT_REPAIR_TEST_PASS ${sha}'`;
-}
-async function testAtResult(f: Awaited<ReturnType<typeof fixture>>, options: Parameters<NonNullable<WorkflowRunOptions["agent"]>["run"]>[1], sha: string, command = "node test.cjs") {
-  const wrapper = testCommand(sha, command);
-  let content: unknown, isError = false;
-  try { content = (await createBashTool(f.record.path).execute("repair-test", { command: wrapper }, options?.signal)).content; }
-  catch (error) { isError = true; content = [{ type: "text", text: String(error) }]; }
-  options?.onHistory?.(compactAgentHistory([
-    { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: { command: wrapper } }] },
-    { role: "toolResult", toolName: "bash", isError, content },
-  ]));
-  return { resultSha: sha, command };
 }
 function integrate(f: Awaited<ReturnType<typeof fixture>>) {
   assert.throws(() => git(f.record.path, "merge", "--no-edit", f.repair.baseSha), /Command failed/);
@@ -133,49 +93,46 @@ function integrate(f: Awaited<ReturnType<typeof fixture>>) {
     return { taskKey: f.task.taskKey, itemId: f.task.itemId, branch: f.task.taskBranch, status: "success" };
   });
   try {
-    const launched = await f.executor.launch(f.card, "demo", undefined, undefined, f.repair);
+    const launched = await f.executor.launch(f.card, "demo", undefined, undefined);
     assert.equal(launched.status, "launched");
     if (launched.status !== "launched") throw new Error("not launched");
     const run = await settled(f, launched.runId);
     assert.equal(run.status, "completed");
     await f.executor.reconcile([f.card]);
-    assert.equal(f.card.status, f.cfg.columns.needs_human, "success is not passing integrated test evidence");
-    console.log("PASS: a pushed clean integration without test evidence goes to Needs Human despite builder success");
+    assert.equal(f.card.status, f.cfg.columns.review, "normal review, not a telemetry gate");
+    console.log("PASS: a pushed clean integration without tool-history telemetry reaches mandatory Review, never Needs Human");
   } finally { await f.executor.shutdown(); }
 }
 
 {
   const f = await fixture();
   let resultSha = "";
-  f.setBuilder(async (prompt, options) => {
+  f.setBuilder(async (prompt) => {
     assert.ok(prompt.includes(f.card.body), "repair never replaces original requirements");
-    for (const text of [f.repair.requestKey, f.repair.taskSha, f.repair.baseSha, "blanket ours/theirs", "EXISTING", "Never force-push", "do NOT close"]) assert.ok(prompt.includes(text), text);
-    assert.ok(prompt.includes(testCommand("<RESULT_SHA>", "<EXISTING_TEST_COMMAND>")), "mission supplies the executable evidence protocol");
+    for (const text of [f.repair.taskSha, f.repair.baseSha, "MERGE_HEAD", "Never force-push", "do NOT close"]) assert.ok(prompt.includes(text), text);
     resultSha = integrate(f);
-    const testEvidence = await testAtResult(f, options, resultSha);
+    execFileSync(process.execPath, ["test.cjs"], { cwd: f.record.path });
     git(f.record.path, "push", "origin", f.task.taskBranch);
-    return { taskKey: f.task.taskKey, itemId: f.task.itemId, branch: f.task.taskBranch, status: "success", testEvidence };
+    return { taskKey: f.task.taskKey, itemId: f.task.itemId, branch: f.task.taskBranch, status: "success" };
   });
   try {
-    const launched = await f.executor.launch(f.card, "demo", undefined, undefined, f.repair);
+    const launched = await f.executor.launch(f.card, "demo", undefined, undefined);
     assert.equal(launched.status, "launched");
     if (launched.status !== "launched") throw new Error("not launched");
     const run = await settled(f, launched.runId);
     assert.equal(run.status, "completed", JSON.stringify(run));
-    assert.deepEqual((run.args as any).repair, f.repair, "repair is in durable args, not the v3 record");
+    assert.equal(Object.hasOwn(run.args!, "repair"), false, "ordinary run args, no repair protocol");
     assert.equal(run.maxAgents, 1); assert.equal(run.concurrency, 1);
-    assert.equal(f.store.read(f.card.itemId)?.schemaVersion, 3);
+    assert.equal(f.store.read(f.card.itemId)?.schemaVersion, 4);
     assert.equal(Object.hasOwn(f.store.read(f.card.itemId)!, "repair"), false);
     assert.equal(readFileSync(join(f.record.path, ".pi/tested"), "utf8"), resultSha + "\n", "existing tests actually executed at integrated commit");
     assert.equal(readFileSync(join(f.record.path, "task-only.txt"), "utf8"), "original task edit\n");
     assert.equal(readFileSync(join(f.record.path, "base-only.txt"), "utf8"), "base edit\n");
     git(f.repo, "merge-base", "--is-ancestor", f.repair.taskSha, resultSha);
     git(f.repo, "merge-base", "--is-ancestor", f.repair.baseSha, resultSha);
-    assert.ok(repairReviewInput(run)?.testEvidence.output.includes("PASS: both original task"));
     await f.executor.reconcile([f.card]);
     assert.equal(f.card.status, f.cfg.columns.review, f.comments.join("\n"));
-    assert.equal(f.card.closed, false, "manual validation/close is still required with review disabled");
-    assert.equal(f.cfg.review.enabled, false);
+    assert.equal(f.card.closed, false, "manual validation/close is still required");
     assert.equal(git(f.origin, "rev-parse", "refs/heads/main"), f.repair.baseSha);
     assert.equal(git(f.repo, "rev-parse", "HEAD"), f.repair.baseSha);
     assert.equal(git(f.record.path, "status", "--porcelain"), "");
@@ -187,10 +144,10 @@ function integrate(f: Awaited<ReturnType<typeof fixture>>) {
       boardOps: { claim: f.board.claim, refresh: async () => f.board.getCard(f.card.itemId), release: f.board.release, listComments: async () => [], comment: async (_card, body) => { f.comments.push(body); return "comment-id"; }, setStatus: async (_card, status) => { f.card.status = status; } },
       review: async (input) => {
         reviews++;
-        assert.deepEqual(input.repair, repairReviewInput(run), "existing Review receives durable repair/test context");
+        assert.equal("repair" in input, false, "review never requires test-history evidence");
         return runReview(input, async (source, options) => {
-          assert.ok(source.includes("REPAIR TEST EVIDENCE"));
-          assert.ok(source.includes("node test.cjs"));
+          assert.ok(!source.includes("REPAIR TEST EVIDENCE"));
+          execFileSync(process.execPath, ["test.cjs"], { cwd: options.cwd });
           assert.ok(source.includes(f.card.body));
           assert.equal(git(options.cwd, "rev-parse", "HEAD"), resultSha);
           return { result: { verdict: "pass", summary: "Both branches and integrated test evidence reviewed", findings: [] } };
@@ -198,8 +155,7 @@ function integrate(f: Awaited<ReturnType<typeof fixture>>) {
       },
     }, createLoopState(), f.executor, f.store);
     try {
-      await loop.tickNow(); assert.equal(reviews, 0, "review.enabled stays authoritative");
-      f.cfg.review.enabled = true;
+
       await loop.tickNow();
       assert.equal(reviews, 1, notices.join("\n"));
       assert.equal(f.card.status, f.cfg.columns.done, notices.join("\n"));
@@ -211,94 +167,6 @@ function integrate(f: Awaited<ReturnType<typeof fixture>>) {
     try { await restarted.reconcile([f.card]); assert.equal(f.calls(), 1); }
     finally { await restarted.shutdown(); }
     console.log("PASS: real conflicting branches preserve both edits, execute existing tests at the pushed integrated SHA, and await Review/manual close without relaunch");
-  } finally { await f.executor.shutdown(); }
-}
-
-for (const mode of ["missing-base", "invalid-request", "initial-dirty", "last-await-sha"] as const) {
-  const f = await fixture();
-  try {
-    const repair = mode === "missing-base" ? { ...f.repair, baseSha: "0".repeat(40) }
-      : mode === "invalid-request" ? { ...f.repair, requestKey: "bad\nrequest" } : f.repair;
-    if (mode === "initial-dirty") writeFileSync(join(f.record.path, "task-only.txt"), "keep dirty edit\n");
-    const originalGet = f.board.getCard;
-    let reads = 0;
-    f.board.getCard = async (id) => {
-      const card = await originalGet(id);
-      if (mode === "last-await-sha" && card?.status === f.cfg.columns.building && ++reads === 2)
-        git(f.record.path, "commit", "--allow-empty", "-m", "human moved task at actual-start await");
-      return card;
-    };
-    const result = await f.executor.launch(f.card, "demo", undefined, undefined, repair);
-    assert.equal(result.status, "needs-human", mode);
-    assert.equal(f.calls(), 0, "no builder invocation");
-    assert.equal(f.card.status, f.cfg.columns.needs_human);
-    if (mode === "initial-dirty") assert.equal(readFileSync(join(f.record.path, "task-only.txt"), "utf8"), "keep dirty edit\n");
-    assert.equal(git(f.origin, "rev-parse", "refs/heads/main"), f.repair.baseSha);
-    console.log(`PASS: repair admission ${mode} preserves work and blocks invocation`);
-  } finally { await f.executor.shutdown(); }
-}
-
-for (const mode of ["no-push", "unmerged", "dirty", "failed-test", "failed-pipeline", "missing-history", "unfinished-history", "stale-test-sha", "truncated-history", "forged-summary", "missing-base-ancestry", "missing-task-ancestry", "malformed-persisted-repair", "completion-read-dirty"] as const) {
-  const f = await fixture();
-  let sha = "";
-  f.setBuilder(async (_prompt, options) => {
-    if (mode === "unmerged") {
-      assert.throws(() => git(f.record.path, "merge", "--no-edit", f.repair.baseSha));
-      return { taskKey: f.task.taskKey, itemId: f.task.itemId, branch: f.task.taskBranch, status: "success" };
-    }
-    if (mode === "missing-base-ancestry") {
-      writeFileSync(join(f.record.path, "value.json"), '{"task":true,"base":true}\n');
-      git(f.record.path, "add", "value.json"); git(f.record.path, "commit", "-m", "copied behavior without merging designated base");
-      sha = git(f.record.path, "rev-parse", "HEAD");
-    } else sha = integrate(f);
-    if (mode === "missing-task-ancestry") {
-      // Disposable corruption fixture: equivalent tree but original work's history is lost.
-      sha = git(f.repo, "commit-tree", `${sha}^{tree}`, "-p", f.repair.baseSha, "-m", "lost task ancestry");
-      git(f.record.path, "reset", "--hard", sha);
-      git(f.origin, "update-ref", `refs/heads/${f.task.taskBranch}`, sha);
-    }
-    const testEvidence = await testAtResult(f, options, sha, mode === "failed-test" ? "node test.cjs && exit 7" : mode === "failed-pipeline" ? "node test.cjs && (exit 7) | cat" : "node test.cjs");
-    if (mode === "dirty") writeFileSync(join(f.record.path, "task-only.txt"), "keep post-test dirty edit\n");
-    if (mode === "stale-test-sha") git(f.record.path, "commit", "--allow-empty", "-m", "result changed after tests");
-    if (mode !== "no-push") git(f.record.path, "push", "origin", f.task.taskBranch);
-    return { taskKey: f.task.taskKey, itemId: f.task.itemId, branch: f.task.taskBranch, status: "success", testEvidence };
-  });
-  try {
-    const launched = await f.executor.launch(f.card, "demo", undefined, undefined, f.repair);
-    assert.equal(launched.status, "launched");
-    if (launched.status !== "launched") throw new Error("not launched");
-    const run = await settled(f, launched.runId);
-    assert.equal(run.status, "completed", mode);
-    // Restart through the durable public persistence seam, not manager internals.
-    await f.executor.shutdown();
-    if (mode === "missing-history") run.agents[0].history = [];
-    if (mode === "unfinished-history") run.agents[0].history!.push({ role: "assistant", kind: "toolCall", toolName: "bash", text: JSON.stringify({ command: testCommand(sha) }) });
-    if (mode === "forged-summary") run.agents[0].history = [{ role: "assistant", kind: "text", text: "PASS: tests run; exitCode=0" }];
-    if (mode === "truncated-history") run.agents[0].history!.at(-1)!.text += "... [truncated]";
-    if (mode === "malformed-persisted-repair") (run.args as any).repair = { requestKey: f.repair.requestKey, taskSha: f.repair.taskSha };
-    createRunPersistence(f.record.path).save(run);
-    if (mode === "completion-read-dirty") {
-      const originalGet = f.board.getCard;
-      let reads = 0;
-      f.board.getCard = async (id) => {
-        const card = await originalGet(id);
-        if (++reads === 2) writeFileSync(join(f.record.path, "task-only.txt"), "changed during completion read\n");
-        return card;
-      };
-    }
-    const restarted = f.makeExecutor();
-    try {
-      const result = await restarted.reconcile([f.card]);
-      assert.equal(result.needsHuman, 1, `${mode}: ${f.comments.join("\n")}`);
-      assert.equal(f.card.status, f.cfg.columns.needs_human, mode);
-      assert.equal(f.card.closed, false);
-      assert.equal(f.store.read(f.card.itemId)?.activeRunId, undefined);
-      assert.equal(f.calls(), 1, "reconciliation never replaces the durable run");
-      assert.equal(git(f.origin, "rev-parse", "refs/heads/main"), f.repair.baseSha);
-      if (mode === "unmerged") assert.match(git(f.record.path, "ls-files", "--unmerged"), /value.json/);
-      if (mode === "dirty") assert.equal(readFileSync(join(f.record.path, "task-only.txt"), "utf8"), "keep post-test dirty edit\n");
-      console.log(`PASS: repair success with ${mode} is Needs Human, not Review; original worktree retained`);
-    } finally { await restarted.shutdown(); }
   } finally { await f.executor.shutdown(); }
 }
 
@@ -326,12 +194,12 @@ for (const association of ["active", "launch-window"] as const) {
     assert.equal(readFileSync(join(f.record.path, "task-only.txt"), "utf8"), "preserve interrupted edit\n");
     writeFileSync(join(f.record.path, "value.json"), '{"task":true,"base":true}\n');
     git(f.record.path, "add", "value.json", "task-only.txt"); git(f.record.path, "commit", "-m", "fix: complete interrupted merge");
-    const testEvidence = await testAtResult(f, options, git(f.record.path, "rev-parse", "HEAD"));
+    execFileSync(process.execPath, ["test.cjs"], { cwd: f.record.path });
     git(f.record.path, "push", "origin", f.task.taskBranch);
-    return { taskKey: f.task.taskKey, itemId: f.task.itemId, branch: f.task.taskBranch, status: "success", testEvidence };
+    return { taskKey: f.task.taskKey, itemId: f.task.itemId, branch: f.task.taskBranch, status: "success" };
   });
   try {
-    const launched = await f.executor.launch(f.card, "demo", undefined, undefined, f.repair);
+    const launched = await f.executor.launch(f.card, "demo", undefined, undefined);
     if (launched.status !== "launched") throw new Error(JSON.stringify(launched));
     await entered.promise;
     assert.equal(f.executor.activeCount(), 1);
@@ -372,6 +240,7 @@ for (const association of ["active", "launch-window"] as const) {
 for (const mode of ["card-during-revision", "stop-during-final-read", "revision-during-final-read", "one-reserved-slot"] as const) {
   const f = await fixture(), entered = deferred(), finish = deferred();
   let revision = true, reads = 0;
+  const latchSlots: number[] = [];
   const executor = f.makeExecutor(mode === "one-reserved-slot" ? async () => { entered.resolve(); await finish.promise; return "context"; } : undefined);
   const getCard = f.board.getCard;
   f.board.getCard = async (id) => {
@@ -381,16 +250,26 @@ for (const mode of ["card-during-revision", "stop-during-final-read", "revision-
   const launching = executor.launch(f.card, "demo", async () => {
     if (mode === "card-during-revision") { entered.resolve(); await finish.promise; }
     return true;
-  }, () => revision && executor.activeCount() === 1, f.repair);
+  }, () => {
+    const slots = executor.activeCount();
+    latchSlots.push(slots);
+    // The new post-ensure stop checkpoint precedes launch reservation. Actual
+    // invocation still uses the one existing slot, never reserves a second.
+    return revision && slots === (f.store.read(f.card.itemId)?.launchingAt === undefined ? 0 : 1);
+  });
   try {
-    await entered.promise;
+    await Promise.race([entered.promise, launching.then((result) => { throw new Error(`Expected preparation gate was not reached: ${JSON.stringify(result)}`); })]);
     assert.equal(f.calls(), 0); assert.equal(executor.activeCount(), 1, "preparation owns max_workers=1 slot");
     if (mode === "card-during-revision") { f.card.status = f.cfg.columns.backlog; f.card.body = "Human withdrew contract"; }
     if (mode === "stop-during-final-read") executor.stopScheduling();
     if (mode === "revision-during-final-read") revision = false;
     finish.resolve();
     const result = await launching;
-    if (mode === "one-reserved-slot") assert.equal(result.status, "launched", "actual start must not reserve a second slot");
+    assert.equal(latchSlots[0], 0, "post-ensure admission runs before reserving the launch slot");
+    if (mode === "one-reserved-slot") {
+      assert.equal(result.status, "launched", "actual start must not reserve a second slot");
+      assert.equal(latchSlots.at(-1), 1, "actual invocation reuses exactly the reserved slot");
+    }
     else {
       assert.notEqual(result.status, "launched"); assert.equal(f.calls(), 0);
       if (mode === "card-during-revision") { assert.equal(f.card.status, f.cfg.columns.backlog); assert.equal(f.comments.length, 0); }
