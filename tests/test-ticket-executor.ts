@@ -313,7 +313,10 @@ const complete = (itemId: string, result: unknown) => {
             worktrees.beginLaunch(tracked.itemId);
             const runsDir = workflowProjectPaths(record.path).runsDir;
             mkdirSync(runsDir, { recursive: true });
-            writeFileSync(join(runsDir, `${run.runId}.json`), JSON.stringify(run));
+            writeFileSync(
+              join(runsDir, `${run.runId}.json`),
+              JSON.stringify(run),
+            );
           } else worktrees.setActiveRun(tracked.itemId, run.runId);
         }
         board.cards.delete(tracked.itemId);
@@ -358,7 +361,12 @@ const complete = (itemId: string, result: unknown) => {
           failures.push(error);
         }
         if (mode === "launching")
-          rmSync(join(workflowProjectPaths(record.path).runsDir, `${run.runId}.json`));
+          rmSync(
+            join(
+              workflowProjectPaths(record.path).runsDir,
+              `${run.runId}.json`,
+            ),
+          );
       }
     }
   }
@@ -445,13 +453,22 @@ const complete = (itemId: string, result: unknown) => {
     if (mode === "missing-run" || mode === "launch-window") {
       assert.equal(result.errors, mode === "missing-run" ? 1 : 0);
       assert.equal(board.cards.get(card.itemId)!.status, cfg.columns.building);
-      assert.deepEqual(recordFor(card.itemId), before, "missing/ambiguous run is retained, not guessed or quarantined");
+      assert.deepEqual(
+        recordFor(card.itemId),
+        before,
+        "missing/ambiguous run is retained, not guessed or quarantined",
+      );
       assert.equal(state.starts, starts);
       assert.equal(board.comments.get(card.itemId)?.length ?? 0, 0);
       // Explicit fixture teardown; production retains this uncertain association.
-      for (const run of state.runs.values()) await new FakeManager(state, false).stopAndWait(run.runId);
-      await executor.shutdown(); worktrees.clearExecution(card.itemId); state.runs.clear();
-      board.cards.delete(card.itemId); board.comments.delete(card.itemId); board.failReleaseOnce.delete(card.itemId);
+      for (const run of state.runs.values())
+        await new FakeManager(state, false).stopAndWait(run.runId);
+      await executor.shutdown();
+      worktrees.clearExecution(card.itemId);
+      state.runs.clear();
+      board.cards.delete(card.itemId);
+      board.comments.delete(card.itemId);
+      board.failReleaseOnce.delete(card.itemId);
       continue;
     }
     assert.equal(result.errors, 1, mode);
@@ -494,8 +511,16 @@ const complete = (itemId: string, result: unknown) => {
       if (mode === "foreign-run") {
         assert.equal((await executor.reconcile(board.all())).errors, 1);
         assert.ok(pendingTicketWrite(recordFor(card.itemId)));
-        assert.equal(state.stops, stops, "unknown/foreign run is not drained or released as ours");
-        state.runs.get(record.activeRunId!)!.args = { itemId: card.itemId, issueNumber: card.number, taskKey: record.taskKey };
+        assert.equal(
+          state.stops,
+          stops,
+          "unknown/foreign run is not drained or released as ours",
+        );
+        state.runs.get(record.activeRunId!)!.args = {
+          itemId: card.itemId,
+          issueNumber: card.number,
+          taskKey: record.taskKey,
+        };
       }
       const retry = await executor.reconcile(board.all());
       assert.equal(retry.errors, 0, `retry is cleanup only: ${mode}`);
@@ -515,7 +540,12 @@ const complete = (itemId: string, result: unknown) => {
         0,
         `no builder resume during cleanup: ${mode}`,
       );
-      assert.ok([...state.runs.values()].every((run) => run.status !== "running" && run.status !== "paused"), mode);
+      assert.ok(
+        [...state.runs.values()].every(
+          (run) => run.status !== "running" && run.status !== "paused",
+        ),
+        mode,
+      );
     } catch (error) {
       console.error(`FAIL: partial settlement ${mode}`, error);
       failures.push(error);
@@ -612,9 +642,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   else fail("FAIL: active ticket dispatched twice");
   const branchCollision = board.add("PVTI_790", 79);
   board.cards.get(branchCollision.itemId)!.title = "T079 duplicate branch";
-  if (
-    (await executor.launch(branchCollision, "demo")).status === "skipped"
-  ) {
+  if ((await executor.launch(branchCollision, "demo")).status === "skipped") {
     console.log("PASS: two tickets cannot share one task branch/worktree");
   } else fail("FAIL: duplicate task branch ownership");
   const card80 = board.add("PVTI_80", 80);
@@ -798,12 +826,9 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     board.comments.get(completedDirty.itemId) ?? []
   ).join("\n");
   if (
-    board.cards.get(completedDirty.itemId)?.status ===
-      cfg.columns.ready &&
+    board.cards.get(completedDirty.itemId)?.status === cfg.columns.ready &&
     !recordFor(completedDirty.itemId).activeRunId &&
-    completedDirtyComment.includes(
-      "board-agent-write:",
-    ) &&
+    completedDirtyComment.includes("board-agent-write:") &&
     completedDirtyComment.includes("dirty worktree") &&
     existsSync(join(completedDirtyPath, "completed-dirty.txt"))
   )
@@ -999,8 +1024,13 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   };
   await executor.reconcile(board.all());
   if (
-    malformedIdentity.slice(0, 2).every((card) => board.cards.get(card.itemId)?.status === cfg.columns.ready) &&
-    board.cards.get(malformedIdentity[2].itemId)?.status === cfg.columns.building &&
+    malformedIdentity
+      .slice(0, 2)
+      .every(
+        (card) => board.cards.get(card.itemId)?.status === cfg.columns.ready,
+      ) &&
+    board.cards.get(malformedIdentity[2].itemId)?.status ===
+      cfg.columns.building &&
     recordFor(malformedIdentity[2].itemId).activeRunId === wrongArgsRun.runId
   ) {
     console.log(
@@ -1020,7 +1050,11 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   stateFor(missingRecord.path).runs.delete(missingRecord.activeRunId!);
   await executor.reconcile(board.all());
   if (
-    terminalCards.slice(0, 3).every((card) => board.cards.get(card.itemId)?.status === cfg.columns.ready) &&
+    terminalCards
+      .slice(0, 3)
+      .every(
+        (card) => board.cards.get(card.itemId)?.status === cfg.columns.ready,
+      ) &&
     board.cards.get(terminalCards[3].itemId)?.status === cfg.columns.building &&
     recordFor(terminalCards[3].itemId).activeRunId === missingRecord.activeRunId
   ) {
@@ -1037,7 +1071,8 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
       itemId: explained.itemId,
       status: "needs_decision",
       question: "Deployment target is missing.",
-      context: "Checked repository configuration. Choosing a target would be unsafe.",
+      context:
+        "Checked repository configuration. Choosing a target would be unsafe.",
       options: ["Select staging", "Select production"],
       recommendation: "Use staging first; reply with the approved target.",
     },
@@ -1055,7 +1090,8 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     blockerComment.includes("Deployment target is missing.") &&
     blockerComment.includes("Checked repository configuration.") &&
     blockerComment.includes("Choosing a target would be unsafe.") &&
-    blockerComment.includes("Select staging") && blockerComment.includes("Select production") &&
+    blockerComment.includes("Select staging") &&
+    blockerComment.includes("Select production") &&
     blockerComment.includes("reply with the approved target.") &&
     blockerComment.includes("manually move this card to `Ready`") &&
     !blockerComment.includes("dirty worktree") &&
@@ -1094,8 +1130,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     board.comments.get(wrongBranchFailure.itemId) ?? []
   ).join("\n");
   if (
-    board.cards.get(wrongBranchFailure.itemId)?.status ===
-      cfg.columns.ready &&
+    board.cards.get(wrongBranchFailure.itemId)?.status === cfg.columns.ready &&
     !recordFor(wrongBranchFailure.itemId).activeRunId &&
     [
       "Build prerequisites are missing.",
@@ -1139,7 +1174,10 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   stateFor(adoptingRecord.path).runs.set(adoptedRun.runId, adoptedRun);
   const journalDir = workflowProjectPaths(adoptingRecord.path).runsDir;
   mkdirSync(journalDir, { recursive: true });
-  writeFileSync(join(journalDir, `${adoptedRun.runId}.json`), JSON.stringify(adoptedRun));
+  writeFileSync(
+    join(journalDir, `${adoptedRun.runId}.json`),
+    JSON.stringify(adoptedRun),
+  );
   await board.claim(adopting);
   executor = makeExecutor(true);
   const adoptedSummary = await executor.reconcile(board.all());
@@ -1167,7 +1205,9 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     unstartedAfter.launchingAt !== undefined &&
     unstartedSummary.needsHuman === 0
   ) {
-    console.log("PASS: zero matching persisted runs retains an uncertain launch window, never another builder");
+    console.log(
+      "PASS: zero matching persisted runs retains an uncertain launch window, never another builder",
+    );
   } else fail("FAIL: zero-side-effect launch recovery");
 
   const incident = board.add("PVTI_911", 911, cfg.columns.building);
@@ -1193,7 +1233,9 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     firstIncidentComments === 1 &&
     repeatedIncidentComments === 1 &&
     nextIncidentComments === 2 &&
-    incidentComments.every((comment) => comment.includes("board-agent-write:")) &&
+    incidentComments.every((comment) =>
+      comment.includes("board-agent-write:"),
+    ) &&
     new Set(incidentComments).size === 2
   ) {
     console.log("PASS: recovery comments deduplicate per run lineage");
@@ -1372,9 +1414,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
 // Real Git + real executor + real BoardLoop; only the remote board and builders
 // are offline adapters. Every repository/ref below belongs to this TMP_DIR.
 let finalSequence = 0;
-async function finalFixture(
-  strategy: "merge" | "squash" = "merge",
-) {
+async function finalFixture(strategy: "merge" | "squash" = "merge") {
   const dir = join(root, `final-executor-${++finalSequence}`);
   const remote = join(dir, "origin.git");
   const checkout = join(dir, "repo");
@@ -1390,8 +1430,11 @@ async function finalFixture(
   git(checkout, "remote", "add", "origin", remote);
   git(checkout, "push", "-u", "origin", "main");
   mkdirSync(join(checkout, ".pi"));
-  writeFileSync(join(checkout, ".pi", "board-agent.yml"), `task_merge_strategy: ${strategy}
-`);
+  writeFileSync(
+    join(checkout, ".pi", "board-agent.yml"),
+    `task_merge_strategy: ${strategy}
+`,
+  );
   const finalCfg: Config = {
     ...cfg,
     task_merge_strategy: loadConfig(checkout, () => {}).task_merge_strategy,
@@ -1509,13 +1552,22 @@ async function finalFixture(
     f.store,
   );
   await loop.tickNow();
-  assert.equal(f.tip(), f.baseSha, "Missing record never grants integration permission.");
+  assert.equal(
+    f.tip(),
+    f.baseSha,
+    "Missing record never grants integration permission.",
+  );
   assert.equal(f.store.localBranchSha(f.record.taskBranch), f.taskSha);
   const result = await f.make().finalizeClosed(f.card);
   assert.equal(result.status, "blocked");
-  assert.match(result.status === "blocked" ? result.reason : "", /Missing execution record/);
+  assert.match(
+    result.status === "blocked" ? result.reason : "",
+    /Missing execution record/,
+  );
   f.assertNoAdmissions();
-  console.log("PASS: closed Done retains a local-only branch with missing review/execution ownership rather than guessing approval");
+  console.log(
+    "PASS: closed Done retains a local-only branch with missing review/execution ownership rather than guessing approval",
+  );
 }
 
 {
@@ -1557,10 +1609,20 @@ async function finalFixture(
       f.store,
     );
     await loop.tickNow();
-    assert.notEqual((await actual.finalizeClosed((await f.finalBoard.getCard(f.card.itemId))!)).status, "finalized");
+    assert.notEqual(
+      (
+        await actual.finalizeClosed(
+          (await f.finalBoard.getCard(f.card.itemId))!,
+        )
+      ).status,
+      "finalized",
+    );
   }
   assert.equal(f.finalBoard.cards.get(f.card.itemId)!.closed, true);
-  assert.equal(f.finalBoard.cards.get(f.card.itemId)!.status, cfg.columns.ready);
+  assert.equal(
+    f.finalBoard.cards.get(f.card.itemId)!.status,
+    cfg.columns.ready,
+  );
   assert.equal(f.store.read(f.card.itemId)!.retry?.stage, "integrate");
   assert.equal(
     readFileSync(join(f.record.path, "leftover.txt"), "utf8"),
@@ -1568,7 +1630,9 @@ async function finalFixture(
   );
   assert.ok(f.store.has(f.card.itemId));
   f.assertNoAdmissions(true);
-  console.log("PASS: missing task refs retain unknown residuals and unavailable remote proof as closed I/O retry");
+  console.log(
+    "PASS: missing task refs retain unknown residuals and unavailable remote proof as closed I/O retry",
+  );
 }
 
 for (const strategy of ["squash", "merge"] as const) {
@@ -1695,14 +1759,26 @@ for (const strategy of ["squash", "merge"] as const) {
   );
   const oldPlanSnapshot = structuredClone(expected);
   f.finalBoard.cards.get(expected.itemId)!.plan = "changed-after-build";
-  assert.equal((await f.make().finalizeClosed(oldPlanSnapshot)).status, "skipped");
+  assert.equal(
+    (await f.make().finalizeClosed(oldPlanSnapshot)).status,
+    "skipped",
+  );
   assert.equal(f.tip(), f.baseSha);
-  assert.equal((await f.make().finalizeClosed((await f.finalBoard.getCard(expected.itemId))!)).status, "finalized");
+  assert.equal(
+    (
+      await f
+        .make()
+        .finalizeClosed((await f.finalBoard.getCard(expected.itemId))!)
+    ).status,
+    "finalized",
+  );
   assert.equal(
     f.finalBoard.cards.get(expected.itemId)!.plan,
     "changed-after-build",
   );
-  console.log("PASS: stale Plan snapshots cannot authorize integration; a fresh optional Plan change does not invalidate the reviewed task");
+  console.log(
+    "PASS: stale Plan snapshots cannot authorize integration; a fresh optional Plan change does not invalidate the reviewed task",
+  );
 }
 {
   const f = await finalFixture("merge");
@@ -1714,17 +1790,36 @@ for (const strategy of ["squash", "merge"] as const) {
   assert.notEqual((await f.make().finalizeClosed(f.card)).status, "finalized");
   assert.equal(f.tip(), f.baseSha);
   assert.equal(f.store.localBranchSha(f.record.taskBranch), localSha);
-  assert.equal(readFileSync(join(f.record.path, "local-only.txt"), "utf8"), "latest local work\n");
+  assert.equal(
+    readFileSync(join(f.record.path, "local-only.txt"), "utf8"),
+    "latest local work\n",
+  );
   f.assertNoAdmissions(true);
-  console.log("PASS: closing Done cannot integrate unpushed local commits newer than the reviewed SHA");
+  console.log(
+    "PASS: closing Done cannot integrate unpushed local commits newer than the reviewed SHA",
+  );
 }
 {
   const f = await finalFixture();
   const journal = {
-    baseSha: f.baseSha, taskSha: f.taskSha,
-    resultSha: git(f.checkout, "commit-tree", `${f.taskSha}^{tree}`, "-p", f.baseSha, "-p", f.taskSha, "-m", "prepared result"),
+    baseSha: f.baseSha,
+    taskSha: f.taskSha,
+    resultSha: git(
+      f.checkout,
+      "commit-tree",
+      `${f.taskSha}^{tree}`,
+      "-p",
+      f.baseSha,
+      "-p",
+      f.taskSha,
+      "-m",
+      "prepared result",
+    ),
   };
-  f.store.update(f.card.itemId, (record) => ({ ...record, integration: journal }));
+  f.store.update(f.card.itemId, (record) => ({
+    ...record,
+    integration: journal,
+  }));
   const before = JSON.stringify(f.store.read(f.card.itemId));
   const openReady = { ...f.card, closed: false, status: cfg.columns.ready };
   f.finalBoard.cards.set(f.card.itemId, openReady);
@@ -1765,10 +1860,15 @@ for (const strategy of ["squash", "merge"] as const) {
   assert.deepEqual(f.notifications, []);
   rmSync(hook);
   const restarted = f.make();
-  assert.deepEqual(await restarted.finalizeClosed((await f.finalBoard.getCard(f.card.itemId))!), {
-    status: "finalized",
-    resultSha: published,
-  });
+  assert.deepEqual(
+    await restarted.finalizeClosed(
+      (await f.finalBoard.getCard(f.card.itemId))!,
+    ),
+    {
+      status: "finalized",
+      resultSha: published,
+    },
+  );
   assert.equal(
     f.tip(),
     published,
@@ -1783,7 +1883,9 @@ for (const strategy of ["squash", "merge"] as const) {
   });
   assert.equal(f.notifications.length, 1);
   f.assertNoAdmissions(true);
-  console.log("PASS: cleanup failure retains integration/retry; closed Ready restart finishes without another merge or model");
+  console.log(
+    "PASS: cleanup failure retains integration/retry; closed Ready restart finishes without another merge or model",
+  );
 }
 {
   const f = await finalFixture();

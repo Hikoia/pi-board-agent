@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { isTargetIssue, type Card } from "./gh.js";
-import { TicketWorktrees, type TicketExecutionRecord, type TicketRetryState } from "./ticket-worktree.js";
+import {
+  TicketWorktrees,
+  type TicketExecutionRecord,
+  type TicketRetryState,
+} from "./ticket-worktree.js";
 
 /** Writeback lives in retry.reason until all I/O settles. No second journal or
  * repair-specific protocol: the same path handles build, review and conflict. */
@@ -14,33 +18,69 @@ interface PendingWrite {
 }
 const PREFIX = "Pending ticket writeback:\n";
 
-export function pendingTicketWrite(record: TicketExecutionRecord): PendingWrite | undefined {
+export function pendingTicketWrite(
+  record: TicketExecutionRecord,
+): PendingWrite | undefined {
   if (!record.retry?.reason.startsWith(PREFIX)) return undefined;
   let value: PendingWrite;
-  try { value = JSON.parse(record.retry.reason.slice(PREFIX.length)) as PendingWrite; }
-  catch (cause) { throw new Error("Invalid pending ticket writeback; preserved for inspection.", { cause }); }
-  if (!value?.card || value.card.itemId !== record.itemId || value.card.number !== record.issueNumber ||
-      !isTargetIssue(value.card, value.card.repoOwner!, value.card.repoName!,
-        value.card.closed && ["integrate", "cleanup"].includes(record.retry.stage) ? undefined : "Task") ||
-      typeof value.card.title !== "string" || typeof value.card.body !== "string" ||
-      typeof value.card.status !== "string" || typeof value.card.closed !== "boolean" ||
-      !Array.isArray(value.card.assignees) || !value.card.assignees.every((a) => typeof a === "string" && !!a) ||
-      !Object.keys(value).every((key) => ["card", "status", "reason", "comment", "reopen", "retry"].includes(key)) ||
-      typeof value.status !== "string" || !value.status || typeof value.reason !== "string" || !value.reason ||
-      typeof value.retry !== "boolean" || (value.comment !== undefined && typeof value.comment !== "string") ||
-      (value.reopen !== undefined && value.reopen !== true))
-    throw new Error("Invalid pending ticket writeback; preserved for inspection.");
+  try {
+    value = JSON.parse(
+      record.retry.reason.slice(PREFIX.length),
+    ) as PendingWrite;
+  } catch (cause) {
+    throw new Error(
+      "Invalid pending ticket writeback; preserved for inspection.",
+      { cause },
+    );
+  }
+  if (
+    !value?.card ||
+    value.card.itemId !== record.itemId ||
+    value.card.number !== record.issueNumber ||
+    !isTargetIssue(
+      value.card,
+      value.card.repoOwner!,
+      value.card.repoName!,
+      value.card.closed && ["integrate", "cleanup"].includes(record.retry.stage)
+        ? undefined
+        : "Task",
+    ) ||
+    typeof value.card.title !== "string" ||
+    typeof value.card.body !== "string" ||
+    typeof value.card.status !== "string" ||
+    typeof value.card.closed !== "boolean" ||
+    !Array.isArray(value.card.assignees) ||
+    !value.card.assignees.every((a) => typeof a === "string" && !!a) ||
+    !Object.keys(value).every((key) =>
+      ["card", "status", "reason", "comment", "reopen", "retry"].includes(key),
+    ) ||
+    typeof value.status !== "string" ||
+    !value.status ||
+    typeof value.reason !== "string" ||
+    !value.reason ||
+    typeof value.retry !== "boolean" ||
+    (value.comment !== undefined && typeof value.comment !== "string") ||
+    (value.reopen !== undefined && value.reopen !== true)
+  )
+    throw new Error(
+      "Invalid pending ticket writeback; preserved for inspection.",
+    );
   return value;
 }
 
 export function queueTicketWrite(
-  store: TicketWorktrees, record: TicketExecutionRecord, stage: TicketRetryState["stage"], write: PendingWrite,
+  store: TicketWorktrees,
+  record: TicketExecutionRecord,
+  stage: TicketRetryState["stage"],
+  write: PendingWrite,
 ): TicketExecutionRecord {
-  if (record.schemaVersion !== 4) throw new Error("Migrate ticket before executing v4 writeback.");
+  if (record.schemaVersion !== 4)
+    throw new Error("Migrate ticket before executing v4 writeback.");
   if (JSON.stringify(store.read(record.itemId)) !== JSON.stringify(record))
     throw new Error("Ticket record changed before writeback.");
   if (pendingTicketWrite(record)) return record;
-  return store.update(record.itemId, (current) => ({ ...current,
+  return store.update(record.itemId, (current) => ({
+    ...current,
     retry: { stage, reason: PREFIX + JSON.stringify(write) },
   }));
 }
@@ -55,18 +95,27 @@ export interface TicketWriteBoard {
 }
 
 export function sameTicketContract(a: Card, b: Card): boolean {
-  return a.itemId === b.itemId && a.number === b.number && a.contentType === b.contentType &&
+  return (
+    a.itemId === b.itemId &&
+    a.number === b.number &&
+    a.contentType === b.contentType &&
     a.repoOwner?.toLowerCase() === b.repoOwner?.toLowerCase() &&
     a.repoName?.toLowerCase() === b.repoName?.toLowerCase() &&
-    a.type?.toLowerCase() === b.type?.toLowerCase() && a.plan === b.plan &&
-    a.title === b.title && a.body === b.body;
+    a.type?.toLowerCase() === b.type?.toLowerCase() &&
+    a.plan === b.plan &&
+    a.title === b.title &&
+    a.body === b.body
+  );
 }
 
 /** Caller must drain the old run BEFORE even releasing a withdrawn claim. An
  * exception retains the pending write AND execution identity for the next tick. */
 export async function settleTicketWrite(
-  store: TicketWorktrees, record: TicketExecutionRecord, board: TicketWriteBoard,
-  botLogin: string, drain: () => Promise<void> = async () => {},
+  store: TicketWorktrees,
+  record: TicketExecutionRecord,
+  board: TicketWriteBoard,
+  botLogin: string,
+  drain: () => Promise<void> = async () => {},
 ): Promise<"settled" | "withdrawn"> {
   const write = pendingTicketWrite(record);
   if (!write) throw new Error("No pending ticket writeback.");
@@ -76,24 +125,54 @@ export async function settleTicketWrite(
       throw new Error("Ticket record changed during writeback.");
     // Conflict reopening must retain exclusive branch/path ownership across
     // each awaited board operation, not only the initial merge-tree check.
-    if (write.reopen) store.cleanupRecord({ ...record, title: write.card.title, body: write.card.body });
+    if (write.reopen)
+      store.cleanupRecord({
+        ...record,
+        title: write.card.title,
+        body: write.card.body,
+      });
   };
-  const fresh = async () => { sameRecord(); const card = await board.getCard(record.itemId); sameRecord(); return card; };
-  const target = (card: Card | undefined): card is Card => !!card &&
-    isTargetIssue(card, write.card.repoOwner!, write.card.repoName!,
-      write.card.closed && ["integrate", "cleanup"].includes(record.retry!.stage) ? undefined : "Task") &&
-    card.itemId === record.itemId && card.number === record.issueNumber;
-  const hasBot = (card: Card) => card.assignees.some((a) => a.toLowerCase() === botLogin.toLowerCase());
-  const allowed = (card: Card | undefined): card is Card => target(card) && sameTicketContract(card, write.card) &&
+  const fresh = async () => {
+    sameRecord();
+    const card = await board.getCard(record.itemId);
+    sameRecord();
+    return card;
+  };
+  const target = (card: Card | undefined): card is Card =>
+    !!card &&
+    isTargetIssue(
+      card,
+      write.card.repoOwner!,
+      write.card.repoName!,
+      write.card.closed &&
+        ["integrate", "cleanup"].includes(record.retry!.stage)
+        ? undefined
+        : "Task",
+    ) &&
+    card.itemId === record.itemId &&
+    card.number === record.issueNumber;
+  const hasBot = (card: Card) =>
+    card.assignees.some((a) => a.toLowerCase() === botLogin.toLowerCase());
+  const allowed = (card: Card | undefined): card is Card =>
+    target(card) &&
+    sameTicketContract(card, write.card) &&
     card.assignees.every((a) => a.toLowerCase() === botLogin.toLowerCase()) &&
     (hasBot(card) || card.status === write.status) &&
     (card.status === write.card.status || card.status === write.status) &&
-    (card.closed === write.card.closed || (write.reopen === true && card.closed === false));
-  const finish = (withdrawn = false) => store.update(record.itemId, (current) => ({ ...current,
-    launchingAt: undefined, activeRunId: undefined, activeRunStartedAt: undefined,
-    lastRunId: current.activeRunId ?? current.lastRunId,
-    retry: !withdrawn && write.retry ? { stage: current.retry!.stage, reason: write.reason } : undefined,
-  }));
+    (card.closed === write.card.closed ||
+      (write.reopen === true && card.closed === false));
+  const finish = (withdrawn = false) =>
+    store.update(record.itemId, (current) => ({
+      ...current,
+      launchingAt: undefined,
+      activeRunId: undefined,
+      activeRunStartedAt: undefined,
+      lastRunId: current.activeRunId ?? current.lastRunId,
+      retry:
+        !withdrawn && write.retry
+          ? { stage: current.retry!.stage, reason: write.reason }
+          : undefined,
+    }));
   const guard = async (): Promise<Card | undefined> => {
     const card = await fresh();
     if (allowed(card)) return card;
@@ -105,7 +184,17 @@ export async function settleTicketWrite(
   let card = await guard();
   if (!card) return "withdrawn";
   if (write.comment) {
-    const marker = `<!-- board-agent-write:${record.itemId}:${createHash("sha256").update(JSON.stringify([record.activeRunId ?? record.lastRunId ?? record.createdAt, record.retry!.reason])).digest("hex").slice(0, 20)} -->`;
+    const marker = `<!-- board-agent-write:${record.itemId}:${createHash(
+      "sha256",
+    )
+      .update(
+        JSON.stringify([
+          record.activeRunId ?? record.lastRunId ?? record.createdAt,
+          record.retry!.reason,
+        ]),
+      )
+      .digest("hex")
+      .slice(0, 20)} -->`;
     const body = `${marker}\n${write.comment}`;
     const comments = await board.listComments(card);
     card = await guard();
@@ -120,11 +209,14 @@ export async function settleTicketWrite(
   }
   card = await guard();
   if (!card) return "withdrawn";
-  if (write.reopen && card.closed) throw new Error("Issue reopen is not yet observed.");
-  if (card.status !== write.status) await board.setStatus(card.itemId, write.status);
+  if (write.reopen && card.closed)
+    throw new Error("Issue reopen is not yet observed.");
+  if (card.status !== write.status)
+    await board.setStatus(card.itemId, write.status);
   card = await guard();
   if (!card) return "withdrawn";
-  if (card.status !== write.status) throw new Error("Project status write is not yet observed.");
+  if (card.status !== write.status)
+    throw new Error("Project status write is not yet observed.");
   if (hasBot(card)) {
     await board.release(card);
     card = await guard();

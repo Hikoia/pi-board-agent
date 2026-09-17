@@ -129,7 +129,10 @@ async function fixture() {
   git(f.record.path, "add", ".");
   git(f.record.path, "commit", "-m", "task conflict");
   git(f.record.path, "push", "origin", f.task.taskBranch);
-  f.store.setReviewedTaskSha(f.task.itemId, git(f.record.path, "rev-parse", "HEAD"));
+  f.store.setReviewedTaskSha(
+    f.task.itemId,
+    git(f.record.path, "rev-parse", "HEAD"),
+  );
   const base = f.tip();
   const local = f.store.localBranchSha(f.task.taskBranch);
   await assert.rejects(() => f.finish(), /merge-tree/);
@@ -147,7 +150,10 @@ async function fixture() {
   chmodSync(hook, 0o755);
   await assert.rejects(() => f.finish(), /push/);
   f.kept();
-  assert.ok(f.store.read(f.task.itemId)!.integration, "prepared result survives rejected push");
+  assert.ok(
+    f.store.read(f.task.itemId)!.integration,
+    "prepared result survives rejected push",
+  );
   rmSync(hook);
   writeFileSync(join(f.repo, "later.txt"), "later base work\n");
   git(f.repo, "add", ".");
@@ -157,7 +163,10 @@ async function fixture() {
   assert.equal(f.store.read(f.task.itemId)!.reviewedTaskSha, f.taskSha);
   const result = await f.finish();
   assert.equal(f.tip(), result);
-  assert.equal(git(f.repo, "show", "-s", "--format=%P", result!), `${advanced} ${f.taskSha}`);
+  assert.equal(
+    git(f.repo, "show", "-s", "--format=%P", result!),
+    `${advanced} ${f.taskSha}`,
+  );
   assert.equal(git(f.repo, "show", "origin/main:later.txt"), "later base work");
   assert.equal(git(f.repo, "show", "origin/main:feature.txt"), "feature");
   console.log(
@@ -301,7 +310,17 @@ async function fixture() {
     integration: {
       baseSha: f.baseSha,
       taskSha: f.taskSha,
-      resultSha: git(f.repo, "commit-tree", `${f.taskSha}^{tree}`, "-p", f.baseSha, "-p", f.taskSha, "-m", "prepared before push"),
+      resultSha: git(
+        f.repo,
+        "commit-tree",
+        `${f.taskSha}^{tree}`,
+        "-p",
+        f.baseSha,
+        "-p",
+        f.taskSha,
+        "-m",
+        "prepared before push",
+      ),
     },
   }));
   const before = JSON.stringify(f.store.read(f.task.itemId));

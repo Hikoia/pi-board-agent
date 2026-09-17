@@ -5,7 +5,12 @@
  * by Status.
  */
 import type { Config } from "./config.js";
-import { ensureStandardFields, getProjectMetadata, validateProjectMetadata, type ProjectMetadata } from "./gh.js";
+import {
+  ensureStandardFields,
+  getProjectMetadata,
+  validateProjectMetadata,
+  type ProjectMetadata,
+} from "./gh.js";
 
 export interface InitResult {
   created: string[];
@@ -37,15 +42,35 @@ export function buildStandardSpecs(cfg: Config) {
   ];
 }
 
-export async function initProject(owner: string, number: number, cfg: Config): Promise<InitResult> {
-  const meta = await getProjectMetadata(owner, number, cfg.status_field, cfg.type_field);
+export async function initProject(
+  owner: string,
+  number: number,
+  cfg: Config,
+): Promise<InitResult> {
+  const meta = await getProjectMetadata(
+    owner,
+    number,
+    cfg.status_field,
+    cfg.type_field,
+  );
   const specs = buildStandardSpecs(cfg);
-  const { created, existing } = await ensureStandardFields(meta, specs, "Board");
-  const refreshed = await getProjectMetadata(owner, number, cfg.status_field, cfg.type_field);
+  const { created, existing } = await ensureStandardFields(
+    meta,
+    specs,
+    "Board",
+  );
+  const refreshed = await getProjectMetadata(
+    owner,
+    number,
+    cfg.status_field,
+    cfg.type_field,
+  );
   try {
     validateProjectMetadata(refreshed, cfg);
   } catch (error: any) {
-    throw new Error(`${error.message}. Add missing required options manually; init-project never rewrites an existing option list.`);
+    throw new Error(
+      `${error.message}. Add missing required options manually; init-project never rewrites an existing option list.`,
+    );
   }
   return { created, existing, view: "Board" };
 }

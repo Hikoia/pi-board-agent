@@ -154,7 +154,14 @@ reset([
     data: {
       node: {
         fields: connection(
-          [{ id: "S", name: "Status", dataType: "SINGLE_SELECT", options: [{ id: "R", name: "Ready" }] }],
+          [
+            {
+              id: "S",
+              name: "Status",
+              dataType: "SINGLE_SELECT",
+              options: [{ id: "R", name: "Ready" }],
+            },
+          ],
           "FIELDS_2",
         ),
       },
@@ -164,7 +171,12 @@ reset([
     data: {
       node: {
         fields: connection([
-          { id: "K", name: "Kind", dataType: "SINGLE_SELECT", options: [{ id: "T", name: "Task" }] },
+          {
+            id: "K",
+            name: "Kind",
+            dataType: "SINGLE_SELECT",
+            options: [{ id: "T", name: "Task" }],
+          },
           { id: "L", name: "Plan", dataType: "TEXT" },
         ]),
       },
@@ -187,43 +199,126 @@ assert.partialDeepStrictEqual(metadata, {
   statusFieldType: "SINGLE_SELECT",
   typeFieldType: "SINGLE_SELECT",
 });
-console.log("PASS: Project metadata retains explicit GraphQL field types, not option-presence guesses");
+console.log(
+  "PASS: Project metadata retains explicit GraphQL field types, not option-presence guesses",
+);
 
 reset([
   { data: { repositoryOwner: { projectV2: { id: "P" } } } },
-  { data: { node: { fields: connection([
-    { id: "S", name: "Status", dataType: "SINGLE_SELECT", options: ["Backlog", "Ready", "In Progress", "Review", "Done", "Needs Human"].map((name) => ({ id: name, name })) },
-    { id: "T", name: "Type", dataType: "SINGLE_SELECT", options: [{ id: "TASK", name: "Task" }] },
-  ]) } } },
+  {
+    data: {
+      node: {
+        fields: connection([
+          {
+            id: "S",
+            name: "Status",
+            dataType: "SINGLE_SELECT",
+            options: [
+              "Backlog",
+              "Ready",
+              "In Progress",
+              "Review",
+              "Done",
+              "Needs Human",
+            ].map((name) => ({ id: name, name })),
+          },
+          {
+            id: "T",
+            name: "Type",
+            dataType: "SINGLE_SELECT",
+            options: [{ id: "TASK", name: "Task" }],
+          },
+        ]),
+      },
+    },
+  },
 ]);
-validateProjectMetadata(await getProjectMetadata("project-org", 17, "Status", "Type"), _DEFAULTS);
+validateProjectMetadata(
+  await getProjectMetadata("project-org", 17, "Status", "Type"),
+  _DEFAULTS,
+);
 assert.equal(calls().length, 2);
 assert.ok(calls().every((args) => !args.some((arg) => /mutation\(/.test(arg))));
-console.log("PASS: real metadata adapter accepts Type:Task and six statuses including Backlog, with no Plan/Story requirement or schema writes");
+console.log(
+  "PASS: real metadata adapter accepts Type:Task and six statuses including Backlog, with no Plan/Story requirement or schema writes",
+);
 
 {
-  const status = { id: "S", name: "Status", dataType: "SINGLE_SELECT", options: Object.values(_DEFAULTS.columns).map((name) => ({ name, id: name })) };
+  const status = {
+    id: "S",
+    name: "Status",
+    dataType: "SINGLE_SELECT",
+    options: Object.values(_DEFAULTS.columns).map((name) => ({
+      name,
+      id: name,
+    })),
+  };
   const plan = { id: "L", name: "Plan", dataType: "TEXT" };
-  const type = { id: "K", name: "Kind", dataType: "SINGLE_SELECT", options: [{ id: "TASK", name: "Task" }, { id: "STORY", name: "Story" }] };
+  const type = {
+    id: "K",
+    name: "Kind",
+    dataType: "SINGLE_SELECT",
+    options: [
+      { id: "TASK", name: "Task" },
+      { id: "STORY", name: "Story" },
+    ],
+  };
   for (const [label, fields, error] of [
     ["missing Status", [plan, type], /Status field/],
-    ["missing Backlog", [{ ...status, options: status.options.filter((o) => o.name !== "Backlog") }, plan, type], /Backlog/],
-    ["wrong Status despite options", [{ ...status, dataType: "TEXT" }, plan, type], /Status field/],
+    [
+      "missing Backlog",
+      [
+        {
+          ...status,
+          options: status.options.filter((o) => o.name !== "Backlog"),
+        },
+        plan,
+        type,
+      ],
+      /Backlog/,
+    ],
+    [
+      "wrong Status despite options",
+      [{ ...status, dataType: "TEXT" }, plan, type],
+      /Status field/,
+    ],
     ["missing Type", [status, plan], /Type.*SINGLE_SELECT/],
-    ["text Type", [status, plan, { ...type, dataType: "TEXT", options: undefined }], /Type.*SINGLE_SELECT/],
-    ["missing Type option", [status, plan, { ...type, options: [{ id: "STORY", name: "Story" }] }], /Type.*Task/],
+    [
+      "text Type",
+      [status, plan, { ...type, dataType: "TEXT", options: undefined }],
+      /Type.*SINGLE_SELECT/,
+    ],
+    [
+      "missing Type option",
+      [status, plan, { ...type, options: [{ id: "STORY", name: "Story" }] }],
+      /Type.*Task/,
+    ],
   ] as const) {
     reset([
       { data: { repositoryOwner: { projectV2: { id: "P" } } } },
       { data: { node: { fields: connection([...fields]) } } },
     ]);
-    await assert.rejects(async () => validateProjectMetadata(
-      await getProjectMetadata("project-org", 17, "Status", "Kind"), _DEFAULTS,
-    ), error, label);
-    assert.equal(calls().length, 2, `${label}: only metadata queries, no schema mutation`);
-    assert.ok(calls().every((args) => !args.some((arg) => /mutation\(/.test(arg))));
+    await assert.rejects(
+      async () =>
+        validateProjectMetadata(
+          await getProjectMetadata("project-org", 17, "Status", "Kind"),
+          _DEFAULTS,
+        ),
+      error,
+      label,
+    );
+    assert.equal(
+      calls().length,
+      2,
+      `${label}: only metadata queries, no schema mutation`,
+    );
+    assert.ok(
+      calls().every((args) => !args.some((arg) => /mutation\(/.test(arg))),
+    );
   }
-  console.log("PASS: real metadata adapter + lane validation reject missing/wrong raw GraphQL fields and Type options using read-only queries");
+  console.log(
+    "PASS: real metadata adapter + lane validation reject missing/wrong raw GraphQL fields and Type options using read-only queries",
+  );
 }
 reset([
   {
@@ -280,7 +375,10 @@ reset([
   projectItems(invalidRaw.slice(4)),
 ]);
 const invalid = await listCards("P", "Status", "Plan", "Kind");
-assert.ok(!calls()[0].some((arg) => /on PullRequest|on DraftIssue|subIssues/.test(arg)), "retired content queries are absent");
+assert.ok(
+  !calls()[0].some((arg) => /on PullRequest|on DraftIssue|subIssues/.test(arg)),
+  "retired content queries are absent",
+);
 check(
   invalid.length === invalidRaw.length &&
     calls()[0].some((arg) => arg.includes("__typename")) &&
@@ -372,7 +470,15 @@ for (const mode of ["exit1", "timeout"] as const) {
             error.timeoutMs === GIT_GH_TIMEOUT_MS,
     );
     assert.deepEqual(calls(), [
-      ["issue", "edit", "7", "--repo", "origin-owner/repo", "--remove-assignee", "bot"],
+      [
+        "issue",
+        "edit",
+        "7",
+        "--repo",
+        "origin-owner/repo",
+        "--remove-assignee",
+        "bot",
+      ],
     ]);
     console.log(`PASS: production release rejects ${mode} without replay`);
   } catch (error) {

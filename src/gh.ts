@@ -552,8 +552,19 @@ async function readClaimState(
   };
 }
 
-export async function tryClaim(card: Card, botLogin: string, allowClosed = false): Promise<boolean> {
-  if (!isTargetIssue(card, card.repoOwner ?? "", card.repoName ?? "", allowClosed ? undefined : "Task"))
+export async function tryClaim(
+  card: Card,
+  botLogin: string,
+  allowClosed = false,
+): Promise<boolean> {
+  if (
+    !isTargetIssue(
+      card,
+      card.repoOwner ?? "",
+      card.repoName ?? "",
+      allowClosed ? undefined : "Task",
+    )
+  )
     return false;
   requiredString(botLogin, "claim login");
   const bot = botLogin.toLowerCase();
@@ -594,7 +605,15 @@ export async function tryClaim(card: Card, botLogin: string, allowClosed = false
 
 /** Failures propagate; callers choosing best-effort cleanup must catch and warn. */
 export async function release(card: Card, botLogin: string): Promise<void> {
-  if (!isTargetIssue(card, card.repoOwner ?? "", card.repoName ?? "", card.closed ? undefined : "Task")) return;
+  if (
+    !isTargetIssue(
+      card,
+      card.repoOwner ?? "",
+      card.repoName ?? "",
+      card.closed ? undefined : "Task",
+    )
+  )
+    return;
   requiredString(botLogin, "release login");
   await runGh([
     "issue",
@@ -807,10 +826,17 @@ export async function createComment(
 /** Reopening is a handoff write, never approval or a builder launch. */
 export async function reopenIssue(issueId: string): Promise<void> {
   requiredString(issueId, "issue id");
-  const data = await graphql<any>(`mutation($id: ID!) {
+  const data = await graphql<any>(
+    `mutation($id: ID!) {
     reopenIssue(input: { issueId: $id }) { issue { id closed } }
-  }`, { id: issueId });
-  if (data?.reopenIssue?.issue?.id !== issueId || data.reopenIssue.issue.closed !== false) throw new Error("GitHub returned unconfirmed issue reopen.");
+  }`,
+    { id: issueId },
+  );
+  if (
+    data?.reopenIssue?.issue?.id !== issueId ||
+    data.reopenIssue.issue.closed !== false
+  )
+    throw new Error("GitHub returned unconfirmed issue reopen.");
 }
 
 export interface IssueComment {

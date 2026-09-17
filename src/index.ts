@@ -18,11 +18,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadConfig, validateConfig, resolveOwner } from "./config.js";
-import {
-  getProjectMetadata,
-  validateProjectMetadata,
-  whoami,
-} from "./gh.js";
+import { getProjectMetadata, validateProjectMetadata, whoami } from "./gh.js";
 import { createLoopState, BoardLoop, type LoopDeps } from "./loop.js";
 import { acquireOwnerLock, ownerLockHeldByOther } from "./owner-lock.js";
 import {
@@ -48,7 +44,9 @@ import {
 
 let loop: BoardLoop | null = null;
 // Retained only with this loop's owner, including incomplete cleanup.
-let loopWorktrees: { cwd: string; store: TicketWorktrees; cfg: ReturnType<typeof loadConfig> } | undefined;
+let loopWorktrees:
+  | { cwd: string; store: TicketWorktrees; cfg: ReturnType<typeof loadConfig> }
+  | undefined;
 function stateRoot(cwd: string): string {
   return loopWorktrees?.cwd === resolve(cwd)
     ? loopWorktrees.store.repoRoot
@@ -94,17 +92,24 @@ function hasRecoveryState(cwd: string, root: string): boolean {
   assertSupportedState(cwd, root, true);
   const stateDir = resolve(root, CONFIG_DIR_NAME, "board-agent");
   if (!existsSync(stateDir)) return false;
-  const store = loopWorktrees?.cwd === resolve(cwd)
-    ? loopWorktrees.store
-    : new TicketWorktrees(cwd);
-  return store.hasCleanupReceipts() || store.list()
-    .some(
-      (record) =>
-        record.schemaVersion === 3 ||
-        record.activeRunId !== undefined ||
-        record.launchingAt !== undefined ||
-        record.finalization !== undefined || record.integration !== undefined || record.retry !== undefined,
-    );
+  const store =
+    loopWorktrees?.cwd === resolve(cwd)
+      ? loopWorktrees.store
+      : new TicketWorktrees(cwd);
+  return (
+    store.hasCleanupReceipts() ||
+    store
+      .list()
+      .some(
+        (record) =>
+          record.schemaVersion === 3 ||
+          record.activeRunId !== undefined ||
+          record.launchingAt !== undefined ||
+          record.finalization !== undefined ||
+          record.integration !== undefined ||
+          record.retry !== undefined,
+      )
+  );
 }
 
 function statusPrefix(level: "info" | "warn" | "error"): string {
@@ -175,7 +180,9 @@ async function startBoardLoop(
   const cwd = ctx.cwd;
   const generation = stopGeneration;
   if (loop?.isStopping())
-    throw new Error("Loop cleanup is pending; retry stop before starting again.");
+    throw new Error(
+      "Loop cleanup is pending; retry stop before starting again.",
+    );
   const root = stateRoot(cwd);
   assertSupportedState(cwd, root, true);
   const preflight = await currentRevision(cwd);
@@ -285,12 +292,7 @@ async function startBoardLoop(
     const revisionCheck = async () => {
       updateWidget(); // Busy-tick heartbeat reflects live runs without package/config scans.
       const check = lastRevisionCheck;
-      saveRuntime(
-        ctx,
-        liveRuntimeState(check),
-        check,
-        root,
-      );
+      saveRuntime(ctx, liveRuntimeState(check), check, root);
       return {
         ok: check.ok,
         reason: check.ok ? undefined : formatRevisionFailure(check),
@@ -317,10 +319,15 @@ async function startBoardLoop(
     });
     // No manager exists yet. Acquisition rejects a live previous owner (even
     // this PID); its shutdown retains the lock until all old work is drained.
-    const migration = await executor.migrateLegacy(ownerLock,
-      () => generation === stopGeneration);
+    const migration = await executor.migrateLegacy(
+      ownerLock,
+      () => generation === stopGeneration,
+    );
     for (const failure of migration.failures)
-      callback(`Legacy migration preserved ${failure.source}: ${failure.reason}`, "warn");
+      callback(
+        `Legacy migration preserved ${failure.source}: ${failure.reason}`,
+        "warn",
+      );
     if (generation !== stopGeneration)
       throw new Error("Startup cancelled by stop/shutdown.");
     const deps: LoopDeps = {
@@ -455,10 +462,7 @@ export default function (pi: ExtensionAPI) {
       const template = readConfigTemplate();
       mkdirSync(resolve(cwd, CONFIG_DIR_NAME), { recursive: true });
       writeFileSync(dest, template, { encoding: "utf8", flag: "wx" });
-      ctx.ui.notify(
-        `Wrote: ${dest} (edit project.number)`,
-        "info",
-      );
+      ctx.ui.notify(`Wrote: ${dest} (edit project.number)`, "info");
     },
   });
 
@@ -579,7 +583,9 @@ export default function (pi: ExtensionAPI) {
         const { summarizePlans } = await import("./plan.js");
         const plans = summarizePlans(cfg, cards);
         const execution = inspectTicketExecutions(
-          cwd, cards, cfg,
+          cwd,
+          cards,
+          cfg,
           loopWorktrees?.cwd === resolve(cwd) ? loopWorktrees.store : undefined,
         );
 
