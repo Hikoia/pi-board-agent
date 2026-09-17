@@ -176,6 +176,38 @@ See [architecture](docs/architecture.md), [operations/recovery](docs/runbook.md)
 and the [builder procedure](skills/board-agent/SKILL.md). Historical audit reports
 are preserved baselines, not current policy.
 
+### Update to the latest main commit (PowerShell)
+
+Run `/board-agent stop` in every owning Pi session, wait for cleanup and managed
+run leases to drain, and take a [stopped backup](docs/runbook.md#stopped-backup).
+Exit those Pi sessions, then paste the following into PowerShell:
+
+```powershell
+$ref = git ls-remote --exit-code https://github.com/Hikoia/pi-board-agent.git refs/heads/main
+
+if ($LASTEXITCODE -eq 0 -and $ref -match '^([0-9a-f]{40})\s') {
+    $sha = $Matches[1]
+    pi install "git:github.com/Hikoia/pi-board-agent@$sha"
+} else {
+    throw "Could not retrieve the latest SHA; update cancelled."
+}
+```
+
+This resolves `main` once and installs that exact SHA. Latest does not mean
+reviewed or tested; use the explicit reviewed-SHA install above if you have not
+validated the current `main`. `pi update --extensions` does not advance an
+existing SHA pin; rerun this snippet to select the latest `main` again.
+
+After a successful install, restart Pi in the target repository and check:
+
+```text
+/board-agent lint
+/board-agent status
+```
+
+Only after lint passes, use `/board-agent run` to resume with one exclusive
+owner. Do not use `/reload` as a hot-update procedure.
+
 ## Commands
 
 | Command | Purpose |
