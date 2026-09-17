@@ -99,9 +99,11 @@ function hasRecoveryState(cwd: string, root: string): boolean {
   assertSupportedState(cwd, root);
   const stateDir = resolve(cwd, CONFIG_DIR_NAME, "board-agent");
   if (!existsSync(stateDir)) return false;
-  return (loopWorktrees?.cwd === resolve(cwd)
-    ? loopWorktrees.store
-    : new TicketWorktrees(cwd))
+  return (
+    loopWorktrees?.cwd === resolve(cwd)
+      ? loopWorktrees.store
+      : new TicketWorktrees(cwd)
+  )
     .list()
     .some(
       (record) =>
@@ -179,7 +181,9 @@ async function startBoardLoop(
   const cwd = ctx.cwd;
   const generation = stopGeneration;
   if (loop?.isStopping())
-    throw new Error("Loop cleanup is pending; retry stop before starting again.");
+    throw new Error(
+      "Loop cleanup is pending; retry stop before starting again.",
+    );
   const root = stateRoot(cwd);
   assertSupportedState(cwd, root);
   const preflight = await currentRevision(cwd);
@@ -255,6 +259,7 @@ async function startBoardLoop(
         clearBoardWidget(ctx);
         return;
       }
+      executor.activeCount();
       const { active, occupiedSlots: builderSlots } = executor.observation ?? {
         active: [],
         occupiedSlots: 0,
@@ -287,20 +292,16 @@ async function startBoardLoop(
       updateWidget();
     };
     const revisionCheck = async () => {
+      // Busy-tick heartbeats must refresh activity too, not just runtime identity.
+      updateWidget();
       const check = await currentRevision(cwd);
-      saveRuntime(
-        ctx,
-        liveRuntimeState(check),
-        check,
-        root,
-      );
+      saveRuntime(ctx, liveRuntimeState(check), check, root);
       return {
         ok: check.ok,
         reason: check.ok ? undefined : formatRevisionFailure(check),
       };
     };
     const onTick = async () => {
-      updateWidget();
       await revisionCheck();
     };
 
@@ -581,7 +582,9 @@ export default function (pi: ExtensionAPI) {
         const { summarizePlans } = await import("./plan.js");
         const plans = summarizePlans(cfg, cards);
         const execution = inspectTicketExecutions(
-          cwd, cards, cfg,
+          cwd,
+          cards,
+          cfg,
           loopWorktrees?.cwd === resolve(cwd) ? loopWorktrees.store : undefined,
         );
 

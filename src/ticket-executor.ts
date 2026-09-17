@@ -74,6 +74,7 @@ export type LaunchResult =
 
 export type FinalizeOutcome =
   | { status: "finalized"; resultSha: string }
+  | { status: "backlogged" }
   | { status: "conflict"; baseSha: string; taskSha: string; reason: string }
   | { status: "skipped"; reason: string; repair?: RepairRequest }
   | RepairBlocker;
@@ -89,6 +90,7 @@ export interface TicketExecutor {
     canStartWork?: () => boolean | Promise<boolean>,
     canStartWorkNow?: () => boolean,
   ): Promise<ReconcileSummary>;
+  hasPendingRecovery?(itemId: string): boolean;
   repairFor?(card: Card): Promise<RepairRequest | RepairBlocker | undefined>;
   repairForReview?(
     record: TicketExecutionRecord,
@@ -1092,6 +1094,14 @@ export class ManagedTicketExecutor implements TicketExecutor {
       if (this.stopping) break;
       const snapshot = cardsById.get(original.itemId);
       try {
+        if (
+          snapshot?.closed &&
+          statusIs(snapshot, this.deps.cfg.columns.backlog) &&
+          isTargetIssue(snapshot, this.deps.repoOwner, this.deps.repoName) &&
+          snapshot.number === original.issueNumber &&
+          !this.hasPendingRecovery(original.itemId)
+        )
+          continue; // Retained historical idle records need no per-ticket polling.
         // A failed read preserves recovery evidence; confirmed absence or a
         // replacement target stops only the local run, never mutates a snapshot.
         const card = await this.deps.board.getCard(original.itemId);
@@ -1592,11 +1602,20 @@ export class ManagedTicketExecutor implements TicketExecutor {
     return { status: "launched", runId, worktree: record.path };
   }
 
+  hasPendingRecovery(itemId: string): boolean {
+    return (
+      this.deps.worktrees.hasPendingRecovery(itemId) ||
+      this.conflicts.hasPending(itemId)
+    );
+  }
+
   async finalizeClosed(
     snapshot: Card,
     canStartWork: () => boolean | Promise<boolean> = () => true,
     canStartWorkNow: () => boolean = () => true,
   ): Promise<FinalizeOutcome> {
+    if (this.stopping)
+      return { status: "skipped", reason: "executor stopping" };
     let card: Card | undefined;
     try {
       card = await this.deps.board.getCard(snapshot.itemId);
@@ -1607,10 +1626,12 @@ export class ManagedTicketExecutor implements TicketExecutor {
       };
     }
     if (!card) return { status: "skipped", reason: "card no longer exists" };
-    if (!isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task"))
+    if (this.stopping)
+      return { status: "skipped", reason: "executor stopping" };
+    if (!isTargetIssue(card, this.deps.repoOwner, this.deps.repoName))
       return {
         status: "skipped",
-        reason: "card is not a Task Issue in the configured repository",
+        reason: "card is not an Issue in the configured repository",
       };
     if (card.itemId !== snapshot.itemId || card.number !== snapshot.number)
       return { status: "skipped", reason: "issue changed" };
@@ -1621,20 +1642,73 @@ export class ManagedTicketExecutor implements TicketExecutor {
       };
 
     try {
+      const recovering = await this.conflicts.resumeClosed(
+        card.itemId,
+        async () => !this.stopping && (await canStartWork()),
+        () => !this.stopping && canStartWorkNow(),
+      );
+      if (recovering) return recovering;
+      if (this.stopping)
+        return { status: "skipped", reason: "executor stopping" };
       const task = buildTasksForWave(this.deps.cfg, "", [card])[0];
       const resultSha = await this.deps.worktrees.finalizeAccepted(
         task,
         this.deps.cfg.task_merge_strategy,
       );
-      if (!resultSha)
-        return { status: "skipped", reason: "no local task branch" };
-      this.deps.callback(
-        `Finalized #${card.number} "${card.title}" at ${resultSha} in ${task.baseBranch}. Deleted local/remote branch ${task.taskBranch} and removed its worktree.`,
+      if (await this.deps.worktrees.remoteBranchSha(task.taskBranch))
+        throw new Error("Remote task branch reappeared before Backlog write.");
+      // Read the card after network Git, then recheck synchronous local evidence.
+      const fresh = await this.deps.board.getCard(card.itemId);
+      if (
+        !fresh ||
+        fresh.itemId !== card.itemId ||
+        fresh.number !== card.number ||
+        !isTargetIssue(fresh, this.deps.repoOwner, this.deps.repoName) ||
+        !fresh.closed ||
+        !statusIs(fresh, this.deps.cfg.columns.done)
+      )
+        return {
+          status: "skipped",
+          reason: "ticket changed before Backlog write",
+        };
+      if (
+        this.deps.worktrees.localBranchSha(task.taskBranch) ||
+        this.hasPendingRecovery(card.itemId)
+      )
+        throw new Error(
+          "Task ref or pending recovery remains before Backlog write.",
+        );
+      await this.deps.board.setStatus(
+        card.itemId,
+        this.deps.cfg.columns.backlog,
       );
-      return { status: "finalized", resultSha };
+      const confirmed = await this.deps.board.getCard(card.itemId);
+      if (
+        !confirmed ||
+        confirmed.itemId !== card.itemId ||
+        confirmed.number !== card.number ||
+        !isTargetIssue(confirmed, this.deps.repoOwner, this.deps.repoName) ||
+        !confirmed.closed ||
+        !statusIs(confirmed, this.deps.cfg.columns.backlog)
+      )
+        throw new Error("Backlog write was not confirmed.");
+      snapshot.status = confirmed.status;
+      snapshot.closed = confirmed.closed;
+      this.deps.callback(
+        resultSha
+          ? `Finalized #${card.number} "${card.title}" at ${resultSha} in ${task.baseBranch}. Deleted local/remote branch ${task.taskBranch} and removed its worktree → ${this.deps.cfg.columns.backlog}.`
+          : `Backlogged #${card.number} "${card.title}" → ${this.deps.cfg.columns.backlog} (closed; no task branches).`,
+      );
+      return resultSha
+        ? { status: "finalized", resultSha }
+        : { status: "backlogged" };
     } catch (error) {
       if (error instanceof MergeConflictError) {
-        if (this.deps.board.conflict) {
+        if (
+          error.repairable &&
+          card.type?.toLowerCase() === "task" &&
+          this.deps.board.conflict
+        ) {
           const repair: RepairRequest = {
             requestKey: conflictRequestKey(
               card.itemId,

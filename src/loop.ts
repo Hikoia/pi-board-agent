@@ -1058,24 +1058,35 @@ export class BoardLoop {
         card.plan === story.plan,
     );
     // Every journaled child must still exist; deleting a board card is not completion.
-    return (
-      creation.tasks.length > 0 &&
-      creation.tasks.every((child) =>
+    if (
+      !creation.tasks.length ||
+      !creation.tasks.every((child) =>
         tasks.some(
           (task) =>
             task.itemId === child.itemId && task.number === child.number,
         ),
-      ) &&
-      tasks.every(
-        (task) =>
-          task.closed &&
-          task.status?.toLowerCase() === cfg.columns.done.toLowerCase() &&
-          task.number !== undefined &&
-          !this.ticketWorktrees.localBranchSha(
-            taskBranch(cfg.branches.task_prefix, task.number),
-          ),
       )
-    );
+    )
+      return false;
+    for (const task of tasks) {
+      if (
+        !task.closed ||
+        task.number === undefined ||
+        ![cfg.columns.done, cfg.columns.backlog].some(
+          (status) => status.toLowerCase() === task.status?.toLowerCase(),
+        ) ||
+        (this.executor.hasPendingRecovery?.(task.itemId) ??
+          this.ticketWorktrees.hasPendingRecovery(task.itemId))
+      )
+        return false;
+      const branch = taskBranch(cfg.branches.task_prefix, task.number);
+      if (
+        (await this.ticketWorktrees.remoteBranchSha(branch)) ||
+        this.ticketWorktrees.localBranchSha(branch)
+      )
+        return false;
+    }
+    return true;
   }
 
   private async processTaskDesignCards(cards: Card[]): Promise<boolean> {
@@ -1625,35 +1636,16 @@ export class BoardLoop {
     cards: Card[],
     blockers: Map<string, BlockerNotice>,
   ): Promise<void> {
-    const { cfg, callback, repoOwner, repoName } = this.deps;
+    const { cfg, repoOwner, repoName } = this.deps;
     const candidates = cards.filter(
       (card) =>
         card.closed === true &&
         (card.status ?? "").toLowerCase() === cfg.columns.done.toLowerCase() &&
-        isTargetIssue(card, repoOwner, repoName, "Task"),
+        isTargetIssue(card, repoOwner, repoName),
     );
     if (!candidates.length || this.foreground.signal.aborted) return;
-    let refs: Set<string>;
-    try {
-      refs = await this.ticketWorktrees.localTaskRefs(cfg.branches.task_prefix);
-    } catch (error) {
-      callback(
-        `Closed-Done finalization blocked: local task refs query failed: ${error instanceof Error ? error.message : String(error)}`,
-        "warn",
-      );
-      return;
-    }
     for (const card of candidates) {
       if (this.foreground.signal.aborted) return;
-      // Absence only defers this tick. Presence still requires all fresh checks.
-      if (
-        !refs.has(
-          `refs/heads/${taskBranch(cfg.branches.task_prefix, card.number!)}`,
-        ) &&
-        !this.ticketWorktrees.hasCleanupReceipt(card.itemId)
-      ) {
-        continue;
-      }
       const outcome = await this.executor.finalizeClosed(
         card,
         async () => (await this.revisionAllowsNewWork()) && this.admitNewWork,
@@ -1661,6 +1653,7 @@ export class BoardLoop {
       );
       if (
         outcome.status === "finalized" ||
+        outcome.status === "backlogged" ||
         (outcome.status === "skipped" && outcome.repair)
       )
         blockers.delete(card.itemId);
@@ -1682,7 +1675,7 @@ export class BoardLoop {
         fingerprint,
         message:
           outcome.status === "conflict"
-            ? `Finalization conflict for #${card.number} "${card.title}": ${taskBranch(cfg.branches.task_prefix, card.number!)} at ${outcome.taskSha} conflicts with ${cfg.branches.base} at ${outcome.baseSha}. Ticket status, branches and worktree preserved; no integration commit or push. Resolve the conflict before retrying.\n${outcome.reason}`
+            ? `Finalization conflict for #${card.number} "${card.title}": ${taskBranch(cfg.branches.task_prefix, card.number!)} could not be integrated into ${cfg.branches.base}. Conflicting commits: ${outcome.baseSha} / ${outcome.taskSha}. Ticket status, branches and worktree preserved; no integration push. Resolve the conflict before retrying.\n${outcome.reason}`
             : `Finalization blocked for "${card.title}": ${outcome.reason}`,
       });
     }

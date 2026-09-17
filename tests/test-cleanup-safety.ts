@@ -173,8 +173,17 @@ try {
       tip = f.tip();
     for (const change of [
       (r: any) => {
-        r.schemaVersion = 2;
+        r.schemaVersion = 3;
       },
+      (r: any) => {
+        delete r.remoteTaskSha;
+      },
+      (r: any) => {
+        r.remoteTaskSha = "invalid";
+      },
+      (r: any) => {
+        r.schemaVersion = 1;
+      }, // v1 must not accept v2's extra field
       (r: any) => {
         r.unexpected = true;
       },

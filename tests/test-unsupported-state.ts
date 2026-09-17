@@ -642,7 +642,7 @@ try {
           : { task: "TASK" },
         statusOptions: Object.fromEntries(
           Object.entries(validMetadata.statusOptions).filter(
-            ([name]) => refine || !["Backlog", "Needs Design"].includes(name),
+            ([name]) => refine || name !== "Needs Design",
           ),
         ),
       };
@@ -661,7 +661,25 @@ try {
       assert.equal(loops.length, count + 1);
       await command("stop");
       console.log(
-        `PASS: lint/run accept ${planFieldType} Plan with refine=${refine}; disabled design does not require Story/Needs Design/Backlog`,
+        `PASS: lint/run accept ${planFieldType} Plan with refine=${refine}; disabled design omits Story/Needs Design but still requires Backlog`,
+      );
+      delete metadata.statusOptions.Backlog;
+      const beforeMissing = messages.length;
+      const beforeLoops: number = loops.length;
+      await command("lint");
+      await command("run");
+      assert.equal(
+        loops.length,
+        beforeLoops,
+        "missing Backlog cannot start a loop",
+      );
+      assert.ok(
+        messages
+          .slice(beforeMissing)
+          .some((message) => /missing.*Backlog/.test(message)),
+      );
+      console.log(
+        `PASS: missing Backlog fails preflight with refine=${refine}, ${planFieldType} Plan`,
       );
     }
   }

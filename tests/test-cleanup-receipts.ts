@@ -148,14 +148,19 @@ try {
       notices.push(message);
     };
     const noWrite = async (): Promise<never> =>
-      assert.fail("cleanup does not mutate the card or launch repair");
+      assert.fail("cleanup does not comment, claim or launch repair");
     const board: TicketBoardAdapter = {
       getCard: async () => structuredClone(card),
       claim: noWrite,
       release: noWrite,
       comment: noWrite,
       listComments: noWrite,
-      setStatus: noWrite,
+      setStatus: async (id, status) => {
+        assert.equal(id, card.itemId);
+        assert.equal(status, cfg.columns.backlog);
+        assert.equal(existsSync(f.receipt), false);
+        card.status = status;
+      },
     };
     const store = new TicketWorktrees(f.repo);
     const executor = new ManagedTicketExecutor({
@@ -192,7 +197,7 @@ try {
     assert.equal(
       existsSync(f.receipt),
       false,
-      `no-ref negative filter must retain pending cleanup: ${JSON.stringify(notices)}`,
+      `absent refs must not bypass pending cleanup: ${JSON.stringify(notices)}`,
     );
     assert.equal(existsSync(f.recordFile), false);
     assert.equal(f.tip(), integrated);

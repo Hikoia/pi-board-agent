@@ -78,6 +78,7 @@ export class MergeConflictError extends Error {
     readonly baseSha: string,
     readonly taskSha: string,
     readonly diagnostic: string,
+    readonly repairable = true,
   ) {
     super(diagnostic);
     this.name = "MergeConflictError";
@@ -256,8 +257,13 @@ export function isTicketExecutionRecord(
   );
 }
 
-interface CleanupReceipt {
-  schemaVersion: 1;
+type CleanupReceipt = (
+  | { schemaVersion: 1 }
+  | {
+      schemaVersion: 2;
+      remoteTaskSha: string | null;
+    }
+) & {
   itemId: string;
   issueNumber: number;
   taskBranch: string;
@@ -270,7 +276,7 @@ interface CleanupReceipt {
   parents: Awaited<ReturnType<typeof directoryStamps>>;
   gitParents: Awaited<ReturnType<typeof directoryStamps>>;
   backup: string | null;
-}
+};
 const hash = (bytes: Buffer) =>
   createHash("sha256").update(bytes).digest("hex");
 const equalRecordBytes = (bytes: Buffer, record: TicketExecutionRecord) => {
@@ -284,7 +290,7 @@ const equalRecordBytes = (bytes: Buffer, record: TicketExecutionRecord) => {
   }
 };
 
-/** Persistent builder worktrees and local-branch finalization. */
+/** Persistent builder worktrees and two-source finalization. */
 export class TicketWorktrees {
   readonly repoRoot: string;
   private readonly gitCommonDir?: string;
@@ -336,7 +342,7 @@ export class TicketWorktrees {
     mkdirSync(this.cleanupDir, { recursive: true });
   }
 
-  /** Presence, not validity: corrupt receipts must also survive the no-ref filter. */
+  /** Presence, not validity: corrupt receipts also block the historical shortcut. */
   hasCleanupReceipt(itemId: string): boolean {
     if (this.hasSymlink(this.cleanupDir))
       throw new Error("Symlinked cleanup state.");
@@ -380,28 +386,36 @@ export class TicketWorktrees {
     return existsSync(this.recordPath(itemId));
   }
 
-  /** Full local ref names for a tick's negative filter, never approval evidence. */
-  async localTaskRefs(prefix: string): Promise<Set<string>> {
-    const output = await mustGitAsync(
-      ["for-each-ref", "--format=%(refname)", `refs/heads/${prefix}issue-*`],
-      this.repoRoot,
+  /** Idle historical records may remain, but unreadable evidence is never absence. */
+  hasPendingRecovery(itemId: string): boolean {
+    if (this.hasCleanupReceipt(itemId)) return true;
+    const path = this.recordPath(itemId);
+    const stat = lstatSync(path, { throwIfNoEntry: false });
+    if (!stat) return false;
+    const record =
+      !this.hasSymlink(path) && stat.isFile() ? this.read(itemId) : undefined;
+    if (!record)
+      throw new Error("Corrupt or unsupported ticket execution record.");
+    return !!(
+      record.activeRunId ||
+      record.launchingAt !== undefined ||
+      record.finalization
     );
-    return new Set(output.split(/\r?\n/).filter(Boolean));
   }
 
-  /** Only a missing local ref means done; Git errors must not look like absence. */
+  /** Git errors must not look like an absent local ref. */
   localBranchSha(branch: string): string | undefined {
     this.validateBranches(branch);
     const ref = `refs/heads/${branch}`;
+    const symbolic = git(["symbolic-ref", "--quiet", ref], this.repoRoot);
+    if (symbolic.ok || symbolic.status !== 1 || symbolic.timedOut)
+      throw new Error(`Local ${branch} is symbolic or unreadable.`);
     const args = ["show-ref", "--verify", "--quiet", ref];
     const result = git(args, this.repoRoot);
     if (!result.ok) {
-      if (result.status === 1) return undefined;
+      if (result.status === 1 && !result.timedOut) return undefined;
       throw processFailure("git", args, result);
     }
-    const symbolic = git(["symbolic-ref", "--quiet", ref], this.repoRoot);
-    if (symbolic.ok || symbolic.status !== 1)
-      throw new Error(`Local ${branch} is symbolic or unreadable.`);
     return mustGit(["rev-parse", "--verify", `${ref}^{commit}`], this.repoRoot);
   }
 
@@ -893,7 +907,7 @@ export class TicketWorktrees {
       );
     if (
       branchSha(task.taskBranch, this.repoRoot) ||
-      (await this.remoteSha(task.taskBranch))
+      (await this.remoteBranchSha(task.taskBranch))
     )
       throw new Error(
         `${task.taskBranch} already exists without a v3 ticket record.`,
@@ -932,7 +946,7 @@ export class TicketWorktrees {
     return record;
   }
 
-  /** Closed + Done approves the current local branch, not an execution record. */
+  /** Closed + Done approves both exact task refs, not an execution record. */
   async finalizeAccepted(
     task: BuilderTask,
     strategy: Config["task_merge_strategy"],
@@ -942,10 +956,7 @@ export class TicketWorktrees {
       await this.cleanupFinalized(task, receipt);
       return receipt.resultSha;
     }
-    await this.checkCleanupGit();
-    const taskSha = this.localBranchSha(task.taskBranch);
-    if (!taskSha) return undefined;
-    this.validateBranches(task.baseBranch);
+    this.validateBranches(task.taskBranch, task.baseBranch);
     if (task.taskBranch === task.baseBranch)
       throw new Error("Task branch must differ from the base branch.");
     if (
@@ -956,11 +967,42 @@ export class TicketWorktrees {
       )
     )
       throw new Error("Builder execution is still active.");
+    let taskSha = this.localBranchSha(task.taskBranch);
+    const remoteTaskSha = await this.remoteBranchSha(task.taskBranch);
+    if (!taskSha && !remoteTaskSha) {
+      // Historical closure authorizes only a board move, never residual deletion.
+      const record = await this.cleanupRecord(task, false);
+      if (record?.finalization)
+        throw new Error(
+          "Pending finalization has no task ref; preserve recovery evidence.",
+        );
+      return undefined;
+    }
+    await this.checkCleanupGit();
     const record = await this.cleanupRecord(task);
+    await this.fetchRequired(
+      task.baseBranch,
+      ...(remoteTaskSha ? [task.taskBranch] : []),
+    );
+    if (remoteTaskSha && this.fetchedSha(task.taskBranch) !== remoteTaskSha)
+      throw new Error(`Remote ${task.taskBranch} moved during fetch.`);
+    if (!taskSha) {
+      // Restore only the missing ref, never a builder/worktree or a competing ref.
+      await mustGitAsync(
+        [
+          "update-ref",
+          "--no-deref",
+          `refs/heads/${task.taskBranch}`,
+          remoteTaskSha!,
+          "0".repeat(40),
+        ],
+        this.repoRoot,
+      );
+      taskSha = remoteTaskSha!;
+    }
     const path = this.pathFor(task.itemId, task.issueNumber);
     const orphan = !!record && !this.entryForPath(path) && existsSync(path);
     if (!orphan) this.checkedTaskWorktrees(task.taskBranch, taskSha);
-    await this.fetchRequired(task.baseBranch);
     const baseSha = this.fetchedSha(task.baseBranch);
     const old = record?.finalization;
     if (
@@ -985,23 +1027,94 @@ export class TicketWorktrees {
           "Legacy finalization result is not confirmed on remote base.",
         );
       await this.verifyLegacyResult(old);
+      if (
+        remoteTaskSha &&
+        !this.isAncestor(remoteTaskSha, taskSha) &&
+        !this.isAncestor(remoteTaskSha, old.resultSha)
+      )
+        throw new Error(
+          `Remote ${task.taskBranch} has unmerged work; cleanup refused.`,
+        );
       const receipt = await this.prepareReceipt(
         task,
         taskSha,
         old.resultSha,
         true,
+        remoteTaskSha,
       );
       await this.cleanupFinalized(task, receipt);
       return old.resultSha;
     }
-    const state = { targetBranch: task.baseBranch, baseSha, taskSha };
-    const treeSha = await this.resultTree(state);
-    const parents = this.resultParents(state, strategy);
-    // ponytail: squash retries use tree equality; conflicting later edits need a manual merge.
-    const integrated =
-      this.isAncestor(taskSha, baseSha) ||
-      (strategy === "squash" &&
-        treeSha === mustGit(["rev-parse", `${baseSha}^{tree}`], this.repoRoot));
+    if (strategy !== "merge" && strategy !== "squash")
+      throw new Error("Unsupported finalization strategy.");
+    // Check the original tips, not a temporary commit whose SHA can change on retry.
+    let integrated =
+      this.isAncestor(taskSha, baseSha) &&
+      (!remoteTaskSha || this.isAncestor(remoteTaskSha, baseSha));
+    let sourceSha = taskSha;
+    let treeSha: string | undefined;
+    if (!integrated) {
+      if (remoteTaskSha && !this.isAncestor(remoteTaskSha, taskSha)) {
+        if (this.isAncestor(taskSha, remoteTaskSha)) sourceSha = remoteTaskSha;
+        else {
+          let sourceTree: string;
+          try {
+            sourceTree = await this.resultTree({
+              targetBranch: task.taskBranch,
+              baseSha: taskSha,
+              taskSha: remoteTaskSha,
+            });
+          } catch (error) {
+            if (error instanceof MergeConflictError)
+              throw new MergeConflictError(
+                error.baseSha,
+                error.taskSha,
+                `Local/remote task sources conflict; resolve manually.\n${error.diagnostic}`,
+                false,
+              );
+            throw error;
+          }
+          sourceSha = await mustGitAsync(
+            ["commit-tree", sourceTree, "-p", taskSha, "-p", remoteTaskSha],
+            this.repoRoot,
+            `chore(board): combine local/remote ${task.taskBranch}\n`,
+          );
+          if (!SHA.test(sourceSha))
+            throw new Error("git commit-tree returned no source commit.");
+        }
+      }
+      try {
+        treeSha = await this.resultTree({
+          targetBranch: task.baseBranch,
+          baseSha,
+          taskSha: sourceSha,
+        });
+      } catch (error) {
+        if (error instanceof MergeConflictError) {
+          const combined = sourceSha !== taskSha && sourceSha !== remoteTaskSha;
+          // The first diagnostic line contains the temporary tip AND conflict-tree OID.
+          // Neither may turn unchanged original sources into a new blocker each tick.
+          const diagnostic = combined
+            ? `git merge-tree conflict for task sources ${taskSha} / ${remoteTaskSha}:\n${error.diagnostic.split(/\r?\n/).slice(1).join("\n").replaceAll(sourceSha, "<combined-task-tip>")}`
+            : error.diagnostic;
+          throw new MergeConflictError(
+            error.baseSha,
+            combined ? taskSha : error.taskSha,
+            diagnostic,
+            sourceSha === taskSha && remoteTaskSha === taskSha,
+          );
+        }
+        throw error;
+      }
+      // ponytail: squash retries use tree equality; conflicting later edits need a manual merge.
+      integrated =
+        strategy === "squash" &&
+        treeSha === mustGit(["rev-parse", `${baseSha}^{tree}`], this.repoRoot);
+    }
+    const parents = this.resultParents(
+      { targetBranch: task.baseBranch, baseSha, taskSha: sourceSha },
+      strategy,
+    );
     if (orphan && !integrated)
       throw new Error(
         "Unregistered residual is not confirmed integrated; cleanup refused.",
@@ -1009,7 +1122,7 @@ export class TicketWorktrees {
     let resultSha = baseSha;
     if (!integrated) {
       resultSha = await mustGitAsync(
-        ["commit-tree", treeSha, ...parents.flatMap((sha) => ["-p", sha])],
+        ["commit-tree", treeSha!, ...parents.flatMap((sha) => ["-p", sha])],
         this.repoRoot,
         `chore(board): merge ${task.taskKey} after validation\n\n${task.title.replace(/[\r\n]+/g, " ")}\n\nRefs #${task.issueNumber}\nBoard-Agent-Item: ${task.itemId}\n`,
       );
@@ -1032,6 +1145,7 @@ export class TicketWorktrees {
       taskSha,
       resultSha,
       integrated,
+      remoteTaskSha,
     );
     await this.cleanupFinalized(task, receipt);
     return resultSha;
@@ -1212,6 +1326,7 @@ export class TicketWorktrees {
   /** Strict inventory: an unreadable/mixed record cannot silently disappear from ownership. */
   private async cleanupRecord(
     task: BuilderTask,
+    inspectPaths = true,
   ): Promise<TicketExecutionRecord | undefined> {
     await directoryStamps(join(this.recordsDir, "probe"));
     let own: TicketExecutionRecord | undefined;
@@ -1240,7 +1355,7 @@ export class TicketWorktrees {
           throw new Error("Ticket cleanup record identity changed.");
         if (record.activeRunId || record.launchingAt !== undefined)
           throw new Error("Builder execution is still active.");
-        this.assertOwnedPath(record);
+        if (inspectPaths) this.assertOwnedPath(record);
         own = record;
       } else if (
         record.taskBranch === task.taskBranch ||
@@ -1249,6 +1364,7 @@ export class TicketWorktrees {
         throw new Error("Ticket cleanup path/branch has another record owner.");
       }
     }
+    if (!inspectPaths) return own;
     const path = this.pathFor(task.itemId, task.issueNumber);
     if (!this.isManagedPath(path))
       throw new Error(`Refusing unmanaged worktree: ${path}`);
@@ -1291,8 +1407,12 @@ export class TicketWorktrees {
         "parents",
         "gitParents",
         "backup",
+        ...(r?.schemaVersion === 2 ? ["remoteTaskSha"] : []),
       ]) ||
-      r.schemaVersion !== 1 ||
+      ![1, 2].includes(r.schemaVersion) ||
+      (r.schemaVersion === 2 &&
+        r.remoteTaskSha !== null &&
+        (typeof r.remoteTaskSha !== "string" || !SHA.test(r.remoteTaskSha))) ||
       r.itemId !== task.itemId ||
       r.issueNumber !== task.issueNumber ||
       r.taskBranch !== task.taskBranch ||
@@ -1363,6 +1483,7 @@ export class TicketWorktrees {
     taskSha: string,
     resultSha: string,
     legacy: boolean,
+    remoteTaskSha: string | undefined,
   ): Promise<CleanupReceipt> {
     const record = await this.cleanupRecord(task);
     const recordBytes = record
@@ -1370,29 +1491,6 @@ export class TicketWorktrees {
       : null;
     if (recordBytes && !equalRecordBytes(recordBytes, record!))
       throw new Error("Cleanup execution record changed.");
-    // Freeze a receipt only once every destructive precondition, including the remote task, is ready.
-    const remote = await gitAsync(
-      [
-        "ls-remote",
-        "--exit-code",
-        "--heads",
-        "origin",
-        `refs/heads/${task.taskBranch}`,
-      ],
-      this.repoRoot,
-    );
-    if (remote.ok) {
-      const sha = remote.stdout.trim().split(/\s+/)[0];
-      if (
-        !SHA.test(sha) ||
-        (!this.isAncestor(sha, taskSha) &&
-          !this.isAncestor(sha, this.fetchedSha(task.baseBranch)))
-      )
-        throw new Error(
-          `Remote ${task.taskBranch} has unmerged work; cleanup refused.`,
-        );
-    } else if (remote.status !== 2)
-      throw processFailure("git", ["ls-remote"], remote);
     const path = this.pathFor(task.itemId, task.issueNumber);
     const entry = this.entryForPath(path);
     if (entry) this.checkedTaskWorktrees(task.taskBranch, taskSha);
@@ -1442,7 +1540,8 @@ export class TicketWorktrees {
       await writeCleanupEvidence(join(backup, "record.json"), recordBytes!);
     }
     const receipt: CleanupReceipt = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      remoteTaskSha: remoteTaskSha ?? null,
       itemId: task.itemId,
       issueNumber: task.issueNumber,
       taskBranch: task.taskBranch,
@@ -1458,6 +1557,10 @@ export class TicketWorktrees {
     };
     await this.checkCleanup(task, receipt);
     for (const snapshot of snapshots) await verifySnapshot(snapshot, false);
+    if ((await this.remoteBranchSha(task.taskBranch)) !== remoteTaskSha)
+      throw new Error(`Remote ${task.taskBranch} moved; cleanup refused.`);
+    if (this.localBranchSha(task.taskBranch) !== taskSha)
+      throw new Error(`Local ${task.taskBranch} moved; cleanup refused.`);
     await writeCleanupEvidence(
       this.receiptPath(task.itemId),
       JSON.stringify(receipt, null, 2),
@@ -1692,20 +1795,13 @@ export class TicketWorktrees {
         `Pushed result ${receipt.resultSha} is not on origin/${task.baseBranch}.`,
       );
     await guard();
-    const args = [
-      "ls-remote",
-      "--exit-code",
-      "--heads",
-      "origin",
-      `refs/heads/${task.taskBranch}`,
-    ];
-    const remote = await gitAsync(args, this.repoRoot);
-    if (remote.ok) {
-      const remoteSha = remote.stdout.trim().split(/\s+/)[0];
+    const remoteSha = await this.remoteBranchSha(task.taskBranch);
+    if (remoteSha) {
       if (
-        !SHA.test(remoteSha) ||
-        (!this.isAncestor(remoteSha, receipt.taskSha) &&
-          !this.isAncestor(remoteSha, baseSha))
+        receipt.schemaVersion === 2
+          ? remoteSha !== receipt.remoteTaskSha
+          : !this.isAncestor(remoteSha, receipt.taskSha) &&
+            !this.isAncestor(remoteSha, baseSha)
       )
         throw new Error(
           `Remote ${task.taskBranch} has unmerged work; cleanup refused.`,
@@ -1720,7 +1816,7 @@ export class TicketWorktrees {
         ],
         this.repoRoot,
       );
-    } else if (remote.status !== 2) throw processFailure("git", args, remote);
+    }
     for (const snapshot of receipt.snapshots) {
       await guard();
       if (this.entryForPath(snapshot.path)) {
@@ -1741,10 +1837,8 @@ export class TicketWorktrees {
       throw new Error(
         `Pushed result ${receipt.resultSha} is not on origin/${task.baseBranch}.`,
       );
-    const remaining = await gitAsync(args, this.repoRoot);
-    if (remaining.ok)
+    if (await this.remoteBranchSha(task.taskBranch))
       throw new Error("Remote task branch reappeared; cleanup refused.");
-    if (remaining.status !== 2) throw processFailure("git", args, remaining);
     await guard();
     if (this.localBranchSha(task.taskBranch))
       await mustGitAsync(
@@ -1809,13 +1903,25 @@ export class TicketWorktrees {
     );
   }
 
-  private async remoteSha(branch: string): Promise<string | undefined> {
-    const result = await gitAsync(
-      ["ls-remote", "--exit-code", "--heads", "origin", `refs/heads/${branch}`],
-      this.repoRoot,
-    );
-    if (!result.ok) return undefined;
-    return result.stdout.trim().split(/\s+/)[0];
+  async remoteBranchSha(branch: string): Promise<string | undefined> {
+    this.validateBranches(branch);
+    const ref = `refs/heads/${branch}`;
+    const args = ["ls-remote", "--exit-code", "--heads", "origin", ref];
+    const result = await gitAsync(args, this.repoRoot);
+    if (!result.ok) {
+      if (
+        result.status === 2 &&
+        !result.timedOut &&
+        !result.stdout.trim() &&
+        !result.stderr.trim()
+      )
+        return undefined;
+      throw processFailure("git", args, result);
+    }
+    const match = /^([0-9a-f]{40})\t([^\r\n]+)(?:\r?\n)?$/i.exec(result.stdout);
+    if (!match || match[2] !== ref)
+      throw new Error(`Malformed remote ref: ${branch}`);
+    return match[1];
   }
 
   private isAncestor(ancestor: string, descendant: string): boolean {

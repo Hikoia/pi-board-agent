@@ -350,17 +350,17 @@ try {
   assert.equal(existsSync(record.path), true);
   assert.equal(store.has(task.itemId), true);
   const published = git(repo, "rev-parse", "origin/main");
-  assert.notEqual(published, baseSha);
+  assert.equal(published, baseSha);
   console.log(
-    "PASS: non-absence ls-remote failure after push retains the local cleanup/retry signal",
+    "PASS: non-absence ls-remote failure blocks before integration and retains both sources",
   );
 
   from = observations.length;
   const resultSha = await store.finalizeAccepted(task, "merge");
-  assert.equal(
+  assert.notEqual(
     resultSha,
     published,
-    "retry must not create another integration commit",
+    "healthy retry now integrates the task",
   );
   assert.equal(
     git(repo, "ls-remote", "origin", "refs/heads/main").split(/\s+/)[0],

@@ -167,16 +167,11 @@ async function fixture() {
     "remote-only work",
   );
   git(f.repo, "push", "origin", `${newer}:refs/heads/${f.task.taskBranch}`);
-  await assert.rejects(() => f.finish(), /unmerged work/);
-  assert.equal(f.tip(f.task.taskBranch), newer);
-  assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
-  assert.ok(existsSync(f.record.path));
-  git(f.record.path, "merge", "--ff-only", newer);
   await f.finish("merge");
   git(f.repo, "merge-base", "--is-ancestor", newer, "origin/main");
   assert.equal(f.tip(f.task.taskBranch), "");
   console.log(
-    "PASS: remote-only commits are never deleted; integrating them locally permits normal cleanup",
+    "PASS: remote-ahead commits are integrated automatically before cleanup",
   );
 }
 {
@@ -272,6 +267,13 @@ async function fixture() {
   );
   await assert.rejects(() => f.finish(), /symbolic/);
   assert.equal(f.tip(), f.baseSha);
+  git(
+    f.repo,
+    "symbolic-ref",
+    `refs/heads/${f.task.taskBranch}`,
+    "refs/heads/missing",
+  );
+  assert.throws(() => f.store.localBranchSha(f.task.taskBranch), /symbolic/);
   assert.throws(() => f.store.localBranchSha("-invalid"), /Invalid branch/);
   console.log(
     "PASS: symbolic or invalid local refs cannot redirect merge or deletion",

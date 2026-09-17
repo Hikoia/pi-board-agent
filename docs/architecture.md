@@ -61,8 +61,8 @@ entry point. Boolean shape validation and unknown-key rejection are unchanged.
 Startup (explicit, automatic, recovery), lint and cached-loop promotion validate
 current config plus metadata for enabled lanes before admission. Status and Type
 must be single-select; Plan must be text or single-select. Task is always needed;
-Story and Needs Design are needed when refinement is enabled. Backlog is not an
-automatic lane requirement. An unrefined/partial Story checks its own select Plan
+Story and Needs Design are needed when refinement is enabled. The configured
+Backlog option is always required for closed-Issue completion. An unrefined/partial Story checks its own select Plan
 option before claim/model/publication, and creation rechecks independently.
 Plan text uses `setTextField`; select Plan resolves the existing option ID with
 `setSingleSelect`. Plan/Type are verified before child Ready publication.
@@ -116,7 +116,7 @@ storage. One manager with one agent owns each persistent ticket worktree.
 reject unsupported state read-only
   → list/hydrate all Project items
   → reconcile persisted ticket runs and launch windows
-  → finalize eligible closed Done Tasks (also in recovery-only mode)
+  → finalize/backlog eligible closed Done Issues (also in recovery-only mode)
   → check pinned revision, admissions, and main-checkout cleanliness
   → reserve one slot if primary foreground work is pending and capacity exists
   → pre-fill remaining capacity with Ready Task builders
@@ -302,49 +302,56 @@ that the latest main/base has been integrated and passed integration tests.
 Repair evidence covers its specified base and result, not later base advances;
 normal merges have no blanket integration test gate.
 
-## Local-branch finalization
+## Closed-Issue finalization
 
-Before per-card finalization, the loop queries local task refs once per tick
-with closed-Done target Task candidates. Exact full local branch names are a
-**negative-only filter**: absence defers a candidate only if no cleanup receipt
-remains; presence never approves integration. A newly created branch can wait
-until the next tick; a vanished branch or changed approval is caught by fresh
-checks. A failed refs query warns/blocks this lane, not an empty-success result.
-Unsettled records and repair handoffs reconcile independently without a branch;
-no general persistent completed-ticket table is added.
+Every closed Done Issue in the configured repository is a candidate, regardless
+of Type or Plan. PRs, drafts, foreign repositories, open Issues and other lanes
+are excluded. No local-ref negative filter or permanent completion cache is used.
 
-For a fresh, closed Done Task in the origin repository:
+1. Freshly validate item/repository/issue number, closed and Done. Pending repair
+   handoffs and execution state retain recovery authority. A cleanup receipt
+   reconfirms its remote base result and runs cleanup-only, even without refs.
+2. Inspect exact local and origin `<task_prefix>issue-<number>` refs. Async remote
+   query failures are not absence. With neither ref and no pending recovery, a
+   historical ticket needs no past merge proof: leave residual files/worktrees
+   and idle records untouched and proceed only to the board move below.
+3. Otherwise require existing ownership/clean/lock checks. Fetch base and remote
+   task objects and verify the observed SHA. Remote-only uses compare-and-create
+   to restore the local ref, never a builder/worktree or a competing local ref.
+4. Ancestor-related sources use the encompassing tip; divergent sources use
+   `merge-tree` and a temporary two-parent `commit-tree`. Integrate that source
+   into latest origin/base. Neither task branch tip, index nor checkout is changed.
+   Merge retains both histories; squash retains combined content. Merge retries
+   check original source ancestry, squash retries use resulting tree equality.
+   Source conflicts and non-Task conflicts stay closed Done for manual resolution;
+   only original Task ownership/SHA conditions permit the existing repair handoff.
+5. Push normally, verify remote base and unchanged source refs, then publish the
+   late cleanup receipt. Delete remote via exact lease, remove only verified
+   managed worktree/metadata, recheck base and remote absence, then delete local
+   ref with expected SHA, record and receipt last. Failures preserve retry evidence.
+6. Recheck absent refs, recovery state and fresh closed Done card before writing
+   configured Backlog. Confirm the write before updating this tick's snapshot and
+   reporting `finalized` (Git cleanup) or `backlogged` (no-branch history). Both
+   clear blockers. The Issue stays closed; no comment, archive or reopen is added.
 
-1. A pending cleanup receipt takes precedence: reconfirm its result on remote
-   base and perform only checked cleanup. Otherwise derive `task/issue-<number>`
-   using the configured prefix. An absent local branch means no finalizer work:
-   no remote lookup or leftover-file deletion; Git errors are not absence.
-2. Refuse active builders and unsafe registered task worktrees. Ordinary
-   integration needs no Plan, review marker, checked-out/pushed branch or record;
-   any managed directory being removed does require matching recorded ownership.
-3. Fetch `origin/<base>` and use native `git merge-tree` / `git commit-tree`
-   to merge or squash the local tip, leaving the main checkout untouched.
-   A verified conflict can enter the separately guarded repair handoff above.
-4. Push normally and fetch again to verify remote integration. Only once
-   destructive preconditions are ready, publish a late cleanup receipt.
-5. Delete only an integrated remote task ref with an exact deletion lease, then
-   remove managed directories and related Git metadata under receipt checks.
-   Reconfirm remote base integration and remote-task absence; delete the local
-   ref with its expected SHA, then the exact record, then the receipt last.
-
-A receipt survives failures, including after local-ref/record deletion, and
-bypasses the no-ref filter on retry. Without one, existing merge ancestry or
-unchanged squash result tree can prove prior integration; uncertainty preserves
-work rather than forcing cleanup. `Plan` and `reviewedTaskSha` remain build/review
-metadata, not ordinary completion gates. Story completion still checks its
-children are closed Done with no local task branch; it is not a cleanup-receipt
-or integration-test audit.
+If cleanup succeeds but the board write fails, the next tick takes the historical
+path without reintegration. A lost successful response is not repeated once
+Backlog is observed. Reopen/lane/identity/removal changes abort writeback. Stop
+blocks new candidates while already-started Git cleanup drains normally.
+Closed Backlog idle records are retained without per-ticket reconcile reads,
+unless recovery remains. Story completion requires all journaled children still
+exist, closed Done/Backlog, no local/origin task refs and no pending recovery;
+Plan summaries count closed Backlog as complete, never open Backlog.
 
 ### Late destructive cleanup receipts
 
-Strict v1 receipts in `.pi/board-agent/cleanup/<safe-item-id>.json` are separate
-from unchanged v3 records, **not an early merge intent**. They bind ticket,
-branches, original task/result SHAs, exact record bytes/hash, managed path and
+New strict v2 receipts in `.pi/board-agent/cleanup/<safe-item-id>.json` add
+`remoteTaskSha: string | null` for the integrated origin source. `taskSha` remains
+the original local ref/worktree SHA. A changed/new remote ref blocks cleanup;
+deletion uses the recorded exact lease. Existing strict v1 receipts retain their
+original ancestry/deletion rules and recover in place, never auto-rewritten.
+Receipts are separate from unchanged v3 records, **not an early merge intent**.
+They bind ticket, branches, original task/result SHAs, exact record bytes/hash, managed path and
 Git common-directory identities, directory ancestors and relative entry
 snapshots. Asynchronous non-following traversal includes ignored files and
 empty directories; entries record type, identity, size/content hash or symlink

@@ -220,6 +220,14 @@ export class ConflictRecovery {
       .filter((n) => n.endsWith(".json"))
       .map((n) => this.read(n.slice(0, -5))!);
   }
+  hasPending(itemId: string): boolean {
+    return this.all().some(
+      (h) =>
+        h.card.itemId === itemId &&
+        (h.step !== "consumed" || (h.notice !== null && h.notice.id === null)),
+    );
+  }
+
   private save(h: Handoff, previous?: Handoff): void {
     const path = this.file(h.request.requestKey);
     this.safePath(path);
@@ -484,6 +492,43 @@ export class ConflictRecovery {
     } catch (error) {
       if (error instanceof HandoffChanged) this.change(h, { step: "blocked" });
       throw error;
+    }
+  }
+
+  async resumeClosed(
+    itemId: string,
+    canWork: () => boolean | Promise<boolean>,
+    canNow: () => boolean,
+  ): Promise<
+    | RepairBlocker
+    | { status: "skipped"; repair: RepairRequest; reason: string }
+    | undefined
+  > {
+    if (!this.hasPending(itemId)) return undefined;
+    const pending = this.all().filter(
+      (h) => h.card.itemId === itemId && h.step !== "consumed",
+    );
+    const h = pending[0];
+    try {
+      if (
+        pending.length !== 1 ||
+        !["comment", "ready", "reopen", "queue"].includes(h.step)
+      )
+        throw new Error(
+          "Repair handoff is pending; recover it before finalization.",
+        );
+      await this.progress(h, canWork, canNow);
+      return {
+        status: "skipped",
+        repair: h.request,
+        reason: "Conflict repair queued for the existing Ready scheduler.",
+      };
+    } catch (error) {
+      return {
+        status: "blocked",
+        repair: h?.request,
+        reason: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 
@@ -771,7 +816,7 @@ export class ConflictRecovery {
     if (h?.step === "launching")
       this.change(h, { step: "consumed", runId: record.activeRunId ?? null });
   }
-  bind(record: TicketExecutionRecord, runId: string, args: unknown): void {
+  bind(_record: TicketExecutionRecord, runId: string, args: unknown): void {
     const repair = (args as { repair?: RepairRequest } | undefined)?.repair;
     if (!repair?.requestKey.startsWith("conflict-")) return;
     const h = this.readIfConflict(repair);

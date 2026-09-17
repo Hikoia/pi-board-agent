@@ -1505,8 +1505,12 @@ async function finalFixture(
   );
   assert.deepEqual(await f.make().finalizeClosed(f.card), {
     status: "skipped",
-    reason: "no local task branch",
+    reason: "ticket is no longer closed and Done",
   });
+  assert.equal(
+    f.finalBoard.cards.get(f.card.itemId)!.status,
+    cfg.columns.backlog,
+  );
   f.assertNoAdmissions();
   console.log(
     "PASS: Done + Closed finalizes a local-only branch without Plan or execution metadata",
@@ -1526,7 +1530,7 @@ async function finalFixture(
   mkdirSync(f.record.path);
   writeFileSync(join(f.record.path, "leftover.txt"), "do not delete\n");
   const before = f.finalBoard.all();
-  // Remote branch and stale record still exist; neither is needed to settle.
+  // Remote branch and stale record still exist; unavailable origin must block.
   git(
     f.checkout,
     "remote",
@@ -1553,12 +1557,9 @@ async function finalFixture(
       f.store,
     );
     await loop.tickNow();
-    assert.deepEqual(await actual.finalizeClosed(f.card), {
-      status: "skipped",
-      reason: "no local task branch",
-    });
+    assert.equal((await actual.finalizeClosed(f.card)).status, "blocked");
   }
-  assert.deepEqual(f.notifications, []);
+  assert.ok(f.notifications.every((n) => n.level === "warn"));
   assert.deepEqual(f.finalBoard.all(), before);
   assert.equal(
     readFileSync(join(f.record.path, "leftover.txt"), "utf8"),
@@ -1567,7 +1568,7 @@ async function finalFixture(
   assert.ok(f.store.has(f.card.itemId));
   f.assertNoAdmissions();
   console.log(
-    "PASS: no local task branch settles silently offline, regardless of Plan, stale records or remote/worktree leftovers",
+    "PASS: missing local ref never hides remote-query failure; idle record and residual files are preserved",
   );
 }
 
@@ -1629,8 +1630,12 @@ for (const strategy of ["squash", "merge"] as const) {
   assert.equal(f.tip(), result);
   assert.deepEqual(await f.make().finalizeClosed(f.card), {
     status: "skipped",
-    reason: "no local task branch",
+    reason: "ticket is no longer closed and Done",
   });
+  assert.equal(
+    f.finalBoard.cards.get(f.card.itemId)!.status,
+    cfg.columns.backlog,
+  );
   assert.equal(
     git(
       f.checkout,
@@ -1644,7 +1649,7 @@ for (const strategy of ["squash", "merge"] as const) {
   );
   assert.deepEqual(f.notifications, [
     {
-      message: `Finalized #${f.card.number} "${f.card.title}" at ${result} in main. Deleted local/remote branch ${f.record.taskBranch} and removed its worktree.`,
+      message: `Finalized #${f.card.number} "${f.card.title}" at ${result} in main. Deleted local/remote branch ${f.record.taskBranch} and removed its worktree → ${cfg.columns.backlog}.`,
       level: "info",
     },
   ]);
@@ -1662,7 +1667,6 @@ for (const strategy of ["squash", "merge"] as const) {
     { status: cfg.columns.ready },
     { number: 9999 },
     { itemId: "DIFFERENT" },
-    { type: "Story" },
     { contentType: "PullRequest" },
     { contentType: "DraftIssue" },
     { repoOwner: "other" },
@@ -1783,7 +1787,7 @@ for (const strategy of ["squash", "merge"] as const) {
   assert.equal(existsSync(f.record.path), false);
   assert.deepEqual(await restarted.finalizeClosed(f.card), {
     status: "skipped",
-    reason: "no local task branch",
+    reason: "ticket is no longer closed and Done",
   });
   assert.equal(f.notifications.length, 1);
   f.assertNoAdmissions();

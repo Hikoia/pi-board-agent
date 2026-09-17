@@ -27,28 +27,34 @@ Task Ready
   → optional detached AI review, or manual validation
   → Done (still unmerged; worktree retained)
   → human closes the Issue
-  → no local task branch and no cleanup receipt? finalizer has no work
-  → otherwise merge/squash into branches.base (main by default), or resume cleanup
+  → inspect exact local + origin task refs (all Issue Types)
+  → neither ref and no pending recovery? move directly to Backlog, keep leftovers
+  → otherwise integrate both sources into branches.base, or resume cleanup
   → push and verify origin/base before publishing a cleanup receipt
   → delete remote branch, worktree, local task branch, record, then receipt
+  → recheck the closed Done card and absent refs → Backlog (Issue stays closed)
 ```
 
 `Plan` is required to claim/build a ticket, not for ordinary finalization. A
-closed `Done` Task needs no execution record or review marker to integrate its
-local branch. If both its local `task/issue-<number>` branch and cleanup receipt
-are absent, the finalizer does not query remote branches or delete leftover
-files. A pending receipt still retries cleanup without that branch; repair
-handoff requires the matching original record and Plan.
+closed `Done` Issue of any Type (including unset) needs no execution record or
+review marker to integrate its exact `<task_prefix>issue-<number>` local and
+origin branches. Remote-only refs are restored without creating a builder or
+worktree; divergent commits are combined without changing the task checkout.
+If both refs are absent and no recovery is pending, historical tickets move to
+Backlog on the next tick without requiring past merge proof or deleting residual
+files/idle records. Pending executions, receipts and repair handoffs take
+precedence. Closed Backlog is complete for Story/Plan accounting, never new work;
+idle historical records are no longer polled per ticket. Open Backlog is not complete.
 
 `Needs Design` accepts decisions only from repository `OWNER`, `MEMBER`, or
 `COLLABORATOR` comments. `Needs Human` is terminal until a human fixes the
 reported blocker and moves the card back to `Ready`.
 
 Only open GitHub **Issues** from the repository configured by `origin` can
-enter refinement, building, or review. Closed `Done` Task Issues may finalize
-or enter the guarded conflict handoff below; a closed Issue never launches a
-builder. Pull requests, draft Project items, cross-repository Issues, and cards
-without the exact configured `Type` (`Story` or `Task`) are never mutated.
+enter refinement, building, or review, with the matching `Story`/`Task` Type.
+Closed `Done` Issues of any Type may finalize; only Tasks may enter the guarded
+conflict handoff below. A closed Issue never launches a builder. Pull requests,
+draft Project items and cross-repository Issues are never mutated.
 
 ## Requirements
 
@@ -168,8 +174,8 @@ uses `project.owner`; Issue reads and mutations always use the repository
 parsed from `git remote get-url origin`.
 
 AI review is disabled by default. Validate the retained worktree, move the Task
-to `Done`, then close its Issue to approve integration of its current local task
-branch, including committed changes not yet pushed. Set `review.enabled: true`
+to `Done`, then close its Issue to approve integration of both local and origin
+task branches, including committed changes not yet pushed. Set `review.enabled: true`
 for automated `Review` → `Done`. Finalization itself does not require an AI
 review record; closing the Done Issue is the human approval. Ordinary Review
 is not proof that the latest main/base has been integrated and passed integration
@@ -194,7 +200,7 @@ associated runs reserve capacity even when not known to be running. The widget
 separates **slots occupied** from **models running**; it is an observation, not
 an admission or recovery authority.
 
-Each tick reconciles builders and finalizes closed Done Tasks first. With
+Each tick reconciles builders and finalizes closed Done Issues first. With
 capacity, it reserves one primary foreground slot, pre-fills other slots with
 Ready builders, then invokes at most one primary model in Task design → Story
 refine → Review priority. Waiting/non-model actions can fall through. It
@@ -227,7 +233,8 @@ non-production compatibility pointer.
 ## Conflict repair and renewed approval
 
 A positively verified merge conflict pushes no integration result and performs
-no cleanup. With the matching idle original record, Plan, clean worktree and
+no cleanup. Divergent-source conflicts and non-Task conflicts stay closed Done
+for manual resolution. Only a Task with the matching idle original record, Plan, clean worktree and
 local/remote task SHA, Board Agent freshly checks identity, branch ownership,
 human lane/claim and revision before automatically moving the card to `Ready`
 and reopening the Issue. Other Git failures or unprovable ownership block and
@@ -272,15 +279,18 @@ reopen/Ready retry uses the ordinary builder flow.
 - AI review never runs in the main checkout. It uses a detached, disposable
   managed worktree pinned to the first fresh post-claim `origin/task` SHA.
 - Review PASS persists that exact SHA before exposing `Done`.
-- Finalization merges the local task branch into the fresh remote base without
-  modifying the main checkout. It verifies the normal, non-force push before
+- Finalization integrates both exact local/origin task sources into the fresh
+  remote base without modifying the main or task checkout/index. It verifies the normal, non-force push before
   cleanup. A late destructive cleanup receipt, not an early merge intent, keeps
   retries possible even after the local branch has been deleted.
 - Active builders, dirty/locked/unmanaged registered task worktrees, failed
   pushes and concurrent ref changes prevent unsafe cleanup. Remote-only commits
   are never discarded. These blockers leave the card `Done`; a verified conflict
   may instead use the guarded repair/reapproval cycle above.
-- Cleanup receipts bind the confirmed result and task SHAs, record/path and Git
+- New v2 cleanup receipts bind the confirmed result, local `taskSha` and
+  `remoteTaskSha` (or null); remote deletion uses that exact SHA lease. Strict v1
+  receipts still recover cleanup-only under their original rules, without rewriting
+  evidence. Execution records remain v3. Receipts also bind record/path and Git
   ownership, directory identities, and relative file types/sizes/hashes or link
   targets, including ignored files. Registered worktrees use normal Git removal;
   after registration is gone, only rechecked matching leftovers are removed
@@ -290,12 +300,12 @@ reopen/Ready retry uses the ordinary builder flow.
 - Failed fresh reads never fall back to board snapshots for mutation authority.
   Failed assignee release is surfaced; unsettled execution associations and
   journals remain available for retry instead of being cleared as success.
-- Closed-Done candidates use one per-tick local task-ref query as a **negative
-  filter only**. Absent branches defer without per-card remote reads unless a
-  cleanup receipt remains; present branches still undergo fresh approval/ref/
-  worktree checks. Query failure warns and blocks that lane, never means “all
-  absent.” Unsettled records and repair handoffs still reconcile independently;
-  no general persistent completion cache is created.
+- Closed-Done candidates re-read card identity/state and exact local/origin refs.
+  Remote queries use the async runner; failures never mean absence. After cleanup,
+  refs and card are rechecked before Backlog, and only confirmed writes update the
+  snapshot/report success. Failed writes retry as no-branch history; a lost success
+  response stops retrying once Backlog is observed. Reopened/moved/replaced/removed
+  cards are not overwritten. No completion record or permanent cache is added.
 - Identical per-ticket finalization/repair blockers warn once per loop lifetime;
   checks and safe retries still run every tick. Changed reasons/SHAs, recovery,
   a different ticket or restart can warn again. Notification deduplication is

@@ -274,6 +274,7 @@ export function validateProjectMetadata(
       `Project Status field '${cfg.status_field}' is required and must be SINGLE_SELECT.`,
     );
   validateStatusOptions(meta, [
+    cfg.columns.backlog,
     cfg.columns.ready,
     cfg.columns.building,
     cfg.columns.review,
@@ -1157,21 +1158,36 @@ export async function createComment(
 }
 
 /** Edit only a known issue comment; callers must verify actual author and data. */
-export async function updateIssueComment(id: string, body: string): Promise<void> {
-  requiredString(id, "comment id"); requiredString(body, "comment body");
-  const data = await graphql<any>(`mutation($id: ID!, $body: String!) {
+export async function updateIssueComment(
+  id: string,
+  body: string,
+): Promise<void> {
+  requiredString(id, "comment id");
+  requiredString(body, "comment body");
+  const data = await graphql<any>(
+    `mutation($id: ID!, $body: String!) {
     updateIssueComment(input: { id: $id, body: $body }) { issueComment { id } }
-  }`, { id, body });
-  if (data?.updateIssueComment?.issueComment?.id !== id) throw new Error("GitHub returned mismatched updated comment id.");
+  }`,
+    { id, body },
+  );
+  if (data?.updateIssueComment?.issueComment?.id !== id)
+    throw new Error("GitHub returned mismatched updated comment id.");
 }
 
 /** Reopening is a handoff write, never approval or a builder launch. */
 export async function reopenIssue(issueId: string): Promise<void> {
   requiredString(issueId, "issue id");
-  const data = await graphql<any>(`mutation($id: ID!) {
+  const data = await graphql<any>(
+    `mutation($id: ID!) {
     reopenIssue(input: { issueId: $id }) { issue { id closed } }
-  }`, { id: issueId });
-  if (data?.reopenIssue?.issue?.id !== issueId || data.reopenIssue.issue.closed !== false) throw new Error("GitHub returned unconfirmed issue reopen.");
+  }`,
+    { id: issueId },
+  );
+  if (
+    data?.reopenIssue?.issue?.id !== issueId ||
+    data.reopenIssue.issue.closed !== false
+  )
+    throw new Error("GitHub returned unconfirmed issue reopen.");
 }
 
 export interface IssueComment {

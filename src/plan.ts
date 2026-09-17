@@ -39,7 +39,11 @@ export function summarizePlans(
     summary.totalCards++;
     summary.cards.push(card);
     const status = (card.status ?? "").toLowerCase();
-    if (status === cfg.columns.done.toLowerCase()) summary.doneCards++;
+    if (
+      status === cfg.columns.done.toLowerCase() ||
+      (card.closed && status === cfg.columns.backlog.toLowerCase())
+    )
+      summary.doneCards++;
     else if (status === cfg.columns.ready.toLowerCase()) summary.readyCards++;
     else if (status === cfg.columns.building.toLowerCase())
       summary.buildingCards++;

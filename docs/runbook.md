@@ -45,12 +45,14 @@ releases warn on failure. A green-looking UI is not permission to clear evidence
 
 Runtime network Git and package-revision checks use the async deadline runner;
 Git writes remain ordered and small synchronous local/context probes remain.
-No speed/cost claim follows from this. Closed-Done history uses one local-ref
-query per eligible tick as a negative filter only; presence still needs fresh
-approval/ref/worktree checks. Failure warns/blocks finalization, not “all absent.”
-A branch created after the snapshot may wait one tick; unsettled records and
-repair handoffs still reconcile independently. Pending cleanup receipts bypass
-the no-local-ref filter, including after record/ref deletion has already succeeded.
+No speed/cost claim follows from this. Closed-Done Issues of every Type are
+freshly checked against exact local/origin task refs. Query failures block, never
+mean absence. Existing execution, receipt and repair recovery takes precedence.
+With neither ref and no pending recovery, historical tickets move directly to
+configured Backlog, leaving all residual files and idle records untouched. No
+migration command or toggle is needed: the next normal tick handles history.
+Closed Backlog is complete for Story/Plan accounting and does not launch work;
+idle historical records stop per-ticket polling. Open Backlog is not complete.
 Identical per-ticket finalization/repair blockers warn once per loop lifetime,
 not once per attempt: checks and safe retries still run every tick. A changed
 reason/SHA, recovery, different ticket or restart can warn again. Silence does
@@ -62,9 +64,9 @@ Startup, lint and promotion from recovery to autonomous mode check current
 config and enabled-lane metadata before admitting work:
 
 - Status and Type must be single-select; Plan must be text or single-select.
-- Ready, In Progress, Review, Done, Needs Human and Type `Task` are required.
+- Backlog, Ready, In Progress, Review, Done, Needs Human and Type `Task` are required
+  (using the configured option names).
 - With refinement enabled, Needs Design and Type `Story` are required too.
-  Backlog is recommended for manual holds but is not an automatic lane gate.
 - Each unrefined/partial Story needs its Plan option to exist before claim,
   model or child work. Text Plan writes text; select Plan uses its existing
   option ID. Child creation independently checks metadata and publishes Ready
@@ -82,8 +84,9 @@ Remove deprecated `safety.skip_closed_issues` from both
 remain boolean-compatible but both emit a file-specific warning through
 startup/config commands, including shadowed global values. Absence/defaults
 stay quiet; invalid booleans and unknown keys still fail. Closed Issues never
-start builders/design regardless of this key. A closed Done Task may finalize
-or enter conflict handoff; it must be confirmed reopened before builder admission.
+start builders/design regardless of this key. A closed Done Issue of any Type
+may finalize/backlog; only Tasks may enter conflict handoff and must be confirmed
+reopened before builder admission.
 
 ## Story scope and builder context
 
@@ -292,8 +295,10 @@ is permission to discard this evidence.
 | Message / state | Automation behavior | Required human action |
 | --- | --- | --- |
 | `Unsupported pre-0.2.0 Board Agent state detected` | Startup/lint/run stop read-only | Stop Pi, back up the listed paths and refs, finish/preserve old work, then remove or deliberately migrate each listed artifact. |
-| Closed `Done`, neither local task branch nor cleanup receipt | Finalizer has no work; no remote queries or leftover-file deletion | Do not delete unknown residuals just to match the UI. Unsettled records/repair ledgers reconcile independently; a remote-only branch does not trigger finalization. |
-| Closed `Done`, local task branch exists | Ordinary merge into fresh `origin/<base>`, push/verify, receipt, then checked cleanup; no Plan, execution record or AI-review marker required for integration | Validate current local commits before closure. Local-only branches are supported; automatic conflict handoff separately requires the original record, Plan and matching pushed task SHA. |
+| Closed `Done`, neither local nor origin task ref and no pending recovery | Move to configured Backlog, keep Issue closed; no merge proof or leftover deletion | No action required. Unknown residuals and idle execution records remain untouched, not cleanup-authorized. |
+| Closed `Done`, either/both exact task refs exist | Integrate all source changes into latest `origin/<base>`, push/verify, v2 receipt, checked cleanup, then Backlog | Validate both local and remote commits before closure. Remote-only restores the local ref by compare-and-create; divergence uses temporary merge objects without modifying the task checkout/index. |
+| Git cleanup succeeded, Backlog write failed | Next tick retries the no-branch board move without another merge | Fix board permissions/connectivity. If the write succeeded but its reply was lost, observing Backlog stops retries; no duplicate success notice. |
+| Reopened, moved, replaced or removed before Backlog write | Fresh card check prevents overwriting the manual change | Preserve the human decision; no automatic reopen/comment/archive is performed. |
 | Pending cleanup receipt, even without local ref/record | Reconfirms remote integration and retries only receipted cleanup | Preserve receipt and any backup. Do not recreate a branch/worktree or relaunch a builder to make cleanup retry. |
 | `In Progress` without a valid v3 record | That card moves to `Needs Human`; siblings continue | Inspect Issue history and branches. Restore a verified record/worktree from backup or restart intentionally from `Ready`. |
 | Missing WorkflowManager run or mismatched persisted args | Stops/quarantines only that ticket | Preserve the worktree, inspect the run journal and record, then move to `Ready` only when ownership and intended diff are known. |
@@ -320,7 +325,7 @@ is permission to discard this evidence.
 | Could not pause workflow runs / cleanup incomplete during stop | Loop, managers and owner lock remain held; restart/admission blocked | Inspect the named managers/leases, then retry `/board-agent stop`. Coordinate deliberate process termination only if cleanup cannot be recovered; a stopped heartbeat is not proof of successful shutdown. |
 | Fresh read fails or item disappears | No snapshot-authorized mutation; missing items use orphan recovery | Preserve record/worktree/journal evidence and investigate remote identity/access. Retry fresh observation; do not substitute an old card dump. |
 | Assignee release fails after terminal comment/status | Execution association stays unsettled; settlement retries without a new builder | Repair access/ownership and let reconciliation finish. Do not delete the association because the card already looks terminal. |
-| Closed-Done local refs query fails | Warns and skips this finalization lane, retaining work | Resolve the Git failure and retry; do not treat it as confirmation that all tasks are settled. |
+| Closed-Done local/origin ref query fails | Warns and blocks that candidate, retaining work and Done | Resolve the Git failure and retry; unknown is never absence. |
 | Truncated Story creation journal | Affected Story cannot publish or complete; healthy updates continue durably | Follow the exact-byte journal recovery procedure below; keep both files. |
 
 ## Truncated Story journal recovery
@@ -372,16 +377,18 @@ git -C <worktree> rev-parse HEAD
 git -C <repo> ls-remote origin refs/heads/<task-branch> refs/heads/<base>
 ```
 
-Done + closed approves committed work on the current local task branch.
-The remote task branch may be absent or behind it. Registered task worktrees
-must be clean; remote-only commits and concurrent ref changes prevent deletion.
+Done + closed approves committed work on both exact local and origin task refs.
+Either may be absent/ahead, or the sources may diverge. Merge preserves both
+histories; squash preserves combined content. Registered task worktrees must be
+clean; source conflicts and concurrent ref changes prevent cleanup/Backlog.
 Stop the owner before manually resolving completed-ticket branches. Never
 force-push the base as a recovery shortcut.
 
 ## Conflict repair and reapproval
 
-Only a positively verified merge-tree conflict can initiate automatic repair.
-The original idle v3 record, Plan, task branch/worktree, exact local/remote task
+Only a Task's positively verified base merge-tree conflict can initiate automatic
+repair. Divergent-source conflicts and non-Task conflicts stay closed Done for
+manual resolution. The original idle v3 record, Plan, task branch/worktree, exact local/remote task
 SHA, fresh base SHA, identity, ownership, revision and stop gates must still
 match; another builder or a cleanup receipt blocks handoff. A failed fetch,
 permission error, timeout or unrelated history is not a conflict request.
@@ -432,8 +439,13 @@ test gate and still requires human approval of the current task commits.
 
 A late destructive receipt in `.pi/board-agent/cleanup/` is written only after
 remote base integration is confirmed and destructive preconditions are ready;
-it is **not an early merge intent**. Its strict versioned data binds ticket,
-branches, task/result SHAs, exact record, managed paths/Git ownership, directory
+it is **not an early merge intent**. New v2 receipts add `remoteTaskSha` (SHA or
+null), while `taskSha` still binds the original local ref/worktree. Both source
+refs must remain unchanged before publication. A changed/new remote ref blocks
+cleanup; deletion uses the exact recorded SHA lease. Existing strict v1 receipts
+resume cleanup-only in place under their original rules, without upgrading the
+evidence. Execution records remain v3. Receipt data binds ticket, branches,
+task/result SHAs, exact record, managed paths/Git ownership, directory
 identities and relative entries (type, size, content hash or symlink target),
 including ignored files. Symlink targets are recorded, not traversed or deleted.
 Ordinary dependency lockfiles (`node_modules/uri-js/yarn.lock`, `Cargo.lock`) and
