@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { checkOperation, type OperationControl } from "./operation.js";
 import { isTargetIssue, type Card } from "./gh.js";
 import {
   TicketWorktrees,
@@ -116,11 +117,15 @@ export async function settleTicketWrite(
   board: TicketWriteBoard,
   botLogin: string,
   drain: () => Promise<void> = async () => {},
+  control?: OperationControl,
 ): Promise<"settled" | "withdrawn"> {
+  checkOperation(control);
   const write = pendingTicketWrite(record);
   if (!write) throw new Error("No pending ticket writeback.");
+  const technical = write.card.closed && ["integrate", "cleanup"].includes(record.retry!.stage);
   await drain();
   const sameRecord = () => {
+    checkOperation(control);
     if (JSON.stringify(store.read(record.itemId)) !== JSON.stringify(record))
       throw new Error("Ticket record changed during writeback.");
     // Conflict reopening must retain exclusive branch/path ownership across
@@ -157,7 +162,7 @@ export async function settleTicketWrite(
     target(card) &&
     sameTicketContract(card, write.card) &&
     card.assignees.every((a) => a.toLowerCase() === botLogin.toLowerCase()) &&
-    (hasBot(card) || card.status === write.status) &&
+    (technical || hasBot(card) || card.status === write.status) &&
     (card.status === write.card.status || card.status === write.status) &&
     (card.closed === write.card.closed ||
       (write.reopen === true && card.closed === false));
@@ -169,7 +174,7 @@ export async function settleTicketWrite(
       activeRunStartedAt: undefined,
       lastRunId: current.activeRunId ?? current.lastRunId,
       retry:
-        !withdrawn && write.retry
+        technical || (!withdrawn && write.retry)
           ? { stage: current.retry!.stage, reason: write.reason }
           : undefined,
     }));
@@ -183,6 +188,19 @@ export async function settleTicketWrite(
   };
   let card = await guard();
   if (!card) return "withdrawn";
+  if (technical) {
+    // Old versions queued Ready/comment writes for pure I/O failures. Never
+    // replay those writes, but retain the retry after guarded claim release.
+    if (hasBot(card)) {
+      await board.release(card);
+      card = await guard();
+      if (!card) return "withdrawn";
+      if (hasBot(card)) throw new Error("Claim release is not yet observed.");
+    }
+    sameRecord();
+    finish();
+    return "settled";
+  }
   if (write.comment) {
     const marker = `<!-- board-agent-write:${record.itemId}:${createHash(
       "sha256",

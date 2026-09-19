@@ -1,5 +1,6 @@
 // Offline GH boundary + real loop/executor/WorkflowManager and disposable local Git.
 import assert from "node:assert/strict";
+import { settledTicks } from "./async-loop-fixture.js";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -213,6 +214,7 @@ export async function fixture(conflict = true) {
       executor,
       new TicketWorktrees(repo),
     );
+    settledTicks(loop);
     return { loop, state, executor };
   };
   return {

@@ -32,6 +32,7 @@ import {
   type TicketExecutionRecord,
 } from "../src/ticket-worktree.js";
 import { buildTasksForWave } from "../src/workflow-prompt.js";
+import { settledTicks } from "./async-loop-fixture.js";
 
 const fail = (message: string) => {
   process.exitCode = 1;
@@ -1551,22 +1552,22 @@ async function finalFixture(strategy: "merge" | "squash" = "merge") {
     f.make(),
     f.store,
   );
+  settledTicks(loop);
   await loop.tickNow();
-  assert.equal(
-    f.tip(),
-    f.baseSha,
-    "Missing record never grants integration permission.",
-  );
-  assert.equal(f.store.localBranchSha(f.record.taskBranch), f.taskSha);
-  const result = await f.make().finalizeClosed(f.card);
-  assert.equal(result.status, "blocked");
-  assert.match(
-    result.status === "blocked" ? result.reason : "",
-    /Missing execution record/,
-  );
+  const result = f.tip();
+  assert.notEqual(result, f.baseSha);
+  git(f.checkout, "merge-base", "--is-ancestor", f.taskSha, result);
+  assert.equal(git(f.checkout, "show", `${result}:accepted.txt`), "approved exact content");
+  assert.equal(git(f.checkout, "rev-parse", "HEAD"), f.baseSha);
+  assert.equal(f.store.localBranchSha(f.record.taskBranch), undefined);
+  assert.equal(f.store.has(f.card.itemId), false);
+  assert.equal(existsSync(f.record.path), false);
+  assert.equal(f.finalBoard.cards.get(f.card.itemId)!.status, cfg.columns.backlog);
+  assert.equal(f.finalBoard.cards.get(f.card.itemId)!.closed, true);
   f.assertNoAdmissions();
+  await loop.stop();
   console.log(
-    "PASS: closed Done retains a local-only branch with missing review/execution ownership rather than guessing approval",
+    "PASS: fresh closed Done approves a safe recordless local ref without Plan/review evidence, builder or worktree recreation",
   );
 }
 
@@ -1590,6 +1591,7 @@ async function finalFixture(strategy: "merge" | "squash" = "merge") {
     "origin",
     join(f.checkout, "unavailable.git"),
   );
+  const original = f.store.read(f.card.itemId);
   for (let restart = 0; restart < 2; restart++) {
     const actual = f.make();
     const loop = new BoardLoop(
@@ -1608,6 +1610,7 @@ async function finalFixture(strategy: "merge" | "squash" = "merge") {
       actual,
       f.store,
     );
+    settledTicks(loop);
     await loop.tickNow();
     assert.notEqual(
       (
@@ -1617,21 +1620,22 @@ async function finalFixture(strategy: "merge" | "squash" = "merge") {
       ).status,
       "finalized",
     );
+    await loop.stop();
   }
   assert.equal(f.finalBoard.cards.get(f.card.itemId)!.closed, true);
   assert.equal(
     f.finalBoard.cards.get(f.card.itemId)!.status,
-    cfg.columns.ready,
+    cfg.columns.done,
   );
-  assert.equal(f.store.read(f.card.itemId)!.retry?.stage, "integrate");
+  assert.deepEqual(f.store.read(f.card.itemId), original, "unknown sources cannot manufacture recovery ownership");
   assert.equal(
     readFileSync(join(f.record.path, "leftover.txt"), "utf8"),
     "do not delete\n",
   );
   assert.ok(f.store.has(f.card.itemId));
-  f.assertNoAdmissions(true);
+  f.assertNoAdmissions();
   console.log(
-    "PASS: missing task refs retain unknown residuals and unavailable remote proof as closed I/O retry",
+    "PASS: missing task refs retain unknown residuals and unavailable remote proof in closed Done",
   );
 }
 
@@ -1655,6 +1659,7 @@ for (const strategy of ["squash", "merge"] as const) {
     actual,
     f.store,
   );
+  settledTicks(loop);
   await loop.tickNow();
   const result = f.tip();
   assert.notEqual(
@@ -1691,10 +1696,8 @@ for (const strategy of ["squash", "merge"] as const) {
   await loop.tickNow();
   await loop.tickNow();
   assert.equal(f.tip(), result);
-  assert.deepEqual(await f.make().finalizeClosed(f.card), {
-    status: "skipped",
-    reason: "no local task branch",
-  });
+  assert.equal((await f.make().finalizeClosed((await f.finalBoard.getCard(f.card.itemId))!)).status, "skipped");
+  assert.equal(f.finalBoard.cards.get(f.card.itemId)!.status, cfg.columns.backlog);
   assert.equal(
     git(
       f.checkout,
@@ -1708,11 +1711,12 @@ for (const strategy of ["squash", "merge"] as const) {
   );
   assert.deepEqual(f.notifications, [
     {
-      message: `Finalized #${f.card.number} "${f.card.title}" at ${result} in main. Deleted local/remote branch ${f.record.taskBranch} and removed its worktree.`,
+      message: `Finalized #${f.card.number} "${f.card.title}" at ${result} in main. Deleted local/remote branch ${f.record.taskBranch} and removed its worktree → ${cfg.columns.backlog}.`,
       level: "info",
     },
   ]);
   f.assertNoAdmissions();
+  await loop.stop();
   console.log(
     `PASS: closed Done ${strategy === "squash" ? "legacy squash normalized to merge" : "merge"} E2E finalizes the exact SHA and notifies branch cleanup once; repeated ticks/restart are no-ops`,
   );
@@ -1787,16 +1791,16 @@ for (const strategy of ["squash", "merge"] as const) {
   git(f.record.path, "add", "local-only.txt");
   git(f.record.path, "commit", "-m", "local work after review");
   const localSha = git(f.record.path, "rev-parse", "HEAD");
-  assert.notEqual((await f.make().finalizeClosed(f.card)).status, "finalized");
-  assert.equal(f.tip(), f.baseSha);
-  assert.equal(f.store.localBranchSha(f.record.taskBranch), localSha);
-  assert.equal(
-    readFileSync(join(f.record.path, "local-only.txt"), "utf8"),
-    "latest local work\n",
-  );
-  f.assertNoAdmissions(true);
+  assert.equal((await f.make().finalizeClosed(f.card)).status, "finalized");
+  const result = f.tip();
+  git(f.checkout, "merge-base", "--is-ancestor", localSha, result);
+  git(f.checkout, "merge-base", "--is-ancestor", f.taskSha, result);
+  assert.equal(git(f.checkout, "show", `${result}:local-only.txt`), "latest local work");
+  assert.equal(f.store.localBranchSha(f.record.taskBranch), undefined);
+  assert.equal(f.tip(f.record.taskBranch), "");
+  f.assertNoAdmissions();
   console.log(
-    "PASS: closing Done cannot integrate unpushed local commits newer than the reviewed SHA",
+    "PASS: fresh closed Done preserves approved local-ahead work and remote ancestry without requiring an AI-review SHA",
   );
 }
 {
@@ -1849,7 +1853,9 @@ for (const strategy of ["squash", "merge"] as const) {
   );
   chmodSync(hook, 0o755);
   const first = await f.make().finalizeClosed(f.card);
-  assert.equal(first.status, "skipped");
+  assert.equal(first.status, "blocked");
+  assert.equal(f.finalBoard.cards.get(f.card.itemId)!.status, cfg.columns.done);
+  assert.equal(f.finalBoard.cards.get(f.card.itemId)!.closed, true);
   const published = f.tip();
   assert.notEqual(published, f.baseSha);
   assert.equal(f.store.localBranchSha(f.record.taskBranch), f.taskSha);
@@ -1877,14 +1883,11 @@ for (const strategy of ["squash", "merge"] as const) {
   assert.equal(f.tip(f.record.taskBranch), "");
   assert.equal(f.store.localBranchSha(f.record.taskBranch), undefined);
   assert.equal(existsSync(f.record.path), false);
-  assert.deepEqual(await restarted.finalizeClosed(f.card), {
-    status: "skipped",
-    reason: "no local task branch",
-  });
+  assert.equal((await restarted.finalizeClosed((await f.finalBoard.getCard(f.card.itemId))!)).status, "skipped");
   assert.equal(f.notifications.length, 1);
-  f.assertNoAdmissions(true);
+  f.assertNoAdmissions();
   console.log(
-    "PASS: cleanup failure retains integration/retry; closed Ready restart finishes without another merge or model",
+    "PASS: cleanup failure retains integration/retry and closed Done; restart finishes without another merge or model",
   );
 }
 {
@@ -1945,6 +1948,7 @@ for (const strategy of ["squash", "merge"] as const) {
     actual,
     f.store,
   );
+  settledTicks(loop);
   await loop.tickNow(); // T002 isolates v3 conversion failures per ticket instead of stopping all board reads.
   assert.equal(boardReads, 1);
   assert.equal(f.store.read(f.card.itemId), undefined);
@@ -1952,6 +1956,7 @@ for (const strategy of ["squash", "merge"] as const) {
   assert.equal(f.finalBoard.cards.get(f.card.itemId)!.status, cfg.columns.done);
   assert.equal(f.tip(), f.baseSha);
   f.assertNoAdmissions();
+  await loop.stop();
   console.log(
     "PASS: invalid mixed finalization/execution state stays read-only; no inferred builder ownership or automatic migration",
   );

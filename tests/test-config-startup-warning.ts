@@ -1,7 +1,8 @@
 // Execute registered production handlers with real config loading, not source-string wiring checks.
 import assert from "node:assert/strict";
+import { until } from "./async-loop-fixture.js";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -60,7 +61,14 @@ const events = new Map<string, Function>();
 let command!: (args: string, ctx: any) => Promise<void>;
 const messages: Array<{ message: string; level: string }> = [];
 const ctx = { cwd, hasUI: false, ui: { notify: (message: string, level: string) => messages.push({ message, level }) }, sessionManager: { getSessionId: () => "offline-config" } };
-const invoke = (name: string) => name === "session_start" ? events.get(name)!({}, ctx) : command(name, ctx);
+const invoke = async (name: string) => {
+  const path = join(cwd, ".pi", "board-agent", "runtime.json");
+  const runtime = () => existsSync(path) ? readFileSync(path, "utf8") : "";
+  const before = runtime();
+  await (name === "session_start" ? events.get(name)!({}, ctx) : command(name, ctx));
+  if (["session_start", "run"].includes(name))
+    await until(() => !!runtime() && runtime() !== before && JSON.parse(runtime()).state !== "starting");
+};
 try {
   (await import(entry)).default({ on: (name: string, handler: Function) => events.set(name, handler), registerCommand: (_name: string, options: any) => { command = options.handler; } });
   // auto_start reaches the shared startup loader too; explicit run exercises it directly.

@@ -90,7 +90,7 @@ try {
     await f.loop.tickNow();
     const result = f.recordNow().integration!.resultSha;
     assert.equal(f.tip(), result);
-    assert.equal(f.card.status, f.cfg.columns.ready);
+    assert.equal(f.card.status, f.cfg.columns.done);
     assert.equal(f.card.closed, true);
     assert.equal(existsSync(f.record.path), true);
     assert.equal(f.recordNow().retry?.stage, "integrate");
@@ -104,7 +104,7 @@ try {
     await f.loop.stop();
     f.noNewEvidence();
     console.log(
-      "PASS: accepted push/lost response resumes closed Ready by fresh integration proof, without another merge, push, builder or reviewer",
+      "PASS: accepted push/lost response preserves Done and resumes by fresh integration proof, without another merge, push, builder or reviewer",
     );
   }
   {

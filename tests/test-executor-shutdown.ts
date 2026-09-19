@@ -8,6 +8,7 @@ import { BoardLoop, createLoopState, type LoopDeps } from "../src/loop.js";
 import { acquireOwnerLock } from "../src/owner-lock.js";
 import { ManagedTicketExecutor, type TicketWorkflowManager } from "../src/ticket-executor.js";
 import { TicketWorktrees } from "../src/ticket-worktree.js";
+import { pendingTicketWrite } from "../src/ticket-retry.js";
 
 const cwd = process.env.TMP_DIR!;
 assert.ok(cwd, "Run via bash tests/run-offline.sh");
@@ -156,19 +157,24 @@ try {
   contextGate.resolve();
   await Promise.all([launching, stopped]);
   assert.equal(starts, 0, "a launch already awaiting context cannot start a builder while stopping");
-  assert.equal(worktrees.read(card.itemId)?.launchingAt, undefined);
-  assert.equal(card.status, cfg.columns.ready);
-  assert.deepEqual(card.assignees, []);
+  assert.ok(worktrees.read(card.itemId)?.launchingAt);
+  assert.ok(pendingTicketWrite(worktrees.read(card.itemId)!));
+  assert.equal(card.status, cfg.columns.building, "stop never writes a late Ready reset");
+  assert.deepEqual(card.assignees, ["bot"], "claim remains tied to durable pending settlement");
   assert.equal(existsSync(first.owner.path), false);
   const observations = [reads, claims, starts, resumes];
   await executor.launch(card, "demo");
   await executor.reconcile([card]);
   executor.activeCount();
   assert.deepEqual([reads, claims, starts, resumes], observations, "closed executor admits neither direct launch nor recovery");
-  console.log("PASS: stop closes an in-flight launch before manager start, safely cleans its claim/launch intent, and latches executor admission");
+  console.log("PASS: stop closes an in-flight launch before manager start, retains its pending reset without late status writes, and latches executor admission");
 
   context = async () => undefined;
   executor = makeExecutor();
+  assert.equal((await executor.reconcile([card])).errors, 0);
+  assert.equal(worktrees.read(card.itemId)?.launchingAt, undefined);
+  assert.equal(card.status, cfg.columns.ready);
+  assert.deepEqual(card.assignees, []);
   assert.equal((await executor.launch(card, "demo")).status, "launched");
   run!.status = "paused";
   const readEntered = deferred(), readGate = deferred();

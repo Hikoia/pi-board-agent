@@ -135,6 +135,12 @@ check(
   "stopped runtime is reported",
 );
 
+for (const state of ["starting", "stopping"]) {
+  healthy(); writeRuntime(projects[0], { state });
+  result = verify();
+  check(result.status === 1 && result.stdout.includes(state.toUpperCase()) && result.stdout.includes("not healthy running or evidence that ownership is available"), `${state} is observable but never healthy running/takeover authority`);
+}
+
 healthy();
 writeRuntime(projects[0], { loadedRevision: otherRevision });
 result = verify();

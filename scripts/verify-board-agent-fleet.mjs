@@ -237,8 +237,8 @@ for (const project of projects) {
     );
   }
   if (runtime?.state !== "running") {
-    codes.add("STOPPED");
-    details.push(`runtime state is ${runtime?.state ?? "missing"}`);
+    codes.add(["starting", "stopping"].includes(runtime?.state) ? runtime.state.toUpperCase() : "STOPPED");
+    details.push(`runtime state is ${runtime?.state ?? "missing"}; not healthy running or evidence that ownership is available`);
   }
   const heartbeat = Date.parse(runtime?.heartbeatAt ?? "");
   let maxAgeMs = 300000;

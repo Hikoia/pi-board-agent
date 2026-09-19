@@ -1,5 +1,6 @@
 // Real entry/loop/runtime/state/lock/store with observable offline board/model boundaries.
 import assert from "node:assert/strict";
+import { until } from "./async-loop-fixture.js";
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
@@ -7,7 +8,8 @@ import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { _DEFAULTS } from "../src/config.js";
 import type { Card } from "../src/gh.js";
-import type { BoardLoop, LoopDeps } from "../src/loop.js";
+import type { BoardLoop, LoopDeps, LoopState } from "../src/loop.js";
+import { observeOperation } from "../src/operation.js";
 import { runProcess, runProcessSync, type ProcessOptions } from "../src/process-runner.js";
 import type { TicketExecutor } from "../src/ticket-executor.js";
 import type { TicketWorktrees } from "../src/ticket-worktree.js";
@@ -35,19 +37,19 @@ const calls: Array<{ mode: string; command: string; args: string[]; cwd?: string
 const entry = pathToFileURL(join(pkg, "src", "index.ts")).href;
 const moduleUrl = (name: string) => new URL(name, entry).href;
 const globals = globalThis as any;
-let loop!: BoardLoop, deps!: LoopDeps, loopStore!: TicketWorktrees, executorStore: TicketWorktrees | undefined;
-let occupied = 0, launches = 0, cards: Card[] = [];
+let loop!: BoardLoop, deps!: LoopDeps, state!: LoopState, loopStore!: TicketWorktrees, executorStore: TicketWorktrees | undefined;
+let occupied = 0, launches = 0, occupancyReads = 0, cards: Card[] = [];
 let observation = { active: [{ itemId: "OBS", taskKey: "T099", runId: "observed", status: "paused", worktree: cwd }], occupiedSlots: 1 };
 const executor: TicketExecutor = {
   migrateLegacy: async () => ({ converted: [], failures: [] }),
   get observation() { return observation; },
   reconcile: async () => ({ active: observation.active, resumed: 0, adopted: 0, needsHuman: 0, orphans: 0, errors: 0 }),
-  activeCount: () => occupied,
+  activeCount: () => { occupancyReads++; return occupied; },
   launch: async () => { launches++; return { status: "skipped", reason: "offline" }; },
   finalizeClosed: async () => { throw new Error("unexpected finalization"); }, shutdown: async () => {},
 };
 globals.__hotPath = {
-  captureLoop: (args: any[], instance: BoardLoop) => { [deps, , , loopStore] = args; loop = instance; },
+  captureLoop: (args: any[], instance: BoardLoop) => { [deps, state, , loopStore] = args; loop = instance; },
   getProjectMetadata: async () => ({ projectId: "P", statusFieldId: "S", statusFieldType: "SINGLE_SELECT", statusOptions: Object.fromEntries(Object.values(_DEFAULTS.columns).map((name) => [name, name])), planFieldId: "PLAN", planFieldType: "TEXT", typeFieldId: "TYPE", typeFieldType: "SINGLE_SELECT", typeOptions: { Task: "TASK", Story: "STORY" } }),
   listCards: async () => structuredClone(cards),
   createProductionTicketExecutor: (options: any) => { executorStore = options.worktrees; return executor; },
@@ -76,6 +78,8 @@ try {
   process.chdir(cwd);
   (await import(entry)).default({ on: () => {}, registerCommand: (_name: string, opts: any) => { command = opts.handler; } });
   await command("run", ctx);
+  await until(() => !!loop?.isRunning());
+  await loop.tickNow();
   assert.ok(loop?.isRunning(), messages.join("\n"));
   assert.equal(calls.filter((call) => call.mode === "sync" && resolve(call.cwd!) === resolve(pkg)).length, 2, "only immutable loaded identity capture uses synchronous package Git");
   calls.length = 0;
@@ -91,7 +95,21 @@ try {
   assert.ok(widget?.includes("  T099 [running]"));
   assert.equal(calls.length, 0, "heartbeats reuse startup identity without package HEAD/status or settings scans");
   assert.ok(calls.every((call) => resolve(call.cwd!) === resolve(pkg)));
-  console.log("PASS: repeated notify/heartbeat uses one owner store/root and cached startup revision; changed executor observations refresh the real widget without Git");
+  const before = occupancyReads;
+  let clock = Date.now();
+  const progress = observeOperation(state, "finalization", () => deps.onActivity!(), { issueNumber: 7 }, () => clock);
+  progress.onProgress({ phase: "remove", completed: 0, total: 100, unit: "items" });
+  for (let i = 1; i <= 100; i++) { clock += 1000; progress.onProgress({ phase: "remove", completed: i, total: 100, unit: "items" }); }
+  assert.ok(widget?.some((line) => line.includes("Cleanup #7") && line.includes("100 / 100 items")));
+  assert.equal(JSON.parse(readFileSync(runtimePath, "utf8")).activity.completed, 100);
+  assert.equal(occupancyReads, before, "progress never scans model capacity");
+  await deps.revisionCheck!();
+  assert.equal(JSON.parse(readFileSync(runtimePath, "utf8")).activity.lastProgressAt, clock, "heartbeat does not fabricate progress");
+  progress.finish("offline blocker");
+  assert.ok(widget?.includes("Maintenance blocked: offline blocker"));
+  assert.equal(calls.length, 0, "progress publishing makes no Git/package/revision probes");
+  assert.equal(occupancyReads, before + 1, "only the existing heartbeat performs its one capacity observation");
+  console.log("PASS: notify/heartbeat/progress uses one owner store/root and cached revision, renders actual progress and never adds Git or capacity probes");
 
   calls.length = 0;
   await loop.tickNow();
@@ -124,6 +142,7 @@ try {
   await deps.revisionCheck!();
   await assert.rejects(loop.tickNow(), /Unsupported pre-0.2.0/);
   await command("run", ctx);
+  await until(() => messages.some((s) => s.includes("Startup/recovery failed")));
   assert.equal(readFileSync(runtimePath, "utf8"), sentinel);
   assert.equal(readFileSync(legacy, "utf8"), "{}");
   assert.equal(launches, 1);
@@ -145,6 +164,8 @@ try {
   await command("stop", ctx);
   assert.equal(existsSync(lockPath), false);
   await command("run", ctx);
+  await until(() => !!loop.isRunning());
+  await loop.tickNow();
   assert.ok(loop.isRunning());
   assert.notEqual(loopStore, previousStore, "resources are not reused across owner lifetimes");
   assert.equal(executorStore, loopStore);

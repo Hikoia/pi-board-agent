@@ -185,17 +185,15 @@ async function fixture() {
     "remote-only work",
   );
   git(f.repo, "push", "origin", `${newer}:refs/heads/${f.task.taskBranch}`);
-  await assert.rejects(() => f.finish(), /Remote task SHA/);
-  assert.equal(f.tip(f.task.taskBranch), newer);
-  assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
-  assert.ok(existsSync(f.record.path));
-  git(f.record.path, "merge", "--ff-only", newer);
-  f.store.setReviewedTaskSha(f.task.itemId, newer);
-  await f.finish("merge");
+  const result = await f.finish("merge");
+  assert.equal(f.tip(), result);
   git(f.repo, "merge-base", "--is-ancestor", newer, "origin/main");
+  git(f.repo, "merge-base", "--is-ancestor", f.taskSha, "origin/main");
   assert.equal(f.tip(f.task.taskBranch), "");
+  assert.equal(f.store.localBranchSha(f.task.taskBranch), undefined);
+  assert.equal(existsSync(f.record.path), false);
   console.log(
-    "PASS: remote-only commits are never deleted; integrating them locally permits normal cleanup",
+    "PASS: remote-ahead commits are integrated before task refs are removed, preserving both approved source ancestries",
   );
 }
 {

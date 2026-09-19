@@ -1,5 +1,6 @@
 // Exercise the actual entry-point widget at a held foreground model boundary.
 import assert from "node:assert/strict";
+import { until } from "./async-loop-fixture.js";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
@@ -65,13 +66,15 @@ try {
   (await import(entry)).default({ on: () => {}, registerCommand: (_name: string, options: any) => { command = options.handler; } });
   const running = command("run", ctx);
   try {
-    await Promise.race([entered, running.then(() => { throw new Error(messages.join("\n")); })]);
-    assert.equal(widget?.[0], "Board Agent ● 6/6 slots occupied · 2 models running");
+    await running;
+    await entered;
+    await until(() => !!widget?.[0]?.startsWith("Board Agent ● 6/6"));
+    assert.equal(widget?.[0], "Board Agent ● 6/6 model slots · 2 models running");
     assert.ok(widget?.includes("  issue-1 [review]"));
     assert.ok(widget?.includes("  T003 [paused]"));
     assert.ok(widget?.includes("  T004 [missing]"));
   } finally { finish(); await running; }
-  assert.equal(widget?.[0], "Board Agent ● 5/6 slots occupied · 1 models running");
+  await until(() => widget?.[0] === "Board Agent ● 5/6 model slots · 1 models running");
   console.log("PASS: real widget distinguishes occupied (including launching/paused/unverifiable) slots from running models and clears foreground after drain");
 } finally {
   await command?.("stop", ctx);

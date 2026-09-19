@@ -1,6 +1,7 @@
 // Actual entry-point widget + executor + WorkflowManager. Hold board I/O while
 // a real (offline) builder runs, pauses and resumes; no tick may finish first.
 import assert from "node:assert/strict";
+import { until } from "./async-loop-fixture.js";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
@@ -189,16 +190,13 @@ try {
     },
   });
   starting = command("run", ctx);
-  await Promise.race([
-    boardEntered.promise,
-    starting.then(() => {
-      throw new Error(messages.join("\n"));
-    }),
-  ]);
+  await starting; // /run returns before the held board read.
+  await boardEntered.promise;
+  await until(() => !!widget?.[0]?.startsWith("Board Agent ● 1/2"));
   assert.equal(agentRunning, true);
   assert.equal(
     widget?.[0],
-    "Board Agent ● 1/2 slots occupied · 1 models running",
+    "Board Agent ● 1/2 model slots · 1 models running",
     "a live builder must not look idle while the first board read is pending",
   );
   assert.ok(widget?.includes("  T001 [running]"));
@@ -208,7 +206,7 @@ try {
   await pulse();
   assert.equal(
     widget?.[0],
-    "Board Agent ● 1/2 slots occupied · 0 models running",
+    "Board Agent ● 1/2 model slots · 0 models running",
   );
   assert.ok(widget?.includes("  T001 [paused]"));
   agentEntered = deferred();
@@ -220,7 +218,7 @@ try {
   await pulse();
   assert.equal(
     widget?.[0],
-    "Board Agent ● 1/2 slots occupied · 1 models running",
+    "Board Agent ● 1/2 model slots · 1 models running",
     "busy-tick heartbeats must refresh a resumed builder without another admission tick",
   );
   assert.equal(boardReads, 1);

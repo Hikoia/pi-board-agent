@@ -39,7 +39,10 @@ Builders must commit and push their task branch, never close/merge their own Iss
 
 ### Retries and decisions
 
-Technical failures return the Project card to Ready with a persisted stage:
+**Project Status describes work; local `retry.stage` describes technical retries.**
+Open Task build/review failures return to Ready. Pure integration/cleanup failures
+keep the existing closed Done/Backlog status, update local retry diagnostics and
+warn without claiming, commenting or reopening:
 
 | Stage | Next attempt |
 | --- | --- |
@@ -51,7 +54,12 @@ Technical failures return the Project card to Ready with a persisted stage:
 Review code findings retry build. Setup/model errors, malformed output, failed
 tests, timeouts and retry exhaustion are **not** product decisions. Failed
 comment/status/reopen/release writes remain pending I/O; they do not relaunch a
-model or pretend Ready was written. No same-ticket immediate retry in a tick.
+model or pretend Ready was written. Old technical pending Ready writes are retired
+without replaying Ready/comments; claim release still requires fresh guards.
+Withdrawal cancels the obsolete write, not confirmed cleanup-only evidence.
+Existing closed Ready integrate/cleanup retries can finish directly to Backlog
+without a builder or an artificial Done transition. Manual Needs Human/open
+Backlog holds remain unchanged. No same-ticket immediate retry in a tick.
 
 A real merge conflict comments, reopens and returns to Ready. The builder merges
 base into the **original task branch**, resolves both sides, tests and pushes;
@@ -137,7 +145,10 @@ See [config compatibility](docs/runbook.md#configuration-compatibility).
 `max_workers` is the shared model budget: managed builders plus one foreground
 review. Launching, pending, paused, missing/unreadable and unsettled associated
 runs conservatively occupy slots. The widget distinguishes occupied slots from
-running models; it never authorizes work. Builder context is rendered from the
+running models; it never authorizes work. One separately tracked finalizer uses
+no model slot and does not block other Ready/Review admissions on its remote
+reads or cleanup. Candidates rotate by stable item ID. A board-wide read failure
+still fails closed. Builder context is rendered from the
 prepared worktree; durable resumes retain their original script/args/context.
 
 ## Stop, upgrade and recovery
@@ -170,7 +181,20 @@ locks, active runs and expected ref SHAs. **Ignored task-worktree files may be
 discarded by `git clean -fdX` before normal `git worktree remove`**; save valuable ignored data elsewhere.
 There is no force removal, broad prune/unlock or recursive-delete fallback.
 Unknown unregistered leftovers remain for human inspection. Only existing,
-validated legacy receipt evidence can authorize residual legacy removal.
+validated legacy receipt evidence can authorize residual legacy removal. Each
+attempt prepares evidence once, removes verified items non-recursively, and
+verifies completion. Full backup verification occurs at most twice per attempt;
+no cross-attempt cache or new snapshots/backups/archives are created by cleanup.
+
+`/run` and auto-start register tracked startup and return control to the UI.
+Migration is still a model-admission barrier. Widget, status and schema-1
+`runtime.json` show `starting`/`stopping` and maintenance activity separately from
+model slots: ticket, phase, completed/total bytes or items, elapsed time,
+`lastProgressAt`, and the last blocker. Progress publishes at most once per second
+except phase changes/errors/end. Heartbeat is **not** progress. No progress for
+`max(3 × tick_seconds, 300)` seconds is flagged, never used to unlock or restart.
+Stop drains startup, tick, heartbeat, finalizer/file handles and manager leases
+before releasing ownership; a failed drain retains the owner for another stop.
 
 See [architecture](docs/architecture.md), [operations/recovery](docs/runbook.md),
 and the [builder procedure](skills/board-agent/SKILL.md). Historical audit reports
@@ -216,7 +240,7 @@ owner. Do not use `/reload` as a hot-update procedure.
 | `/board-agent lint` | Check pinned revision, state, config, auth and Task Project metadata |
 | `/board-agent run` | Acquire ownership, convert/reconcile and admit Ready Tasks |
 | `/board-agent status` | Display board/execution state and last checked revision |
-| `/board-agent stop` | Close admission, cancel review, drain/pause builders, then release owner |
+| `/board-agent stop` | Close admission, cancel startup/review/finalizer, await Git/handles and builder drain, then release owner |
 | `/board-agent context` | Generate host navigation digest; builders use their own worktree |
 | `/board-agent init-project` | Explicitly create missing Task fields/options; never rebuild existing lists |
 

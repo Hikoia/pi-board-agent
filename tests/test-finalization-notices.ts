@@ -30,10 +30,11 @@ try {
     await tick(2);
     reason = "offline fetch unavailable";
     await tick(3);
+    f.card.type = "Story"; await tick(3); // Closed Done Issues of any Type still finalize.
+    f.card.type = "Task"; await tick(3);
     for (const patch of [
       { closed: false },
       { status: "Needs Human" },
-      { type: "Story" },
       { contentType: "PullRequest" },
       { repoOwner: "other" },
     ]) {

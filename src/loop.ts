@@ -30,13 +30,14 @@ import {
 import { buildTasksForWave } from "./workflow-prompt.js";
 import { ownerLockIsHeld, type OwnerLock } from "./owner-lock.js";
 import { assertSupportedState } from "./unsupported-state.js";
+import { observeOperation, type OperationObservation } from "./operation.js";
 
 export type StatusCallback = (
   msg: string,
   level?: "info" | "warn" | "error",
 ) => void;
 
-export interface LoopState {
+export interface LoopState extends OperationObservation {
   running: boolean;
   tickCount: number;
   wavesLaunched: number;
@@ -60,6 +61,8 @@ export interface LoopDeps {
   meta: ProjectMetadata;
   callback: StatusCallback;
   onTick?: () => void | Promise<void>;
+  /** Cached display/runtime publication only; no Git, board or capacity scans. */
+  onActivity?: () => void;
   revisionCheck?: () =>
     | { ok: boolean; reason?: string }
     | Promise<{ ok: boolean; reason?: string }>;
@@ -131,8 +134,6 @@ function ownsClaim(card: Card, botLogin: string): boolean {
   return card.assignees.length === 1 && card.assignees[0].toLowerCase() === bot;
 }
 
-type BlockerNotice = { fingerprint: string; message: string };
-
 export class BoardLoop {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private currentTick: Promise<void> | null = null;
@@ -140,6 +141,8 @@ export class BoardLoop {
   private stopPromise: Promise<void> | null = null;
   private readonly foreground = new AbortController();
   private readonly finalizationBlockers = new Map<string, string>();
+  private finalization?: { itemId: string; promise: Promise<void>; controller: AbortController };
+  private finalizationCursor?: string;
   private stopped = false; // Cleanup complete, not merely cancellation requested.
 
   constructor(
@@ -170,7 +173,7 @@ export class BoardLoop {
         void this.tickNow().catch(failed);
       }
     }, this.deps.cfg.tick_seconds * 1000);
-    await this.tickNow().catch((error: Error) =>
+    void this.tickNow().catch((error: Error) =>
       this.deps.callback(`start tick failed: ${error.message}`, "error"),
     );
   }
@@ -237,35 +240,37 @@ export class BoardLoop {
 
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
-    this.admitNewWork = false;
-    if (this.intervalId) clearInterval(this.intervalId);
-    this.intervalId = null;
-    this.state.running = false;
     const tick = this.currentTick;
     const heartbeat = this.heartbeat;
     // Publish the barrier before abort listeners can re-enter stop(). A failed
     // tick still propagates, but only an incomplete drain is retryable.
     this.stopPromise = Promise.resolve()
       .then(async () => {
-        try {
-          try {
-            await tick;
-          } finally {
-            await heartbeat;
-          }
-        } finally {
-          await this.executor.shutdown();
-          this.ownerLock?.release();
-          this.stopped = true;
-          this.deps.callback("Loop stopped.", "info");
-        }
+        const settled = await Promise.allSettled([tick, heartbeat, this.finalization?.promise]);
+        await this.executor.shutdown();
+        this.ownerLock?.release();
+        this.stopped = true;
+        this.deps.callback("Loop stopped.", "info");
+        const failed = settled.find((result) => result.status === "rejected");
+        if (failed?.status === "rejected") throw failed.reason;
       })
       .finally(() => {
         if (!this.stopped) this.stopPromise = null;
       });
+    this.requestStop();
+    return this.stopPromise;
+  }
+
+  /** Immediate veto; the owner is released only by the awaited stop barrier. */
+  requestStop(): void {
+    this.admitNewWork = false;
+    if (this.intervalId) clearInterval(this.intervalId);
+    this.intervalId = null;
+    this.state.running = false;
     this.executor.stopScheduling?.();
     this.foreground.abort();
-    return this.stopPromise;
+    this.finalization?.controller.abort();
+    this.deps.onActivity?.();
   }
 
   private boardOps(): LoopBoardOps {
@@ -373,15 +378,16 @@ export class BoardLoop {
       this.deps.repoRoot ?? this.ticketWorktrees.repoRoot,
       true,
     );
-    const blockers = new Map<string, BlockerNotice>();
     try {
       const { cfg, callback, repoOwner, repoName } = this.deps;
       let cards = await this.fetchCards();
       if (this.foreground.signal.aborted) return;
+      const excludedItemId = this.finalization?.itemId;
       const summary = await this.executor.reconcile(
         cards,
         async () => (await this.revisionAllowsNewWork()) && this.admitNewWork,
         () => this.admissionStillAllowed(),
+        excludedItemId,
       );
       cards = cards.filter(
         (card) => !this.executor.legacyBlocked?.(card.itemId),
@@ -389,7 +395,8 @@ export class BoardLoop {
       if (this.foreground.signal.aborted) return;
       // Closed/Done is durable recovery, not a new admission (also on dirty/revision latch).
       const attemptedItemIds = new Set(summary.attemptedItemIds ?? []);
-      await this.processClosedDoneCards(cards, blockers, attemptedItemIds);
+      if (excludedItemId) attemptedItemIds.add(excludedItemId);
+      this.processClosedDoneCards(cards, attemptedItemIds);
       if (!(await this.revisionAllowsNewWork()) || !this.admitNewWork) return;
       if (cards.length === 0) {
         callback("No cards on the board yet.");
@@ -446,7 +453,7 @@ export class BoardLoop {
             () => this.admissionStillAllowed(),
           );
           if (result.status !== "launched") continue;
-          blockers.delete(card.itemId);
+          this.finalizationBlockers.delete(card.itemId);
           launched++;
           this.state.wavesLaunched++;
         }
@@ -469,16 +476,6 @@ export class BoardLoop {
         Math.max(0, cfg.max_workers - this.executor.activeCount()),
       );
     } finally {
-      // One incident per ticket across reconcile, closed-Done and Ready wrappers.
-      // The tick-local notices never authorize or suppress any fresh check/retry.
-      for (const [itemId, notice] of blockers) {
-        if (this.finalizationBlockers.get(itemId) === notice.fingerprint)
-          continue;
-        this.finalizationBlockers.set(itemId, notice.fingerprint);
-        this.deps.callback(notice.message, "warn");
-      }
-      for (const itemId of this.finalizationBlockers.keys())
-        if (!blockers.has(itemId)) this.finalizationBlockers.delete(itemId);
       this.state.tickCount++;
       this.state.lastTickMs = Date.now();
       await this.deps.onTick?.();
@@ -649,6 +646,8 @@ export class BoardLoop {
           record,
           writeBoard,
           botLogin,
+          undefined,
+          { signal: this.foreground.signal },
         );
         claimed = false;
         callback(
@@ -684,6 +683,8 @@ export class BoardLoop {
               record,
               writeBoard,
               botLogin,
+              undefined,
+              { signal: this.foreground.signal },
             );
             claimed = false;
           } catch (writeError) {
@@ -743,59 +744,66 @@ export class BoardLoop {
     }
   }
 
-  private async processClosedDoneCards(
+  private processClosedDoneCards(
     cards: Card[],
-    blockers: Map<string, BlockerNotice>,
     attemptedItemIds: Set<string>,
-  ): Promise<void> {
+  ): void {
     const { cfg, repoOwner, repoName } = this.deps;
-    const candidates = cards.filter(
-      (card) =>
-        card.closed === true &&
-        (card.status?.toLowerCase() === cfg.columns.done.toLowerCase() ||
-          (card.status?.toLowerCase() === cfg.columns.ready.toLowerCase() &&
-            // A closed build retry can only finish its interrupted reopen/Ready
-            // handoff here, never launch a model or reuse old merge approval.
-            ["build", "integrate", "cleanup"].includes(
-              this.ticketWorktrees.read(card.itemId)?.retry?.stage ?? "",
-            )) ||
-          (card.status?.toLowerCase() === cfg.columns.backlog.toLowerCase() &&
-            !!this.ticketWorktrees.read(card.itemId)?.integration)) &&
-        !attemptedItemIds.has(card.itemId) &&
-        isTargetIssue(card, repoOwner, repoName),
-    );
-    if (!candidates.length || this.foreground.signal.aborted) return;
-    for (const card of candidates) {
-      if (this.foreground.signal.aborted) return;
-      // Remote-only branches and no-ref history still require fresh finalization.
-      attemptedItemIds.add(card.itemId);
-      const outcome = await this.executor.finalizeClosed(
-        card,
-        async () =>
-          (await this.revisionAllowsNewWork()) && this.admissionStillAllowed(),
-        () =>
-          !this.foreground.signal.aborted &&
-          (!this.ownerLock || ownerLockIsHeld(this.ownerLock)),
-      );
+    const candidates = cards.filter((card) => {
+      if (attemptedItemIds.has(card.itemId) || !isTargetIssue(card, repoOwner, repoName)) return false;
+      const record = this.ticketWorktrees.read(card.itemId);
+      if (record?.activeRunId || record?.launchingAt !== undefined) return false;
+      const stage = record?.retry?.stage;
+      // Retire historical closed technical writes even after a manual lane change.
+      if (record && (stage === "integrate" || stage === "cleanup") && pendingTicketWrite(record)?.card.closed) return true;
+      if (!card.closed) return false;
+      const status = card.status?.toLowerCase();
+      return status === cfg.columns.done.toLowerCase() ||
+        // A closed build retry only finishes its interrupted reopen/Ready handoff.
+        (status === cfg.columns.ready.toLowerCase() && !!stage && ["build", "integrate", "cleanup"].includes(stage)) ||
+        (status === cfg.columns.backlog.toLowerCase() && !!record?.integration);
+    });
+    for (const itemId of this.finalizationBlockers.keys())
+      if (itemId !== this.finalization?.itemId && !candidates.some((c) => c.itemId === itemId))
+        this.finalizationBlockers.delete(itemId);
+    if (this.finalization || !candidates.length || this.foreground.signal.aborted) return;
+    candidates.sort((a, b) => a.itemId < b.itemId ? -1 : a.itemId > b.itemId ? 1 : 0);
+    const card = candidates.find((c) => !this.finalizationCursor || c.itemId > this.finalizationCursor) ?? candidates[0];
+    this.finalizationCursor = card.itemId;
+    attemptedItemIds.add(card.itemId);
+    const controller = new AbortController();
+    const observer = observeOperation(this.state, "finalization", () => this.deps.onActivity?.(), { itemId: card.itemId, issueNumber: card.number ?? undefined });
+    let blocker: string | undefined;
+    const warn = (fingerprint: string, message: string) => {
+      if (this.finalizationBlockers.get(card.itemId) === fingerprint) return;
+      this.finalizationBlockers.set(card.itemId, fingerprint);
+      this.deps.callback(message, "warn");
+    };
+    // Both handlers are attached before the executor can run/reject. Exclusion
+    // lasts through failure writeback AND observation settlement, not UI state.
+    const promise = Promise.resolve().then(() => this.executor.finalizeClosed(
+      card,
+      async () => (await this.revisionAllowsNewWork()) && this.admissionStillAllowed(),
+      () => !controller.signal.aborted && !this.foreground.signal.aborted &&
+        (!this.ownerLock || ownerLockIsHeld(this.ownerLock)),
+      { signal: controller.signal, onProgress: observer.onProgress },
+    )).then((outcome) => {
       if (outcome.status === "finalized" || outcome.status === "backlogged")
-        blockers.delete(card.itemId);
-      if (outcome.status !== "conflict" && outcome.status !== "blocked")
-        continue;
-      if (blockers.has(card.itemId)) continue;
-      // Suppress only the notification, never the fresh check/retry above.
-      const fingerprint = JSON.stringify([
-        outcome.status,
-        outcome.status === "conflict" ? outcome.baseSha : null,
-        outcome.status === "conflict" ? outcome.taskSha : null,
-        outcome.reason,
-      ]);
-      blockers.set(card.itemId, {
-        fingerprint,
-        message:
-          outcome.status === "conflict"
-            ? `Finalization conflict for #${card.number} "${card.title}": ${taskBranch(cfg.branches.task_prefix, card.number!)} at ${outcome.taskSha} conflicts with ${cfg.branches.base} at ${outcome.baseSha}. Ticket status, branches and worktree preserved; no integration commit or push. Resolve the conflict before retrying.\n${outcome.reason}`
-            : `Finalization blocked for "${card.title}": ${outcome.reason}`,
-      });
-    }
+        this.finalizationBlockers.delete(card.itemId);
+      if (outcome.status !== "conflict" && outcome.status !== "blocked") return;
+      blocker = `#${card.number}: ${outcome.reason}`;
+      warn(JSON.stringify(outcome), outcome.status === "conflict"
+        ? `Finalization conflict for #${card.number} "${card.title}": ${taskBranch(cfg.branches.task_prefix, card.number!)} at ${outcome.taskSha} conflicts with ${cfg.branches.base} at ${outcome.baseSha}. Ticket status, branches and worktree preserved; no integration commit or push. Resolve the conflict before retrying.\n${outcome.reason}`
+        : `Finalization blocked for "${card.title}": ${outcome.reason}`);
+    }, (error) => {
+      if (controller.signal.aborted) return;
+      blocker = `#${card.number}: ${String(error)}`;
+      warn(blocker, `Finalization blocked for "${card.title}": ${String(error)}`);
+    }).finally(() => {
+      try { observer.finish(blocker); }
+      finally { this.finalization = undefined; }
+    });
+    this.finalization = { itemId: card.itemId, promise, controller };
+    void promise.catch(() => undefined); // Also handle a failed UI callback before stop drains it.
   }
 }

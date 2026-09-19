@@ -71,9 +71,12 @@ try {
       fs.writeFileSync(t.file, raw);
       let canMigrate = true;
       cut = (step) => { if (step === "record flushed") { if (stop === "owner lost") owner.release(); else canMigrate = false; } };
-      const report = await new LegacyTickets(f.deps).migrate(owner, () => canMigrate);
+      await assert.rejects(
+        new LegacyTickets(f.deps).migrate(owner, () => canMigrate),
+        /owner\.lock|owner was lost|cancelled/i,
+        "owner loss/stop aborts the whole migration, not just one ticket",
+      );
       cut = () => {};
-      assert.equal(report.failures.length, 1);
       assert.deepEqual(fs.readFileSync(t.file), raw);
       if (stop === "owner lost") owner = acquireOwnerLock(f.repo, "bot");
     }

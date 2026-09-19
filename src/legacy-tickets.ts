@@ -20,13 +20,21 @@ import {
   exactKeys,
   isCleanupSnapshot,
   readRegular,
+  readEvidence,
+  verifyEvidence,
+  verifyEvidenceNow,
+  type FileEvidence,
+  prepareSnapshot,
+  removalBatch,
   removeSnapshot,
   verifyBackupSnapshots,
   verifyParents,
   verifySnapshot,
   writeCleanupEvidence,
   type CleanupSnapshot,
+  type PreparedSnapshot,
 } from "./cleanup-snapshot.js";
+import { checkOperation, operationCheckpoint, type OperationControl } from "./operation.js";
 import { buildTasksForWave, type BuilderTask } from "./workflow-prompt.js";
 import { sameTicketContract } from "./ticket-retry.js";
 import { assertOwnerLock, type OwnerLock } from "./owner-lock.js";
@@ -34,6 +42,7 @@ import { legacyNeedsDesignColumn, type Config } from "./config.js";
 import { isTargetIssue, type Card, type IssueComment } from "./gh.js";
 import {
   isTicketExecutionRecord,
+  TicketStateChangedError,
   mustGit,
   samePath,
   singleLine,
@@ -149,6 +158,7 @@ export class LegacyTickets {
   private owner?: OwnerLock;
   private canMigrate: () => boolean = () => true;
   private migrationStarted = false;
+  private control?: OperationControl;
   private readonly pendingFiles = new Set<string>();
   readonly pendingDesign = new Set<string>();
   private readonly failures = new Map<string, string>();
@@ -188,6 +198,7 @@ export class LegacyTickets {
   }
 
   private assertOwner(): void {
+    checkOperation(this.control);
     if (!this.owner || !this.canMigrate())
       throw new Error(
         "Startup migration cancelled; no hot update is permitted.",
@@ -325,7 +336,16 @@ export class LegacyTickets {
   async migrate(
     owner: OwnerLock,
     canMigrate: () => boolean = () => true,
+    control?: OperationControl,
   ): Promise<LegacyMigrationReport> {
+    const external = control;
+    control = { ...control, check: () => {
+      checkOperation(external);
+      if (!canMigrate()) throw new Error("Startup migration cancelled.");
+      assertOwnerLock(owner, this.deps.worktrees.repoRoot);
+    } };
+    this.control = control;
+    const checkpoint = operationCheckpoint(control);
     this.owner = owner;
     this.canMigrate = canMigrate;
     this.assertOwner();
@@ -364,8 +384,11 @@ export class LegacyTickets {
       sources.add(name);
     for (const name of sources)
       this.pendingFiles.add(join(worktrees.recordsDir, name));
+    let completed = 0;
     for (const name of sources) {
+      await checkpoint();
       this.assertOwner();
+      control?.onProgress?.({ phase: "read-evidence", completed, total: sources.size, unit: "items" });
       let itemId: string | undefined;
       const path = join(worktrees.recordsDir, name);
       try {
@@ -383,7 +406,7 @@ export class LegacyTickets {
         }
         const receiptPath = join(cleanupDir, name);
         const receiptBytes = lstatSync(receiptPath, { throwIfNoEntry: false })
-          ? this.bytes(receiptPath)
+          ? await readRegular(receiptPath, control)
           : undefined;
         const rawReceipt = receiptBytes
           ? JSON.parse(receiptBytes.toString("utf8"))
@@ -405,7 +428,7 @@ export class LegacyTickets {
           )
             throw new Error("Recordless receipt has no matching target Issue.");
           const task = buildTasksForWave(this.deps.cfg, "", [card])[0];
-          await this.readReceipt(task); // Full receipt/path validation before deriving new execution metadata.
+          await this.readReceipt(task, control, receiptBytes); // Full validation before deriving execution metadata.
           original = {
             schemaVersion: 4,
             itemId,
@@ -425,6 +448,7 @@ export class LegacyTickets {
             "Unsupported/corrupt ticket source; not guessed or deleted.",
           );
         itemId = original.itemId;
+        control?.onProgress?.({ phase: "read-evidence", itemId, issueNumber: original.issueNumber, completed, total: sources.size, unit: "items" });
         if (original.schemaVersion === 4 && !recordless) continue; // never replay a published ticket
         this.assertOwner();
         const card = await this.deps.board.getCard(itemId);
@@ -464,6 +488,7 @@ export class LegacyTickets {
           (await this.completedReceipt(
             { ...original, title: card.title, body: card.body },
             card,
+            control,
           ))
         ) {
           this.assertOwner();
@@ -582,9 +607,9 @@ export class LegacyTickets {
               );
           }
           const receipt = receiptBytes
-            ? await this.readReceipt(task)
+            ? await this.readReceipt(task, control, receiptBytes)
             : undefined;
-          if (receipt) await this.checkCleanup(task, receipt);
+          if (receipt) await this.checkCleanup(task, receipt, control);
           if (old?.resultSha) await this.verifyLegacyResult(old);
           if (receipt && old?.resultSha && receipt.resultSha !== old.resultSha)
             throw new Error("Receipt and legacy result disagree.");
@@ -654,11 +679,16 @@ export class LegacyTickets {
         this.failures.delete(itemId);
         report.converted.push(itemId);
       } catch (error) {
+        this.assertOwner(); // Stop/owner loss is not a per-ticket migration failure.
         const reason = error instanceof Error ? error.message : String(error);
         if (itemId) this.failures.set(itemId, reason);
         report.failures.push({ source: path, reason });
+      } finally {
+        completed++;
       }
     }
+    this.assertOwner();
+    control?.onProgress?.({ phase: "read-evidence", completed, total: sources.size, unit: "items" });
     return report;
   }
 
@@ -718,7 +748,8 @@ export class LegacyTickets {
   }
 
   /** Conversion and verified legacy residual evidence only. */
-  private async readReceipt(task: BuilderTask): Promise<CleanupReceipt> {
+  private async readReceipt(task: BuilderTask, control?: OperationControl, bytes?: Buffer): Promise<CleanupReceipt> {
+    checkOperation(control);
     const path = join(
       this.deps.worktrees.repoRoot,
       ".pi",
@@ -728,7 +759,7 @@ export class LegacyTickets {
     );
     let r: any;
     try {
-      r = JSON.parse((await readRegular(path)).toString("utf8"));
+      r = JSON.parse((bytes ?? await readRegular(path, control)).toString("utf8"));
     } catch (error) {
       throw new Error(`Corrupt cleanup receipt: ${path}`, { cause: error });
     }
@@ -820,8 +851,13 @@ export class LegacyTickets {
       (!receipt.record && receipt.snapshots.some((s) => s.entries.length))
     )
       throw new Error("Cleanup receipt identity/path mismatch.");
+    for (const entry of receipt.snapshots[1]?.entries ?? []) {
+      const name = entry.path.split("/").at(-1)!;
+      if (name.endsWith(".lock") || name === "locked")
+        throw new Error(`Locked Git cleanup path: ${entry.path}`);
+    }
     await verifyParents(receipt.gitParents);
-    await this.checkCleanupGit(receipt);
+    await this.checkCleanupGit(receipt, control);
     this.deps.worktrees.validateBranches(
       receipt.taskBranch,
       receipt.baseBranch,
@@ -863,7 +899,10 @@ export class LegacyTickets {
   private async checkCleanup(
     task: BuilderTask,
     receipt: CleanupReceipt,
+    control?: OperationControl,
+    full = true,
   ): Promise<void> {
+    checkOperation(control);
     await verifyParents(receipt.parents);
     await verifyParents(receipt.gitParents);
     const record = await this.deps.worktrees.cleanupRecord(task);
@@ -892,7 +931,7 @@ export class LegacyTickets {
           : !receipt.record ||
             JSON.stringify(record) !== JSON.stringify(receipt.record) ||
             hash(
-              await readRegular(this.deps.worktrees.recordPath(task.itemId)),
+              await readRegular(this.deps.worktrees.recordPath(task.itemId), control),
             ) !== receipt.recordHash
       )
         throw new Error("Cleanup execution record changed.");
@@ -910,11 +949,6 @@ export class LegacyTickets {
       throw new Error(`Local ${task.taskBranch} moved; cleanup refused.`);
     if (!this.deps.worktrees.gitCommonDir)
       throw new Error("Missing Git common directory.");
-    for (const entry of receipt.snapshots[1]?.entries ?? []) {
-      const name = entry.path.split("/").at(-1)!;
-      if (name.endsWith(".lock") || name === "locked")
-        throw new Error(`Locked Git cleanup path: ${entry.path}`);
-    }
     for (const name of await readdir(this.deps.worktrees.gitCommonDir)) {
       if (name.endsWith(".lock"))
         throw new Error(`Locked Git cleanup: ${name}`);
@@ -928,20 +962,22 @@ export class LegacyTickets {
     await directoryStamps(refLock);
     if (lstatSync(refLock, { throwIfNoEntry: false }))
       throw new Error(`Locked Git ref: ${refLock}`);
-    await this.checkCleanupGit(receipt);
+    await this.checkCleanupGit(receipt, control);
+    checkOperation(control);
+    if (!full) return;
     if (receipt.backup) {
-      await verifyBackupSnapshots(receipt.backup, receipt.snapshots);
+      await verifyBackupSnapshots(receipt.backup, receipt.snapshots, control);
       if (
-        hash(await readRegular(join(receipt.backup, "record.json"))) !==
+        hash(await readRegular(join(receipt.backup, "record.json"), control)) !==
         receipt.recordHash
       )
         throw new Error("Cleanup backup record changed.");
     }
     // Leave source/ancestor checks last, after other asynchronous validation.
-    for (const snapshot of receipt.snapshots) await verifySnapshot(snapshot);
+    for (const snapshot of receipt.snapshots) await verifySnapshot(snapshot, true, control);
   }
 
-  private async checkCleanupGit(receipt?: CleanupReceipt): Promise<void> {
+  private async checkCleanupGit(receipt?: CleanupReceipt, control?: OperationControl): Promise<void> {
     const root = join(this.deps.worktrees.gitCommonDir!, "worktrees");
     await directoryStamps(join(root, "probe"));
     let names: string[];
@@ -952,18 +988,21 @@ export class LegacyTickets {
       throw error;
     }
     for (const name of names) {
+      checkOperation(control);
       const admin = join(root, name);
       const known =
         receipt?.snapshots[1] && samePath(admin, receipt.snapshots[1].path);
       const stat = lstatSync(admin, { throwIfNoEntry: false });
       if (!stat?.isDirectory() || stat.isSymbolicLink())
         throw new Error(`Unknown Git registration: ${admin}`);
+      if (known && (await readdir(admin)).some((file) => file === "locked" || file.endsWith(".lock")))
+        throw new Error(`Locked Git cleanup: ${admin}`);
       const gitdir = join(admin, "gitdir");
       if (!lstatSync(gitdir, { throwIfNoEntry: false })) {
         if (known) continue; // only exact receipted partial metadata may disappear
         throw new Error(`Ambiguous Git registration: ${admin}`);
       }
-      const target = (await readRegular(gitdir)).toString("utf8").trim();
+      const target = (await readRegular(gitdir, control)).toString("utf8").trim();
       if (
         !singleLine(target) ||
         (receipt &&
@@ -978,12 +1017,12 @@ export class LegacyTickets {
   /** Old receipts are immutable conversion evidence, not a second ticket store.
    * Fresh Done + integrated base + absent artifacts is sufficient completion
    * evidence on restart; no tombstone and no receipt GC. */
-  async completedReceipt(task: BuilderTask, expected: Card): Promise<boolean> {
+  async completedReceipt(task: BuilderTask, expected: Card, control?: OperationControl): Promise<boolean> {
     const { worktrees, board, cfg, repoOwner, repoName, botLogin } = this.deps;
     if (worktrees.has(task.itemId) || !worktrees.hasCleanupReceipt(task.itemId))
       return false;
-    const receipt = await this.readReceipt(task);
-    await this.checkCleanup(task, receipt);
+    const receipt = await this.readReceipt(task, control);
+    await this.checkCleanup(task, receipt, control);
     await worktrees.fetchRequired(task.baseBranch);
     if (
       !worktrees.isAncestor(
@@ -1023,53 +1062,83 @@ export class LegacyTickets {
 
   /** The only residual deletion path: existing, unchanged v3 snapshots, after
    * conversion. Never called as a fallback when normal worktree remove fails. */
-  async cleanupResidual(
-    record: TicketExecutionRecord,
-    remove: boolean,
-    guard: () => Promise<void>,
-  ): Promise<void> {
+  async cleanupResidual(record: TicketExecutionRecord, control?: OperationControl) {
     const { worktrees } = this.deps;
+    const external = control;
+    const evidence: FileEvidence[] = [];
+    control = { ...control, check: () => {
+      checkOperation(external);
+      if (!equal(worktrees.read(record.itemId), record))
+        throw new TicketStateChangedError("Legacy cleanup record changed; work retained.");
+      // Recheck immutable evidence even after an awaited authorization/long hash,
+      // without repeating expensive Git probes or rereading whole receipts.
+      for (const file of evidence) verifyEvidenceNow(file);
+    } };
+    checkOperation(control);
     if (worktrees.worktreeEntries().some((e) => samePath(e.path, record.path)))
       throw new Error("Registered worktree requires normal Git removal.");
     if (!worktrees.hasCleanupReceipt(record.itemId)) {
       if (existsSync(record.path))
-        throw new Error(
-          "Unknown unregistered residual; no legacy snapshot evidence.",
-        );
-      return;
+        throw new Error("Unknown unregistered residual; no legacy snapshot evidence.");
+      return undefined;
     }
+    control?.onProgress?.({ phase: "read-evidence" });
     const task = { ...record, title: "", body: "" };
-    const path = join(
-      worktrees.repoRoot,
-      ".pi",
-      "board-agent",
-      "cleanup",
-      basename(worktrees.recordPath(record.itemId)),
-    );
-    const bytes = await readRegular(path);
-    const archive = join(
-      worktrees.repoRoot,
-      ".pi",
-      "board-agent",
-      "legacy-v3",
-      `receipt-${basename(path)}`,
-    );
-    if (!(await readRegular(archive)).equals(bytes))
+    const path = join(worktrees.repoRoot, ".pi", "board-agent", "cleanup", basename(worktrees.recordPath(record.itemId)));
+    const original = await readEvidence(path, control);
+    const archive = await readEvidence(join(worktrees.repoRoot, ".pi", "board-agent", "legacy-v3", `receipt-${basename(path)}`), control);
+    if (!archive.bytes.equals(original.bytes))
       throw new Error("Legacy receipt differs from converted evidence.");
-    const receipt = await this.readReceipt(task);
+    const receipt = await this.readReceipt(task, control, original.bytes);
+    await this.checkCleanup(task, receipt, control, false);
+    evidence.push(original.evidence, archive.evidence);
+    const backup = receipt.backup ? await verifyBackupSnapshots(receipt.backup, receipt.snapshots, control) : undefined;
+    if (backup) {
+      const saved = await readEvidence(join(receipt.backup!, "record.json"), control);
+      if (hash(saved.bytes) !== receipt.recordHash) throw new Error("Cleanup backup record changed.");
+      evidence.push(backup.manifest, saved.evidence);
+    }
+    const prepared: PreparedSnapshot[] = [];
+    for (const [i, snapshot] of receipt.snapshots.entries()) {
+      const source = await prepareSnapshot(snapshot, control);
+      source.backup = backup?.copies[i];
+      prepared.push(source);
+    }
     const check = async () => {
-      await this.checkCleanup(task, receipt);
-      if (
-        !(await readRegular(path)).equals(bytes) ||
-        !(await readRegular(archive)).equals(bytes)
-      )
-        throw new Error("Legacy evidence changed during cleanup.");
-      await guard();
+      checkOperation(control);
+      for (const file of evidence) await verifyEvidence(file);
+      await this.checkCleanup(task, receipt, control, false);
+      checkOperation(control);
     };
     await check();
-    if (remove)
-      for (const snapshot of receipt.snapshots)
-        await removeSnapshot(snapshot, check);
+    let consumed = false;
+    return {
+      remove: async (authorize: () => Promise<void>, local: () => void) => {
+        if (consumed) throw new Error("Legacy cleanup context already consumed.");
+        consumed = true; // Never reuse authorization after failure or partial cleanup.
+        const batch = removalBatch(authorize, async () => { await check(); local(); }, control);
+        for (const snapshot of prepared) await removeSnapshot(snapshot, batch, control);
+        // Full evidence is read only at preparation and completion; metadata
+        // pins reject replacement in between rather than accepting new evidence.
+        await check();
+        if (!(await readRegular(path, control)).equals(original.bytes) ||
+            !(await readRegular(archive.evidence.path, control)).equals(original.bytes))
+          throw new Error("Legacy evidence changed during cleanup.");
+        if (receipt.backup) {
+          await verifyBackupSnapshots(receipt.backup, receipt.snapshots, control);
+          if (hash(await readRegular(join(receipt.backup, "record.json"), control)) !== receipt.recordHash)
+            throw new Error("Cleanup backup record changed.");
+        }
+        await check();
+        for (const snapshot of receipt.snapshots) {
+          await verifyParents(snapshot.parents, true);
+          if (lstatSync(snapshot.path, { throwIfNoEntry: false })) throw new Error(`Cleanup directory remains: ${snapshot.path}`);
+        }
+        await authorize();
+        await check();
+        local();
+      },
+    };
   }
 
   /** Keep the original question in the issue/comments. Only the lane changes;

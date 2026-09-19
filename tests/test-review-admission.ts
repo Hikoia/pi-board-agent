@@ -91,7 +91,8 @@ try {
       claim: f.board.claim, refresh: () => f.board.getCard(), listComments: async () => [], comment: async () => { f.writes.push('comment'); return 'unexpected'; }, setStatus: async (_card, status) => f.board.setStatus(f.card.itemId, status),
       release: async () => { releaseEntered.resolve(); await releaseFinish.promise; releases++; await f.board.release(); },
     } }, state, f.executor, f.store, owner);
-    const start = (change === 'revision' || change === 'latched' ? loop.start() : loop.tickNow()).finally(() => { done = true; });
+    if (change === 'revision' || change === 'latched') await loop.start();
+    const start = loop.tickNow().finally(() => { done = true; });
     let stopping: Promise<void> | undefined;
     try {
       await reached(entered.promise, start);

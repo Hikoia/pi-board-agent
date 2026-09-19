@@ -1,5 +1,6 @@
 // Real local bare remote; only Git/GitHub I/O fault boundaries are controlled.
 import assert from "node:assert/strict";
+import { settledTicks } from "./async-loop-fixture.js";
 import { writeFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -150,6 +151,7 @@ export async function fixture(legacy = false) {
     executor,
     f.store,
   );
+  settledTicks(loop);
   const noNewEvidence = () => {
     assert.deepEqual(
       readdirSync(join(f.repo, ".pi", "board-agent", "cleanup")),

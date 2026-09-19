@@ -1,5 +1,6 @@
 // Real executor/WorkflowManager, reviewer isolation and native finalization; offline models + board.
 import assert from "node:assert/strict";
+import { settledTicks } from "./async-loop-fixture.js";
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
@@ -306,6 +307,7 @@ const loop = new BoardLoop(
   executor,
   store,
 );
+settledTicks(loop);
 try {
   await loop.tickNow();
   assert.equal(card.status, cfg.columns.building);

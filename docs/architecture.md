@@ -45,8 +45,10 @@ contract and claim after awaited preparation and before writes. Plan is optional
 changing an existing Plan is still a contract change, not permission to use a
 stale snapshot. Failed reads retain evidence rather than authorize from a cached
 board. Claim release is also a mutation: an unidentifiable replacement card
-cannot authorize it. Closed approval can be claimed specifically for finalization
-failure writeback/reopening; builder admission still requires open Ready.
+cannot authorize it. Only an actual build retry/conflict claims closed approval
+for reopening/Ready writeback; pure technical finalization failures update local
+retry state and warnings without changing the Project lane. Builder admission
+still requires open Ready.
 
 One filesystem owner protects the target checkout. PID/host/token checks reject
 live local, foreign-host or corrupt ownership. Only a provably dead same-host
@@ -90,8 +92,12 @@ than turn absence into successful cleanup.
 Each tick:
 
 1. Reject unsupported state read-only, then list cards.
-2. Reconcile original run associations, uncertain launches and pending I/O.
-3. Process closed Done Issues, integrate/cleanup Ready retries and pending Backlog cleanup.
+2. Reconcile original run associations, uncertain launches and model-result I/O.
+   Pure finalization records do not repeat per-ticket remote checks here.
+3. If idle, start one tracked finalizer for closed Done, old technical Ready,
+   pending Backlog cleanup or retirement of an old technical writeback. Do not
+   await it before model admission. Rotate stable item IDs using an in-memory
+   cursor; exclude its ticket until the Promise and settlement have completed.
 4. Check admission and configured main-checkout cleanliness for new model work.
 5. Reserve one slot for a pending review, pre-fill other slots with Ready builders.
 6. Run at most one foreground review; recount/back-fill Ready builders.
@@ -106,7 +112,10 @@ history stops per-ticket polling.
 `max_workers` includes builders and foreground review. Active associations count
 until safely drained and settled, including paused, terminal-but-unsettled,
 missing/unreadable and launch-window state. Display observations cannot lend a
-slot. Existing UsageLimitScheduler timers call fresh resume authorization after
+slot. The one finalizer has its own Promise/AbortController and no model slot,
+queue, journal or dispatch timer. A failed board list still prevents admissions;
+background maintenance does not authorize work from stale board data.
+Existing UsageLimitScheduler timers call fresh resume authorization after
 cooperative drain; a final synchronous stop/admission veto guards actual resume.
 No second scheduler or replacement builder is created for uncertain state.
 
@@ -191,7 +200,12 @@ locks, active runs or concurrent ref movement block deletion. **Ignored files
 may be discarded by `git clean -fdX` and normal Git removal.** Nested Git
 identities are inspected without following links; no cleanup snapshot is created. No force remove, broad prune/unlock, recursive fallback or force base
 push is allowed. Unknown unregistered leftovers are retained. Failed cleanup
-returns Project Ready/cleanup while keeping the Issue closed and approved.
+keeps closed Done/Backlog (or an existing closed Ready compatibility retry) and
+updates only local `retry.stage`/reason and deduplicated warnings. Historical
+integrate/cleanup pending Ready writes retire without status/comment/reopen
+replay; original identity/claim/record guards still govern release/withdrawal.
+Retiring a withdrawn write preserves its technical stage: confirmed cleanup must
+not silently become an unconfirmed integration that can be superseded.
 
 ## Exclusive stopped v3 continuation
 
@@ -215,6 +229,26 @@ finish or convert safely; completed receipts do not resurrect execution records.
 Old receipts/ledgers stay read-only and are not garbage-collected. Partly removed
 unregistered legacy paths require their existing ownership/unchanged snapshots
 and any recorded backup; only the adapter can verify/remove those residuals.
+Each attempt uses prepare → remove → finish: strict original/archive parsing,
+one full backup/source validation, expected-entry Maps and a surviving-item
+removal list; per-entry source/parent/backup checks; then final full backup and
+raw evidence validation. Removed entries are not rescanned. Files hash in 1 MiB
+chunks, cancellation is checked between chunks/items, and traversal yields after
+about 50 ms accumulated work. Handles always close in `finally`.
+
+Full backups are verified at most twice per cleanup attempt. Receipt/manifest
+identity, size, mtime and ctime are pinned between full reads; changed evidence
+is rejected, not adopted. No verification context survives an attempt or owner.
+A remote authorization window permits at most **32 deletions or 1 second** after
+observation, whichever comes first. Check expiry before each delete; long hashes
+refresh expired authority then recheck file/ancestor stamps. Stop, owner, record
+and local Git guards are not cached. Ref deletion and Backlog/record completion
+have independent fresh checks and expected-SHA protection. This window is not a
+network deadline or a promise to detect remote withdrawal within one second.
+Unknown/recreated entries, symlink/junction replacement, nested Git and locks
+still block; partial progress resumes without rollback. A failed normal v4 Git
+removal never falls back to this legacy path.
+
 There are no new snapshots or inferred backups. Without existing evidence,
 unknown remnants remain. Preserve Needs Human; old Task Needs Design maps to
 Needs Human with original questions. Closed Done non-Task Issues may complete;
@@ -230,12 +264,28 @@ Git HEAD/status or settings scans. Runtime JSON is an observation, not fresh
 deployment proof. Unsupported-state and owner-lock checks still guard writes;
 fresh ticket identity/capacity/deadlines remain live. Hot update is unsupported.
 
-`stop()` publishes one reentrant barrier, closes scheduling, aborts foreground
-review, awaits tick/heartbeat work, then pauses/drains managers and leases before
+`/run` and auto-start register a startup Promise/AbortController before yielding,
+without holding the UI behind migration. Repeated run cannot acquire a second
+owner. Migration finishes (isolating failed tickets) before model admission.
+`BoardLoop.start()` installs its timer and tracked first tick and returns.
+
+`stop()` publishes one reentrant barrier, closes scheduling/automatic resume,
+aborts startup, foreground review and finalization, awaits their real settlement
+(including tick/heartbeat and file handles), then drains managers/leases before
 owner release. Failed drain retains managers/owner for retry. Startup generation
 checks prevent a late continuation after stop. Stop during preparation is not a
 technical failure. Already-started Git runs to its bounded outcome; stop awaits
 it, while subsequent destructive steps may be vetoed and left recoverable.
+
+Widget, status and schema-1 runtime carry optional observational activity:
+ticket, phase, completed/total/unit, startedAt, lastProgressAt and lastBlocker.
+Old runtime files without activity remain readable. Progress publication is
+throttled to 1 Hz except phase changes, errors and completion; it performs no
+Git/GitHub/revision/capacity probes. Active activity clears at settlement; a
+blocker remains until the next attempt. Heartbeat and progress are independent.
+A no-progress interval over `max(3 × tick_seconds, 300)` seconds is displayed,
+never treated as takeover/restart authority. `starting`/`stopping` are observable
+states, not healthy running; STOPPING never hides a retained owner as stopped.
 
 All runtime Git/gh calls use the shared deadline runner. POSIX process groups and
 Windows Job Objects contain ordinary descendant processes, not malicious POSIX

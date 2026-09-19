@@ -58,7 +58,8 @@ try {
         assert.ok(!calls.some((a) => a[0] === "worktree" && a[1] === "remove"));
         assert.ok(existsSync(f.recordFile));
         assert.equal(f.card.closed, true);
-        assert.equal(f.card.status, f.cfg.columns.ready);
+        assert.equal(f.card.status, f.cfg.columns.done);
+        assert.equal(f.recordNow().retry?.stage, "cleanup");
         assert.ok(existsSync(join(f.record.path, ".git")));
         assert.ok(existsSync(f.admin));
         if (boundary === "ignored clean")

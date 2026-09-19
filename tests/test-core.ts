@@ -651,6 +651,7 @@ const loop = new BoardLoop(deps, state, executor);
 try {
   await loop.start();
   check(state.running && loop.isRunning(), "loop.start sets running");
+  await loop.tickNow(); // start registers, rather than awaiting, this first tick.
   check(
     tickUpdates === 1 && state.lastTickMs > 0,
     "loop tick refreshes persistent status",
@@ -809,7 +810,7 @@ const indexSource = readFileSync(
 check(
   indexSource.includes("executor.observation") &&
     indexSource.includes("builderSlots + (foreground ? 1 : 0)") &&
-    indexSource.includes("slots occupied · ${runningModels} models running") &&
+    indexSource.includes("model slots · ${runningModels} models running") &&
     indexSource.includes("${foreground.label} [${foreground.kind}]"),
   "persistent widget separates occupied slots from running models and includes every foreground lane",
 );

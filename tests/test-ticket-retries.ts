@@ -1,5 +1,6 @@
 // Real loop/executor/store/Git; all board/model I/O is offline and deterministic.
 import assert from "node:assert/strict";
+import { settledTicks } from "./async-loop-fixture.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -64,6 +65,7 @@ function fixture() {
     comment: async (c, body) => { await board.comment(c, body); return "comment-id"; },
     setStatus: async (c, status) => board.setStatus(c.itemId, status),
   }, review: async (input) => { reviews++; return reviewImpl(input); } }, createLoopState(), executor, store);
+  settledTicks(loop);
   const record = () => store.read(card.itemId)!;
   return { cfg, card, store, board, manager, events, comments, notices, runs, executor, loop, record,
     starts: () => starts, reviews: () => reviews, drains: () => drains,

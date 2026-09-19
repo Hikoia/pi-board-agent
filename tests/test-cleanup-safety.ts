@@ -145,7 +145,7 @@ try {
       writeFileSync(added, "after checked delete");
     }
   };
-  await assert.rejects(finish(), /changed|added/);
+  await assert.rejects(finish(), /changed|added|Unknown cleanup directory contents/);
   faults.afterFs = undefined;
   assert.ok(mutated);
   assert.equal(readFileSync(added, "utf8"), "after checked delete");

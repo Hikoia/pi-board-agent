@@ -26,6 +26,7 @@ import {
   inspectTicketExecutions,
 } from "./ticket-executor.js";
 import { TicketWorktrees } from "./ticket-worktree.js";
+import { activityLines, observeOperation } from "./operation.js";
 import {
   assertSupportedState,
   findUnsupportedState,
@@ -54,6 +55,9 @@ function stateRoot(cwd: string): string {
 }
 let loopState = createLoopState();
 let stopGeneration = 0;
+let startup: { controller: AbortController; promise: Promise<void> } | undefined;
+let stopBarrier: Promise<void> | undefined;
+let updateLiveWidget: (() => void) | undefined;
 const BOARD_WIDGET_ID = "board-agent-active";
 const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const loadedRuntimeIdentity = captureRuntimeIdentity(
@@ -151,12 +155,14 @@ function saveRuntime(
     sessionId: ctx.sessionManager.getSessionId() || undefined,
     state,
     startedAt: runtimeStartedAt,
+    activity: loopState.activity,
+    lastBlocker: loopState.lastBlocker,
   });
 }
 
 function liveRuntimeState(check: RevisionCheck): RuntimeState {
-  // No new runtime schema: recovery-only includes a retained cleanup owner.
-  if (loop?.isStopping()) return "recovery-only";
+  if (stopBarrier || loop?.isStopping() || startup?.controller.signal.aborted) return "stopping";
+  if (startup) return "starting";
   if (!check.ok)
     return loop?.isRunning() ? "recovery-only" : "version-mismatch";
   if (!loop?.isRunning()) return "stopped";
@@ -172,20 +178,56 @@ async function requireCurrentRevision(
   return check;
 }
 
-// Start the autonomous loop (shared by /board-agent run, auto_start, and recovery).
-async function startBoardLoop(
+// Register before yielding: /run and auto-start never hold the UI behind migration.
+function startBoardLoop(ctx: ExtensionContext, admitNewWork?: boolean): void {
+  if (stopBarrier || loop?.isStopping()) throw new Error("Loop cleanup is pending; retry stop before starting again.");
+  if (startup) {
+    ctx.ui.notify("[board-agent] STARTING (startup already registered).", "info");
+    return;
+  }
+  const controller = new AbortController();
+  const job = { controller, promise: Promise.resolve() };
+  startup = job;
+  job.promise = Promise.resolve().then(() => performStart(ctx, admitNewWork, controller.signal)).catch((error) => {
+    if (!controller.signal.aborted)
+      ctx.ui.notify(`[board-agent] Startup/recovery failed: ${String(error)}`, "error");
+  }).finally(() => {
+    if (startup === job) startup = undefined;
+    updateLiveWidget?.();
+    saveRuntime(ctx, liveRuntimeState(lastRevisionCheck), lastRevisionCheck);
+  });
+  void job.promise.catch(() => undefined); // UI/runtime failures are also observed by stop.
+  ctx.ui.notify("[board-agent] STARTING (preflight/migration; model admissions wait).", "info");
+}
+
+async function performStart(
   ctx: ExtensionContext,
-  admitNewWork = true,
+  admitNewWork: boolean | undefined,
+  signal: AbortSignal,
 ): Promise<void> {
   const cwd = ctx.cwd;
   const generation = stopGeneration;
+  signal.throwIfAborted();
   if (loop?.isStopping())
     throw new Error(
       "Loop cleanup is pending; retry stop before starting again.",
     );
   const root = stateRoot(cwd);
   assertSupportedState(cwd, root, true);
+  const previous = readRuntimeStatus(cwd);
+  if (previous?.pid === process.pid && previous.loadedRevision !== loadedRuntimeIdentity.loadedRevision)
+    revisionLatch.mismatch = true;
   const preflight = await currentRevision(cwd);
+  signal.throwIfAborted();
+  const cfg = loadContextConfig(ctx);
+  validateConfig(cfg);
+  if (admitNewWork === undefined) {
+    admitNewWork = cfg.auto_start && preflight.ok;
+    if (!admitNewWork && !hasRecoveryState(cwd, root)) {
+      if (!preflight.ok) throw new Error(formatRevisionFailure(preflight));
+      return;
+    }
+  }
   if (!preflight.ok && admitNewWork) {
     saveRuntime(
       ctx,
@@ -194,14 +236,8 @@ async function startBoardLoop(
     );
     throw new Error(formatRevisionFailure(preflight));
   }
-  // Cached-loop promotion must validate today's config too, not just its old snapshot.
-  const cfg = loadContextConfig(ctx);
-  validateConfig(cfg);
-  saveRuntime(
-    ctx,
-    preflight.ok ? liveRuntimeState(preflight) : "recovery-only",
-    preflight,
-  );
+  // Cached-loop promotion validates today's config too, not just its old snapshot.
+  saveRuntime(ctx, liveRuntimeState(preflight), preflight, root);
   if (!preflight.ok)
     ctx.ui.notify(
       `[board-agent] ${formatRevisionFailure(preflight)} Recovery only.`,
@@ -213,12 +249,14 @@ async function startBoardLoop(
   try {
     const { projectOwner, repoOwner, repoName } = resolveOwner(cfg, cwd);
     const botLogin = cfg.bot_identity || (await whoami());
+    signal.throwIfAborted();
     const meta = await getProjectMetadata(
       projectOwner,
       cfg.project.number,
       cfg.status_field,
       cfg.type_field,
     );
+    signal.throwIfAborted();
     validateProjectMetadata(meta, cfg);
     if (generation !== stopGeneration)
       throw new Error("Startup cancelled by stop/shutdown.");
@@ -227,7 +265,7 @@ async function startBoardLoop(
     if (loop?.isRunning()) {
       if (admitNewWork && !loop.isAdmittingNewWork()) {
         loop.enableAdmissions();
-        await loop.tickNow();
+        void loop.tickNow().catch((error) => ctx.ui.notify(`[board-agent] tick failed: ${String(error)}`, "error"));
         ctx.ui.notify(
           `[board-agent] Recovery loop promoted to autonomous mode.`,
           "info",
@@ -242,22 +280,15 @@ async function startBoardLoop(
     }
     ownerLock = acquireOwnerLock(cwd, botLogin, root);
     const worktrees = new TicketWorktrees(cwd);
+    loopWorktrees = { cwd: resolve(cwd), store: worktrees, cfg };
+    loopState = createLoopState();
 
     const updateWidget = () => {
       if (!ctx.hasUI) return;
-      if (loop?.isStopping()) {
-        ctx.ui.setWidget(
-          BOARD_WIDGET_ID,
-          ["Board Agent ● stopping (cleanup pending)"],
-          { placement: "belowEditor" },
-        );
-        return;
-      }
-      if (!loop?.isRunning()) {
+      if (!startup && !stopBarrier && !loop?.isRunning() && !loop?.isStopping()) {
         clearBoardWidget(ctx);
         return;
       }
-      executor.activeCount();
       const { active, occupiedSlots: builderSlots } = executor.observation ?? {
         active: [],
         occupiedSlots: 0,
@@ -267,13 +298,15 @@ async function startBoardLoop(
       const runningModels =
         active.filter((run) => run.status === "running").length +
         (foreground ? 1 : 0);
-      const widgetStatus = `${occupiedSlots}/${cfg.max_workers} slots occupied · ${runningModels} models running`;
+      const widgetStatus = `${occupiedSlots}/${cfg.max_workers} model slots · ${runningModels} models running`;
+      const lifecycle = liveRuntimeState(lastRevisionCheck);
       ctx.ui.setWidget(
         BOARD_WIDGET_ID,
         [
-          `Board Agent ● ${widgetStatus}`,
+          `Board Agent ● ${lifecycle === "starting" || lifecycle === "stopping" ? `${lifecycle.toUpperCase()} · ` : ""}${widgetStatus}`,
           ...active.map((run) => `  ${run.taskKey} [${run.status}]`),
           ...(foreground ? [`  ${foreground.label} [${foreground.kind}]`] : []),
+          ...activityLines(loopState, cfg.tick_seconds),
         ],
         { placement: "belowEditor" },
       );
@@ -289,10 +322,14 @@ async function startBoardLoop(
       );
       updateWidget();
     };
+    const publishObservation = () => {
+      updateWidget();
+      saveRuntime(ctx, liveRuntimeState(lastRevisionCheck), lastRevisionCheck, root);
+    };
     const revisionCheck = async () => {
-      updateWidget(); // Busy-tick heartbeat reflects live runs without package/config scans.
+      executor.activeCount(); // Existing heartbeat observation, never from progress callbacks.
+      publishObservation();
       const check = lastRevisionCheck;
-      saveRuntime(ctx, liveRuntimeState(check), check, root);
       return {
         ok: check.ok,
         reason: check.ok ? undefined : formatRevisionFailure(check),
@@ -319,15 +356,21 @@ async function startBoardLoop(
     });
     // No manager exists yet. Acquisition rejects a live previous owner (even
     // this PID); its shutdown retains the lock until all old work is drained.
-    const migration = await executor.migrateLegacy(
-      ownerLock,
-      () => generation === stopGeneration,
-    );
-    for (const failure of migration.failures)
-      callback(
-        `Legacy migration preserved ${failure.source}: ${failure.reason}`,
-        "warn",
-      );
+    updateLiveWidget = updateWidget;
+    const observer = observeOperation(loopState, "migration", publishObservation);
+    let migrationBlocker: string | undefined;
+    try {
+      const migration = await executor.migrateLegacy(ownerLock, () => generation === stopGeneration, {
+        signal, onProgress: observer.onProgress,
+      });
+      for (const failure of migration.failures) {
+        migrationBlocker = `${failure.source}: ${failure.reason}`;
+        callback(`Legacy migration preserved ${migrationBlocker}`, "warn");
+      }
+    } finally {
+      observer.finish(migrationBlocker);
+    }
+    signal.throwIfAborted();
     if (generation !== stopGeneration)
       throw new Error("Startup cancelled by stop/shutdown.");
     const deps: LoopDeps = {
@@ -347,8 +390,8 @@ async function startBoardLoop(
         };
       },
       onTick,
+      onActivity: publishObservation,
     };
-    loopState = createLoopState();
     nextLoop = new BoardLoop(
       deps,
       loopState,
@@ -359,6 +402,7 @@ async function startBoardLoop(
     );
     loop = nextLoop;
     loopWorktrees = { cwd: resolve(cwd), store: worktrees, cfg };
+    executor.activeCount(); // Migration is complete; seed display before the first board await.
     await nextLoop.start();
     if (
       generation !== stopGeneration ||
@@ -392,6 +436,7 @@ async function startBoardLoop(
       }
     } else {
       ownerLock?.release();
+      if (ownerLock) loopWorktrees = undefined;
     }
     if (loop === nextLoop && nextLoop?.isStopped()) {
       loop = null;
@@ -406,6 +451,32 @@ async function startBoardLoop(
   }
 }
 
+function stopBoardLoop(ctx: ExtensionContext): Promise<void> {
+  if (stopBarrier) return stopBarrier;
+  stopGeneration++;
+  const pendingStartup = startup;
+  stopBarrier = Promise.resolve().then(async () => {
+    // Startup may still be closing a hashing handle, archiving or awaiting Git.
+    const settled = await Promise.allSettled([pendingStartup?.promise]);
+    if (loop) await loop.stop();
+    if (settled[0].status === "rejected") throw settled[0].reason;
+  }).finally(() => {
+    if (loop?.isStopped()) loop = null;
+    if (!loop) {
+      loopWorktrees = undefined;
+      updateLiveWidget = undefined;
+      clearBoardWidget(ctx);
+    }
+    stopBarrier = undefined; // A failed drain keeps the loop/owner for another stop.
+    saveRuntime(ctx, liveRuntimeState(lastRevisionCheck), lastRevisionCheck);
+  });
+  pendingStartup?.controller.abort();
+  loop?.requestStop();
+  updateLiveWidget?.();
+  saveRuntime(ctx, "stopping", lastRevisionCheck);
+  return stopBarrier;
+}
+
 export default function (pi: ExtensionAPI) {
   const subcommands = new Map<
     string,
@@ -413,39 +484,11 @@ export default function (pi: ExtensionAPI) {
   >();
 
   // Resume durable ticket runs on every startup/reload; auto_start also admits new work.
-  pi.on("session_start", async (_event, ctx) => {
-    if (loop?.isStopping()) return;
+  pi.on("session_start", (_event, ctx) => {
+    if (startup || stopBarrier || loop?.isStopping() || loop?.isRunning()) return;
     clearBoardWidget(ctx);
     runtimeStartedAt = new Date().toISOString();
-    try {
-      // Do this before even the heartbeat write, not only inside recovery discovery.
-      const root = stateRoot(ctx.cwd);
-      assertSupportedState(ctx.cwd, root, true);
-      const cfg = loadContextConfig(ctx);
-      validateConfig(cfg);
-      const previous = readRuntimeStatus(ctx.cwd);
-      if (
-        previous?.pid === process.pid &&
-        previous.loadedRevision !== loadedRuntimeIdentity.loadedRevision
-      ) {
-        revisionLatch.mismatch = true;
-      }
-      const revision = await currentRevision(ctx.cwd);
-      saveRuntime(ctx, revision.ok ? "stopped" : "version-mismatch", revision);
-      const recovery = hasRecoveryState(ctx.cwd, root);
-      if (cfg.auto_start && revision.ok && !loop?.isRunning()) {
-        await startBoardLoop(ctx, true);
-      } else if (recovery && !loop?.isRunning()) {
-        await startBoardLoop(ctx, false);
-      } else if (!revision.ok) {
-        throw new Error(formatRevisionFailure(revision));
-      }
-    } catch (error: any) {
-      ctx.ui.notify(
-        `[board-agent] Startup/recovery failed: ${error.message}`,
-        "error",
-      );
-    }
+    startBoardLoop(ctx); // Automatic admission/recovery decision is inside tracked startup.
   });
   // ----------- /board-agent init -----------
   subcommands.set("init", {
@@ -616,10 +659,17 @@ export default function (pi: ExtensionAPI) {
               `    ${run.taskKey}: ${run.runId} [${run.status}] ${run.worktree}`,
           ),
         );
-        if (loop?.isStopping()) {
+        const foregroundSlots = loopState.foreground ? 1 : 0;
+        lines.push(
+          `Board Agent · ${execution.active.length + foregroundSlots}/${cfg.max_workers} model slots · ${execution.active.filter((r) => r.status === "running").length + foregroundSlots} models running`,
+          ...activityLines(loopState, cfg.tick_seconds),
+        );
+        if (liveRuntimeState(lastRevisionCheck) === "stopping") {
           lines.push(
             "Loop: STOPPING (cleanup pending; retry stop after a drain failure)",
           );
+        } else if (startup) {
+          lines.push("Loop: STARTING (migration barrier; no model admissions)");
         } else if (loopState.running) {
           lines.push(
             `Loop: RUNNING (${loop?.isAdmittingNewWork() ? "autonomous" : "recovery-only"})  tick=${loopState.tickCount}  launches=${loopState.wavesLaunched}`,
@@ -630,7 +680,11 @@ export default function (pi: ExtensionAPI) {
         const output = lines.join("\n");
         ctx.ui.notify(output, "info");
       } catch (err: any) {
-        ctx.ui.notify(`Status failed: ${err.message}`, "error");
+        ctx.ui.notify([
+          `Loop: ${liveRuntimeState(lastRevisionCheck).toUpperCase()}${loop?.isStopping() ? " (cleanup pending; ownership retained)" : ""}`,
+          ...activityLines(loopState, loopWorktrees?.cfg.tick_seconds ?? 90),
+          `Status board read failed: ${err.message}`,
+        ].join("\n"), "error");
       }
     },
   });
@@ -641,7 +695,7 @@ export default function (pi: ExtensionAPI) {
       "Start the autonomous loop (picks Ready cards from the GitHub Project)",
     handler: async (_args, ctx) => {
       try {
-        await startBoardLoop(ctx);
+        startBoardLoop(ctx, true);
       } catch (err: any) {
         ctx.ui.notify(`[board-agent] Failed to start: ${err.message}`, "error");
       }
@@ -652,32 +706,13 @@ export default function (pi: ExtensionAPI) {
   subcommands.set("stop", {
     description: "Stop the autonomous loop gracefully",
     handler: async (_args, ctx) => {
-      stopGeneration++;
-      if (!loop) {
-        clearBoardWidget(ctx);
-        saveRuntime(ctx, "stopped", lastRevisionCheck);
-        ctx.ui.notify("No loop is running.", "warning");
-        return;
-      }
-      const current = loop;
       try {
-        await current.stop();
+        await stopBoardLoop(ctx);
         ctx.ui.notify("Loop stopped.", "info");
       } catch (error: any) {
-        ctx.ui.notify(
-          current.isStopped()
-            ? `Loop stopped with tick warning: ${error.message}`
-            : `Loop cleanup incomplete; ownership retained. Retry stop: ${error.message}`,
-          "warning",
-        );
-      } finally {
-        if (current.isStopped() && loop === current) {
-          loop = null;
-          loopWorktrees = undefined;
-        }
-        if (!loop) clearBoardWidget(ctx);
-        const revision = lastRevisionCheck;
-        saveRuntime(ctx, liveRuntimeState(revision), revision);
+        ctx.ui.notify(loop
+          ? `Loop cleanup incomplete; ownership retained. Retry stop: ${error.message}`
+          : `Loop stopped with tick warning: ${error.message}`, "warning");
       }
     },
   });
@@ -700,32 +735,12 @@ export default function (pi: ExtensionAPI) {
 
   // ----------- Cleanup on shutdown -----------
   pi.on("session_shutdown", async (_event, ctx) => {
-    stopGeneration++;
-    const current = loop;
     try {
-      if (current) await current.stop();
+      await stopBoardLoop(ctx);
     } catch (error: any) {
-      ctx.ui.notify(
-        current?.isStopped()
-          ? `[board-agent] Shutdown completed with tick warning: ${error.message}`
-          : `[board-agent] Shutdown cleanup incomplete; ownership retained. Retry stop: ${error.message}`,
-        current?.isStopped() ? "warning" : "error",
-      );
-    } finally {
-      if (current?.isStopped() && loop === current) {
-        loop = null;
-        loopWorktrees = undefined;
-      }
-      if (!loop) clearBoardWidget(ctx);
-      try {
-        const revision = lastRevisionCheck;
-        saveRuntime(ctx, liveRuntimeState(revision), revision);
-      } catch (error: any) {
-        ctx.ui.notify(
-          `[board-agent] Runtime status update failed: ${error.message}`,
-          "error",
-        );
-      }
+      ctx.ui.notify(loop
+        ? `[board-agent] Shutdown cleanup incomplete; ownership retained. Retry stop: ${error.message}`
+        : `[board-agent] Shutdown completed with tick warning: ${error.message}`, loop ? "error" : "warning");
     }
   });
 }

@@ -13,6 +13,7 @@ import {
   type LegacyMigrationReport,
 } from "./legacy-tickets.js";
 import type { OwnerLock } from "./owner-lock.js";
+import { checkOperation, type OperationControl } from "./operation.js";
 import type { Config } from "./config.js";
 import { planSlug } from "./config.js";
 import {
@@ -94,11 +95,13 @@ export interface TicketExecutor {
     cards: Card[],
     canStartWork?: () => boolean | Promise<boolean>,
     canStartWorkNow?: () => boolean,
+    excludedItemId?: string,
   ): Promise<ReconcileSummary>;
   hasPendingRecovery?(itemId: string): boolean;
   migrateLegacy?(
     owner: OwnerLock,
     canMigrate?: () => boolean,
+    control?: OperationControl,
   ): Promise<LegacyMigrationReport>;
   /** Migration failures are isolated from all model/board mutations. */
   legacyBlocked?(itemId: string): string | undefined;
@@ -114,6 +117,7 @@ export interface TicketExecutor {
     card: Card,
     canStartWork?: () => boolean | Promise<boolean>,
     canStartWorkNow?: () => boolean,
+    control?: OperationControl,
   ): Promise<FinalizeOutcome>;
   activeCount(): number;
   /** Close launches/recovery immediately, before BoardLoop waits for its tick. */
@@ -367,8 +371,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
     this.conflicts = new LegacyTickets(deps);
   }
 
-  migrateLegacy(owner: OwnerLock, canMigrate?: () => boolean) {
-    return this.conflicts.migrate(owner, canMigrate);
+  migrateLegacy(owner: OwnerLock, canMigrate?: () => boolean, control?: OperationControl) {
+    return this.conflicts.migrate(owner, canMigrate, control);
   }
 
   legacyBlocked(itemId: string): string | undefined {
@@ -480,7 +484,9 @@ export class ManagedTicketExecutor implements TicketExecutor {
       throw new Error("Execution record changed while draining.");
   }
 
-  private async settle(record: TicketExecutionRecord): Promise<void> {
+  private async settle(record: TicketExecutionRecord, control?: OperationControl): Promise<void> {
+    const write = pendingTicketWrite(record);
+    const releaseOnly = write && !write.comment && !write.reopen && write.status === write.card.status;
     await settleTicketWrite(
       this.deps.worktrees,
       record,
@@ -489,6 +495,10 @@ export class ManagedTicketExecutor implements TicketExecutor {
       async () => {
         if (record.activeRunId) await this.stopActiveRun(record);
       },
+      { ...control, check: () => {
+        checkOperation(control);
+        if (this.stopping && !releaseOnly) throw new Error("Executor stopping; pending writeback retained.");
+      } },
     );
   }
 
@@ -681,6 +691,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     cards: Card[],
     canStartWork: () => boolean | Promise<boolean> = () => true,
     canStartWorkNow: () => boolean = () => true,
+    excludedItemId?: string,
   ): Promise<ReconcileSummary> {
     const summary: ReconcileSummary = {
       active: [],
@@ -696,6 +707,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     this.canResumeNow = canStartWorkNow;
     this.resumeRevision++;
     for (const card of cards) {
+      if (card.itemId === excludedItemId) continue;
       if (
         this.legacyBlocked(card.itemId) &&
         !this.conflicts.pendingDesign.has(card.itemId)
@@ -717,9 +729,20 @@ export class ManagedTicketExecutor implements TicketExecutor {
 
     for (const original of records) {
       if (this.stopping) break;
-      if (this.legacyBlocked(original.itemId)) continue;
+      if (original.itemId === excludedItemId || this.legacyBlocked(original.itemId)) continue;
       const snapshot = cardsById.get(original.itemId);
       try {
+        // Pure maintenance owns its fresh reads/writeback in the finalizer, not
+        // the admission prefix. Open/manual lanes remain paused there as well.
+        const pending = pendingTicketWrite(original);
+        const maintenance = pending
+          ? pending.card.closed && ["integrate", "cleanup"].includes(original.retry!.stage)
+          : original.finalization || original.integration ||
+            (snapshot?.closed && statusIs(snapshot, this.deps.cfg.columns.done)) ||
+            ["integrate", "cleanup"].includes(original.retry?.stage ?? "") ||
+            this.deps.worktrees.hasCleanupReceipt(original.itemId);
+        if (!original.activeRunId && original.launchingAt === undefined && maintenance)
+          continue;
         if (
           snapshot?.closed &&
           statusIs(snapshot, this.deps.cfg.columns.backlog) &&
@@ -826,6 +849,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
 
     for (const snapshot of cards) {
       if (this.stopping) break;
+      if (snapshot.itemId === excludedItemId) continue;
       if (
         !isTargetIssue(
           snapshot,
@@ -1008,7 +1032,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
         retry: true,
         reason: record.retry?.reason ?? reason,
       });
-      await this.settle(pending);
+      try { await this.settle(pending); }
+      catch (error) { if (!this.stopping) throw error; } // Stop retains a status-changing reset for recovery.
     } else
       await this.outcome(record, card, {
         taskKey: record.taskKey,
@@ -1279,8 +1304,14 @@ export class ManagedTicketExecutor implements TicketExecutor {
     snapshot: Card,
     canStartWork: () => boolean | Promise<boolean> = () => true,
     canStartWorkNow: () => boolean = () => true,
+    control?: OperationControl,
   ): Promise<FinalizeOutcome> {
-    if (this.stopping || !canStartWorkNow())
+    const externalControl = control;
+    control = { ...control, check: () => {
+      checkOperation(externalControl);
+      if (this.stopping || !canStartWorkNow()) throw new FinalizationWithdrawn("Finalization stopped or ownership lost; work retained.");
+    } };
+    if (this.stopping || control.signal?.aborted || !canStartWorkNow())
       return {
         status: "skipped",
         reason: "executor stopping or ownership lost",
@@ -1302,8 +1333,10 @@ export class ManagedTicketExecutor implements TicketExecutor {
       !record.activeRunId &&
       record.launchingAt === undefined;
     try {
+      checkOperation(control);
       original = this.deps.worktrees.read(snapshot.itemId);
       card = await this.deps.board.getCard(snapshot.itemId);
+      checkOperation(control);
       if (
         !card ||
         !sameTicketContract(card, snapshot) ||
@@ -1321,6 +1354,14 @@ export class ManagedTicketExecutor implements TicketExecutor {
           status: "skipped",
           reason: "execution record changed during fresh approval read",
         };
+      // Retire historical technical Ready writes even after manual withdrawal;
+      // settleTicketWrite rechecks the original contract and only releases our claim.
+      if (record && !record.activeRunId && record.launchingAt === undefined &&
+          ["integrate", "cleanup"].includes(record.retry?.stage ?? "") &&
+          pendingTicketWrite(record)) {
+        await this.settle(record, control);
+        return { status: "skipped", reason: "historical technical writeback retired" };
+      }
       const retrying =
         record?.retry &&
         ["build", "integrate", "cleanup"].includes(record.retry.stage);
@@ -1350,7 +1391,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         ...(record ? { taskKey: record.taskKey } : {}),
       };
       const legacyComplete =
-        !record && (await this.conflicts.completedReceipt(task, card));
+        !record && (await this.conflicts.completedReceipt(task, card, control));
       if (record?.retry?.stage === "build")
         throw new Error(record.retry.reason); // unsettled reopen/claim: never integrate again
       if (this.stopping || !canStartWorkNow())
@@ -1360,7 +1401,9 @@ export class ManagedTicketExecutor implements TicketExecutor {
         };
       const expected = card;
       const assertCurrent = async (done = false) => {
+        checkOperation(control);
         const fresh = await this.deps.board.getCard(expected.itemId);
+        checkOperation(control);
         if (
           this.stopping ||
           !canStartWorkNow() ||
@@ -1386,8 +1429,9 @@ export class ManagedTicketExecutor implements TicketExecutor {
             task,
             this.deps.cfg.task_merge_strategy,
             assertCurrent,
-            (r, remove, guard) =>
-              this.conflicts.cleanupResidual(r, remove, guard),
+            (r, operation) => this.conflicts.cleanupResidual(r, operation),
+            undefined,
+            control,
           );
       const assertAbsent = async () => {
         if (await this.deps.worktrees.remoteSha(task.taskBranch))
@@ -1405,6 +1449,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
             "Task ref or pending recovery remains before Backlog write.",
           );
       };
+      control.onProgress?.({ phase: "writeback" });
       await assertAbsent();
       if (!statusIs(expected, this.deps.cfg.columns.backlog))
         await this.deps.board.setStatus(
@@ -1414,7 +1459,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
       await assertCurrent(true);
       if (resultSha)
         await this.deps.worktrees.completeFinalization(task, resultSha, () =>
-          assertCurrent(true),
+          assertCurrent(true), control,
         );
       snapshot.status = this.deps.cfg.columns.backlog;
       snapshot.closed = true;
@@ -1432,7 +1477,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         error instanceof TicketStateChangedError
       )
         return { status: "skipped", reason: error.message };
-      if (this.stopping || !canStartWorkNow())
+      if (this.stopping || control.signal?.aborted || !canStartWorkNow())
         return {
           status: "skipped",
           reason: "finalization stopped or ownership lost",
@@ -1442,6 +1487,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
         ? diagnostic
         : `fresh card read failed: ${diagnostic}`;
       try {
+        checkOperation(control);
+        control.onProgress?.({ phase: "writeback" });
         let record = this.deps.worktrees.read(snapshot.itemId);
         if (
           !record ||
@@ -1493,13 +1540,16 @@ export class ManagedTicketExecutor implements TicketExecutor {
           ...r,
           retry: { stage, reason: detail },
         }));
-        if (!card) return { status: "blocked", reason };
+        // Project Status describes work, not a failed Git/network operation.
+        // Only an actual build retry may claim/comment/reopen/write Ready.
+        if (!buildRetry || !card) return { status: "blocked", reason: detail };
         if (
           buildRetry &&
           (this.stopping || !(await canStartWork()) || !canStartWorkNow())
         )
           return { status: "blocked", reason };
         const fresh = await this.deps.board.getCard(card.itemId);
+        checkOperation(control);
         if (
           !fresh ||
           !sameTicketContract(fresh, card) ||
@@ -1513,6 +1563,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         if (!(await this.deps.board.claim(fresh)))
           return { status: "skipped", reason: "claim lost" };
         const current = await this.deps.board.getCard(card.itemId);
+        checkOperation(control);
         if (
           !current ||
           !sameTicketContract(current, fresh) ||
@@ -1531,9 +1582,11 @@ export class ManagedTicketExecutor implements TicketExecutor {
           ...(buildRetry ? { reopen: true as const } : {}),
           comment: `## ${buildRetry ? "Merge conflict — build retry" : `${stage} retry`}\n\n${detail}`,
         });
-        await this.settle(pending);
-        return { status: "skipped", reason: detail };
+        await this.settle(pending, control);
+        return { status: "blocked", reason: detail };
       } catch (writeError) {
+        if (this.stopping || control.signal?.aborted || !canStartWorkNow())
+          return { status: "skipped", reason: "finalization stopped or ownership lost" };
         this.deps.callback(
           `Finalization writeback pending: ${String(writeError)}`,
           "warn",

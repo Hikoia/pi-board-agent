@@ -68,7 +68,8 @@ labels and notifications remain configurable; use [config-template.yml](../confi
 ```
 
 Stop closes new admission, disables automatic resume scheduling and cancels
-foreground review. It waits for the current tick/heartbeat, review cleanup and
+startup, foreground review and the one maintenance finalizer. It waits for
+startup/migration, the current tick/heartbeat, file handles, review cleanup and
 managed pause/lease drain before releasing ownership. Reentrant stop/shutdown
 calls share that barrier. If draining fails, the loop/managers/owner remain:
 resolve the reported failure and retry stop. A stopping/recovery-only display or
@@ -161,7 +162,7 @@ Before enabling the owner in a target repository:
    ```
 
    This deployment tool deliberately inspects current package HEAD/status.
-   STALE, OVERRIDE, DIRTY, MISMATCH or STOPPED needs investigation. It is not an
+   STALE, OVERRIDE, DIRTY, MISMATCH, STOPPED, STARTING or STOPPING needs investigation. It is not an
    ordinary heartbeat hook, and STOPPED is expected during a stopped rollout.
 
 Windows additionally needs PowerShell FullLanguage with `Add-Type`/PInvoke for
@@ -210,9 +211,11 @@ separately verified coherent stopped backup and remote-state reconciliation.
 | Done OPEN | Await human validation/close; no integration or task cleanup |
 | Closed Done Issue of any Type | Fresh human approval needs no review marker. Integrate exact local/remote sources, then Backlog; unsafe ownership still blocks |
 | Real merge conflict | Comment, reopen, Ready/build; resolve original branch, tests → review → Done → **renewed human close** |
-| Nonconflicting base advance rejects push | Closed Ready/integrate; observe then prepare another normal merge, no model or reopen |
+| Nonconflicting base advance rejects push | Keep the closed lane, record integrate retry locally; observe then prepare another normal merge, no model or reopen |
 | Push response lost | Observe fresh origin/base before deciding integrate versus cleanup; do not infer success from local result |
-| Integrated cleanup/Backlog write failure | Retain cleanup progress; retry cleanup/Backlog only, no merge/build/review replay |
+| Integrated cleanup/Backlog write failure | Keep Done/Backlog and local cleanup progress; retry unfinished cleanup/Backlog only, no Ready regression or merge/build/review replay |
+| Old closed Ready + integrate/cleanup | Resume technical finalization without a builder/reopen or preliminary Done move |
+| Old technical pending Ready writeback | Do not replay Ready/comment/reopen; freshly verify identity/claim/record, release safely and honor withdrawal without erasing the technical stage |
 | Remote base rewritten or confirmed result absent | Preserve integration record/refs/work; investigate, never supersede cleanup with a new result |
 | Dirty/untracked programs, changed refs, wrong path/branch, Git lock | Cleanup blocks. Stop and investigate the actual owner; never force-remove/prune/unlock to get green |
 | Unknown unregistered leftover | Retain it. No recursive fallback or new snapshot to manufacture removal authority |
@@ -220,12 +223,16 @@ separately verified coherent stopped backup and remote-state reconciliation.
 | Manual lane/claim/identity withdrawal | Do not overwrite it or treat it as a technical failure; release only a freshly verified original bot claim after drain |
 | No local task ref | Check remote; restore remote-only ref using compare-and-create, never create a builder/worktree |
 | Confirmed no local or remote task refs | Move closed Done to Backlog only; preserve idle records/leftovers and never bypass pending or corrupt recovery |
+| Stop during pending writeback | Do not send a late status/comment/reopen; retain the pending reset/result for guarded settlement by the next owner. Safe release-only cleanup may finish |
 | Failed owner drain / owner.lock.reclaim remains | Coordinate all owners, preserve evidence, retry or investigate; never steal ownership from an uncertain process |
 
 `max_workers` counts launching, paused, missing and unsettled associated runs as
 occupied. An optimistic widget cannot authorize more capacity. Normal provider
 backoff is retained. Review gets at most one foreground slot; builders use the
-remaining budget. There is no second retry queue or same-ticket immediate retry.
+remaining budget. One maintenance finalizer uses no model slot and does not
+hold Ready/Review admissions behind cleanup or repeated remote reads. Candidates
+rotate; the same ticket is excluded until settlement. Board-wide GitHub failure
+still fails closed. There is no second retry queue or same-ticket immediate retry.
 
 Inspect before manual recovery:
 
@@ -243,11 +250,41 @@ removal, expected local ref deletion, Project Backlog, then record deletion last
 Missing steps resume; changed ownership and valuable work block. Keep the record
 until the sequence actually completes.
 
+## Maintenance observation
+
+`/board-agent run` and auto-start return after registering startup; `starting`
+means preflight/migration has not yet opened model admission. `stopping` means
+cancellation/drain is pending, not that the owner can be replaced. Fleet checks
+report STARTING/STOPPING as non-healthy and grant no takeover authority.
+
+Widget, `/board-agent status` and schema-1 `runtime.json` show maintenance apart
+from model slots: ticket, phase, completed/total MiB or items, elapsed time,
+`lastProgressAt`, and the last blocking reason. Missing activity in an older
+runtime is valid. Progress updates are limited to once per second except phase
+changes/errors/end, without extra Git/GitHub/revision probes. Active activity
+clears on completion; the blocker persists until the next attempt.
+
+Heartbeat only means the owner is responding. After no progress for
+`max(3 × tick_seconds, 300)` seconds, inspect the displayed duration/blocker;
+**do not automatically unlock or restart**. Slow Git completes at its existing
+deadline, and stop waits for it rather than abandoning its Promise.
+
+Legacy cleanup verifies its full backup at preparation and finish (at most twice
+per attempt), then checks each surviving source/parent/backup before non-recursive
+unlink/rmdir. Large files hash in 1 MiB chunks with cooperative cancellation.
+Receipt/manifest metadata is pinned between complete reads. Remote authorization
+is refreshed after at most 32 deletes or 1 second; long-file validation that
+exhausts the window refreshes before deletion. Local owner/record/Git checks and
+stop are never cached. Ref deletion/completion have separate fresh guards. The
+window is **not** a network timeout or a one-second remote-change detection SLA.
+Partial removal resumes safely; no new cleanup snapshots/backups/archives or
+force-delete fallback are introduced. There is no fixed cleanup-time promise.
+
 ## State locations and evidence
 
 ```text
 .pi/board-agent/owner.lock[.reclaim]
-.pi/board-agent/runtime.json                     # last-check identity + heartbeat
+.pi/board-agent/runtime.json                     # last-check identity, heartbeat, optional maintenance activity
 .pi/board-agent/context.md
 .pi/board-agent/ticket-worktrees/<item>.json      # v4 continuation
 .pi/board-agent/legacy-v3/*                      # exact raw migration sources

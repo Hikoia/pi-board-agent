@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { fixture, calls, faults, root, dispose, TicketWorktrees } from "./cleanup-fixture.js";
 
 try {
+  for (const lockedFile of process.platform === "win32" ? ["ignored", "tracked"] : ["native"]) {
   const f = await fixture(true, true);
   if (process.platform !== "win32") {
     calls.length = 0;
@@ -23,13 +24,14 @@ try {
       "SKIP: Windows FileShare.None exclusive lock requires Windows; deterministic partial-removal tests run on both platforms",
     );
   } else {
-    const path = join(f.record.path, "ignored", "cache.bin"),
-      release = join(root, "release-exclusive-lock");
+    const path = lockedFile === "ignored" ? join(f.record.path, "ignored", "cache.bin") : join(f.record.path, "feature.txt"),
+      expected = lockedFile === "ignored" ? Buffer.from([0, 1, 2, 255]) : Buffer.from("feature\n"),
+      release = join(root, `release-exclusive-lock-${lockedFile}`);
     const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
     let child: ReturnType<typeof spawn> | undefined;
     let closed: Promise<void> | undefined;
     faults.beforeGit = async (args) => {
-      if (args[0] !== "worktree" || args[1] !== "remove") return;
+      if (lockedFile === "ignored" ? args[0] !== "clean" : args[0] !== "worktree" || args[1] !== "remove") return;
       faults.beforeGit = undefined;
       assert.ok(
         existsSync(f.recordFile),
@@ -80,24 +82,28 @@ try {
         assert.ok(error instanceof Error);
         assert.match(
           error.message,
-          /git worktree remove .*failed/s,
+          /git (?:clean|worktree remove) .*failed/s,
           "failure must come from REAL Git, not an injected error",
         );
         console.log(`Real locked Git removal diagnostic: ${error.message}`);
         return true;
       });
       assert.ok(child, "real exclusive lock was acquired");
+      if (lockedFile === "ignored") {
+        assert.equal(await f.store.remoteSha(f.task.taskBranch), f.taskSha, "ignored-file clean fails before remote ref deletion");
+        assert.ok(f.store.worktreeEntries().some((entry) => resolve(entry.path) === resolve(f.record.path)));
+      }
       const integrated = f.tip(),
         progress = readFileSync(f.recordFile);
       assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
       assert.ok(existsSync(path));
       assert.ok(existsSync(f.recordFile));
-      await assert.rejects(f.finish(), /EBUSY|EACCES|EPERM|worktree|cleanup|Unregistered residual/i);
+      await assert.rejects(f.finish(), /EBUSY|EACCES|EPERM|worktree|git clean|cleanup|Unregistered residual/i);
       assert.deepEqual(readFileSync(f.recordFile), progress);
       assert.equal(f.tip(), integrated);
       writeFileSync(release, "release");
       await closed;
-      assert.deepEqual(readFileSync(path), Buffer.from([0, 1, 2, 255]), "the exclusively locked original bytes survived partial Git removal");
+      assert.deepEqual(readFileSync(path), expected, "the exclusively locked original bytes survived the failed cleanup");
       calls.length = 0;
       const registered = f.store.worktreeEntries().some((entry) => resolve(entry.path) === resolve(f.record.path));
       if (registered) {
@@ -113,7 +119,7 @@ try {
         const restarted = new TicketWorktrees(f.repo);
         await assert.rejects(restarted.finalizeAccepted(f.task, "merge"), /Unregistered residual requires existing legacy evidence/);
         assert.deepEqual(readFileSync(f.recordFile), progress);
-        assert.deepEqual(readFileSync(path), Buffer.from([0, 1, 2, 255]));
+        assert.deepEqual(readFileSync(path), expected);
         assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
         assert.equal(existsSync(f.receipt), false);
         assert.equal(existsSync(join(f.repo, ".pi", "board-agent", "cleanup-backups")), false);
@@ -126,6 +132,7 @@ try {
       writeFileSync(release, "release");
       await closed;
     }
+  }
   }
 } finally {
   dispose();

@@ -22,6 +22,7 @@ import {
   type ProcessResult,
 } from "./process-runner.js";
 import type { BuilderTask } from "./workflow-prompt.js";
+import { checkOperation, type OperationControl } from "./operation.js";
 
 export interface TicketFinalizationState {
   targetBranch: string;
@@ -932,11 +933,15 @@ export class TicketWorktrees {
     assertCurrent: () => Promise<void> = async () => {},
     legacyResidual?: (
       record: TicketExecutionRecord,
-      remove: boolean,
-      guard: () => Promise<void>,
-    ) => Promise<void>,
+      control?: OperationControl,
+    ) => Promise<{ remove(authorize: () => Promise<void>, local: () => void): Promise<void> } | undefined>,
     _legacyApproval?: (record: TicketExecutionRecord) => string | undefined,
+    control?: OperationControl,
   ): Promise<string | undefined> {
+    checkOperation(control);
+    control?.onProgress?.({ phase: "integrate" });
+    const current = assertCurrent;
+    assertCurrent = async () => { checkOperation(control); await current(); checkOperation(control); };
     this.validateBranches(task.baseBranch, task.taskBranch);
     if (task.baseBranch === task.taskBranch)
       throw new Error("Task branch must differ from the base branch.");
@@ -1006,9 +1011,14 @@ export class TicketWorktrees {
       throw new Error(
         "Build retry must finish before renewed manual close approval.",
       );
+    const localGuard = () => {
+      checkOperation(control);
+      this.assertFinalizationRecord(task, record!);
+      checkOperation(control);
+    };
     const guard = async () => {
       await assertCurrent();
-      this.assertFinalizationRecord(task, record!);
+      localGuard();
     };
     const observe = async () => {
       await this.fetchRequired(task.baseBranch);
@@ -1016,7 +1026,7 @@ export class TicketWorktrees {
       return this.fetchedSha(task.baseBranch);
     };
     const save = (patch: Partial<TicketExecutionRecord>) => {
-      this.assertFinalizationRecord(task, record!);
+      localGuard();
       record = this.update(task.itemId, (r) => ({ ...r, ...patch }));
     };
     const taskPresent = async () => {
@@ -1191,6 +1201,7 @@ export class TicketWorktrees {
       },
     });
 
+    control?.onProgress?.({ phase: "remove" });
     const cleanupGuard = async () => {
       const base = await observe();
       if (!this.isAncestor(integration.resultSha, base))
@@ -1200,30 +1211,28 @@ export class TicketWorktrees {
     };
     const residual = () =>
       existsSync(record!.path) && !this.entryForPath(record!.path);
-    const checkResidual = async () => {
-      if (this.entryForPath(record!.path)) return;
-      if (!residual() && !legacyResidual) return;
-      if (!legacyResidual)
-        throw new Error(
-          "Unregistered residual requires existing legacy evidence; work retained.",
-        );
-      await legacyResidual(record!, false, cleanupGuard);
-    };
-    await checkResidual();
+    await cleanupGuard();
+    let legacyCleanup: Awaited<ReturnType<NonNullable<typeof legacyResidual>>>;
+    if (!this.entryForPath(record.path)) {
+      if (residual() && !legacyResidual)
+        throw new Error("Unregistered residual requires existing legacy evidence; work retained.");
+      legacyCleanup = await legacyResidual?.(record, control);
+    }
     await cleanupGuard();
     const cleanupRemote = await this.remoteSha(task.taskBranch);
     if (cleanupRemote && cleanupRemote !== sourceRemote)
       throw new Error("Remote task ref changed; cleanup retained.");
     await cleanupGuard();
     if (this.entryForPath(record.path) && existsSync(record.path)) {
-      await this.checkNestedGit(record.path);
+      await this.checkNestedGit(record.path, true, undefined, control);
       await cleanupGuard();
       // An ignored Windows OS lock must fail while registration and refs remain.
       await mustGitAsync(["clean", "-fdX"], record.path);
       const links: string[] = [];
-      await this.checkNestedGit(record.path, true, links);
+      await this.checkNestedGit(record.path, true, links, control);
       await cleanupGuard();
       for (const path of links) {
+        checkOperation(control);
         const args = [
           "check-ignore",
           "--quiet",
@@ -1244,6 +1253,7 @@ export class TicketWorktrees {
       }
       await cleanupGuard();
     }
+    checkOperation(control);
     if (cleanupRemote)
       await mustGitAsync(
         [
@@ -1268,11 +1278,8 @@ export class TicketWorktrees {
     }
     // Never a fallback for failed git worktree remove. Only converted,
     // unregistered old remnants may consume their pre-existing snapshots.
-    if (!this.entryForPath(record.path) && (residual() || legacyResidual)) {
-      if (!legacyResidual)
-        throw new Error("Unknown unregistered worktree residual retained.");
-      await legacyResidual(record, true, cleanupGuard);
-    }
+    if (legacyCleanup) await legacyCleanup.remove(remoteAbsent, localGuard);
+    else if (residual()) throw new Error("Unknown unregistered worktree residual retained.");
     await remoteAbsent();
     if (existsSync(record.path) || this.entryForPath(record.path))
       throw new Error("Worktree remains; cleanup retained.");
@@ -1377,7 +1384,9 @@ export class TicketWorktrees {
     path: string,
     root = true,
     links?: string[],
+    control?: OperationControl,
   ): Promise<void> {
+    checkOperation(control);
     const names = await readdir(path);
     if (
       (!root && names.some((name) => name.toLowerCase() === ".git")) ||
@@ -1385,12 +1394,13 @@ export class TicketWorktrees {
     )
       throw new Error(`Nested Git identity: ${path}`);
     for (const name of names) {
+      checkOperation(control);
       if (root && name === ".git") continue;
       const child = join(path, name),
         stat = await lstat(child);
       if (stat.isSymbolicLink()) links?.push(child);
       else if (stat.isDirectory())
-        await this.checkNestedGit(child, false, links);
+        await this.checkNestedGit(child, false, links, control);
     }
   }
 
@@ -1400,7 +1410,9 @@ export class TicketWorktrees {
     task: BuilderTask,
     resultSha: string,
     assertDone: () => Promise<void>,
+    control?: OperationControl,
   ): Promise<void> {
+    checkOperation(control);
     const loaded = this.load(this.recordPath(task.itemId));
     const record = loaded?.record;
     if (
@@ -1418,6 +1430,7 @@ export class TicketWorktrees {
     if (await this.remoteSha(task.taskBranch))
       throw new Error("Remote task branch reappeared; record retained.");
     await assertDone();
+    checkOperation(control);
     this.assertFinalizationRecord(task, record);
     if (
       this.localBranchSha(task.taskBranch) ||

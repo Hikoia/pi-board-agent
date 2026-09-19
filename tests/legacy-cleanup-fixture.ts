@@ -55,7 +55,7 @@ export async function migrateCleanup(f: Omit<Awaited<ReturnType<typeof fixture>>
   } finally { owner.release(); }
   return async () => {
     const result = await f.store.finalizeAccepted(f.task, "merge", undefined,
-      (record, remove, guard) => adapter.cleanupResidual(record, remove, guard), (record) => adapter.approvedTaskSha(record));
+      (record, control) => adapter.cleanupResidual(record, control), (record) => adapter.approvedTaskSha(record));
     if (result) await f.store.completeFinalization(f.task, result, async () => {});
     return result;
   };

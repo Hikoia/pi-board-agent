@@ -19,7 +19,11 @@ import { join, resolve } from "node:path";
 export const BOARD_AGENT_SOURCE = "git:github.com/Hikoia/pi-board-agent";
 export const FULL_GIT_SHA = /^[0-9a-f]{40}$/i;
 
+import type { OperationObservation } from "./operation.js";
+
 export type RuntimeState =
+  | "starting"
+  | "stopping"
   | "running"
   | "recovery-only"
   | "version-mismatch"
@@ -44,7 +48,7 @@ export interface RevisionCheck {
   repairCommand: string;
 }
 
-export interface RuntimeStatus {
+export interface RuntimeStatus extends OperationObservation {
   schemaVersion: 1;
   expectedRevision: string | null;
   loadedRevision: string | null;

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { until } from "./async-loop-fixture.js";
 import { execFileSync } from "node:child_process";
 import {
   cpSync,
@@ -222,6 +223,7 @@ try {
     "unsupported-state.ts",
     "ticket-worktree.ts",
     "cleanup-snapshot.ts",
+    "operation.ts",
     "dispatch.ts",
     "process-runner.ts",
   ]) {
@@ -320,6 +322,7 @@ try {
     async tickNow() {
       this.ticks++;
     }
+    requestStop() { this.admissions = false; }
     async stop() {
       this.stops++;
       await stopWait;
@@ -349,7 +352,7 @@ try {
     validateProjectMetadata: gh.validateProjectMetadata,
     createProductionTicketExecutor: () => {
       executors++;
-      return { migrateLegacy: async () => ({ converted: [], failures: [] }) };
+      return { activeCount: () => 0, migrateLegacy: async () => ({ converted: [], failures: [] }) };
     },
     inspectTicketExecutions: () => ({ active: [], orphans: 0, needsHuman: 0 }),
   };
@@ -394,9 +397,19 @@ try {
     registerCommand: (name: string, command: any) =>
       commands.set(name, command),
   });
-  const command = (name: string, context = ctx) =>
-    commands.get("board-agent").handler(name, context);
-  const event = (name: string) => events.get(name)!({}, ctx);
+  const rawCommand = (name: string, context = ctx) => commands.get("board-agent").handler(name, context);
+  const startupSettled = (start: number) => until(() => messages.slice(start).some((s) =>
+    /started\. Ticking|Loop already running|promoted to autonomous|Startup\/recovery failed|Failed to start/.test(s)));
+  const command = async (name: string, context = ctx) => {
+    const start = messages.length;
+    await rawCommand(name, context);
+    if (name === "run") await startupSettled(start);
+  };
+  const event = async (name: string) => {
+    const start = messages.length;
+    await events.get(name)!({}, ctx);
+    if (name === "session_start") await startupSettled(start);
+  };
 
   putLegacy();
   writeFileSync(
@@ -599,12 +612,11 @@ try {
       finishMetadata = resolve;
     });
     const loopCount = loops.length;
-    const pendingStart = command("run");
+    const pendingStart = rawCommand("run");
     await new Promise((resolve) => setImmediate(resolve));
-    if (stopAction === "stop") await command("stop");
-    else await event(stopAction);
+    const stopping = stopAction === "stop" ? command("stop") : event(stopAction);
     finishMetadata();
-    await pendingStart;
+    await Promise.all([pendingStart, stopping]);
     check(
       loops.length === loopCount && !existsSync(join(state, "owner.lock")),
       `${stopAction} cancels startup still awaiting metadata instead of allowing a later unattended loop`,
@@ -621,7 +633,7 @@ try {
           : { task: "TASK" },
         statusOptions: Object.fromEntries(
           Object.entries(validMetadata.statusOptions).filter(
-            ([name]) => refine || !["Backlog", "Needs Design"].includes(name),
+            ([name]) => refine || name !== "Needs Design",
           ),
         ),
       };
@@ -640,7 +652,7 @@ try {
       assert.equal(loops.length, count + 1);
       await command("stop");
       console.log(
-        `PASS: lint/run accept absent Plan with legacy refine=${refine}; no Story/Needs Design/Backlog required`,
+        `PASS: lint/run accept absent Plan with legacy refine=${refine}; no Story/Needs Design required; Backlog remains required`,
       );
     }
   }

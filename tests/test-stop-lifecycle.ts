@@ -1,5 +1,6 @@
 // Real entry point + BoardLoop, with offline board/executor/revision boundaries.
 import assert from "node:assert/strict";
+import { until } from "./async-loop-fixture.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
@@ -150,6 +151,7 @@ try {
     },
   });
   await invoke("run");
+  await until(() => existsSync(lock) && runtime() === "running");
   assert.equal(executors, 1, messages.join("\n"));
   const gate = deferred();
   drainWait = gate.promise;
@@ -212,7 +214,7 @@ try {
   readGate.resolve();
   await Promise.all([starting, stopping]);
   assert.ok(existsSync(lock), "failed startup drain keeps ownership");
-  assert.equal(runtime(), "recovery-only");
+  assert.equal(runtime(), "stopping");
   assert.ok(
     !messages
       .slice(beforeStartup)
@@ -242,9 +244,13 @@ try {
   metadataWait = metadataGate.promise;
   const pendingStart = invoke("run");
   await turn();
-  await event("session_shutdown");
+  const preflightStop = event("session_shutdown");
+  let preflightStopped = false;
+  void preflightStop.then(() => { preflightStopped = true; });
+  await turn(); assert.equal(preflightStopped, false);
+  assert.equal(runtime(), "stopping");
   metadataGate.resolve();
-  await pendingStart;
+  await Promise.all([pendingStart, preflightStop]);
   metadataWait = Promise.resolve();
   assert.equal(executors, 2);
   assert.equal(existsSync(lock), false);
@@ -272,7 +278,7 @@ try {
   assert.ok(
     messages
       .slice(failureMessages)
-      .some((message) => /Shutdown completed with tick warning/.test(message)),
+      .some((message) => /(?:Shutdown completed|Startup cleanup completed) with tick warning/.test(message)),
     "session shutdown distinguishes a tick failure from incomplete cleanup",
   );
   assert.ok(
@@ -283,6 +289,7 @@ try {
   );
   read = async () => [];
   await invoke("run");
+  await until(() => existsSync(lock) && runtime() === "running");
   assert.equal(
     executors,
     4,
@@ -301,9 +308,16 @@ try {
   const migrationStart = invoke("run");
   await migrating.promise;
   assert.ok(existsSync(lock), "conversion runs under exclusive ownership");
-  await invoke("stop");
+  await invoke("run"); // Duplicate run registers no second owner/executor.
+  const count = executors;
+  const migrationStop = invoke("stop");
+  let migrationStopped = false;
+  void migrationStop.then(() => { migrationStopped = true; });
+  await turn(); assert.equal(migrationStopped, false);
+  assert.ok(existsSync(lock)); assert.equal(runtime(), "stopping");
   migrationGate.resolve();
-  await migrationStart;
+  await Promise.all([migrationStart, migrationStop]);
+  assert.equal(executors, count);
   assert.equal(ticks, 0, "no executor reconciliation/model can race conversion");
   assert.equal(existsSync(lock), false);
   console.log("PASS: startup migration holds the owner before any tick and a stop during conversion prevents late loop/model startup");

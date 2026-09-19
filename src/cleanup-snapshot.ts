@@ -1,6 +1,6 @@
 // Read-only v3 filesystem evidence and verified residual removal. No new cleanup snapshots are persisted.
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, lstatSync } from "node:fs";
 import {
   lstat,
   open,
@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { processFailure, runProcess } from "./process-runner.js";
+import { checkOperation, operationCheckpoint, type OperationControl } from "./operation.js";
 
 export type DirectoryIdentity = { dev: string; ino: string; birth: string };
 type Stamp = { path: string; identity: DirectoryIdentity };
@@ -25,8 +26,7 @@ export interface CleanupSnapshot {
   parents: Stamp[];
   entries: SnapshotEntry[];
 }
-const digest = (data: Buffer | string) =>
-  createHash("sha256").update(data).digest("hex");
+
 const identity = (stat: Awaited<ReturnType<typeof statAt>>) => ({
   dev: String(stat!.dev),
   ino: String(stat!.ino),
@@ -167,41 +167,86 @@ export async function verifyParents(
   }
 }
 
-/** Open non-following, compare the handle to lstat, then recheck after the read. */
-export async function readRegular(path: string): Promise<Buffer> {
+const fileStamp = (stat: NonNullable<Awaited<ReturnType<typeof statAt>>>) => ({
+  ...identity(stat), size: String(stat.size), mtime: String(stat.mtimeNs), ctime: String(stat.ctimeNs),
+});
+export interface FileEvidence {
+  path: string;
+  parents: Stamp[];
+  stamp: ReturnType<typeof fileStamp>;
+}
+export async function verifyEvidence(evidence: FileEvidence): Promise<void> {
+  await verifyParents(evidence.parents);
+  const stat = await statAt(evidence.path);
+  if (!stat || !equal(fileStamp(stat), evidence.stamp))
+    throw new Error(`Cleanup file changed or replaced: ${evidence.path}`);
+}
+
+/** Cheap final veto after the last await; never reads/hashes large evidence.
+ * Paired with async full verification, not a replacement for it. */
+export function verifyEvidenceNow(evidence: FileEvidence): void {
+  for (const parent of evidence.parents) {
+    const stat = lstatSync(parent.path, { bigint: true, throwIfNoEntry: false });
+    if (!stat?.isDirectory() || stat.isSymbolicLink() || !equal(identity(stat), parent.identity))
+      throw new Error(`Cleanup directory identity changed: ${parent.path}`);
+  }
+  const stat = lstatSync(evidence.path, { bigint: true, throwIfNoEntry: false });
+  if (!stat || !equal(fileStamp(stat), evidence.stamp))
+    throw new Error(`Cleanup file changed or replaced: ${evidence.path}`);
+}
+
+/** Bounded, non-following reads. The handle always drains/closes before cancellation returns. */
+async function readChunks(
+  path: string,
+  consume: (bytes: Buffer) => void,
+  checkpoint: () => Promise<void>,
+): Promise<FileEvidence> {
+  await checkpoint();
   const parents = await directoryStamps(path);
   const before = await statAt(path);
   if (!before?.isFile() || before.isSymbolicLink())
     throw new Error(`Not a regular cleanup file: ${path}`);
-  const handle = await open(
-    path,
-    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
-  );
+  const evidence = { path, parents, stamp: fileStamp(before) };
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
-    const opened = await handle.stat({ bigint: true });
-    if (!equal(identity(before), identity(opened)))
+    if (!equal(evidence.stamp, fileStamp(await handle.stat({ bigint: true }))))
       throw new Error(`Cleanup file replaced: ${path}`);
-    const bytes = await handle.readFile();
-    const after = await statAt(path);
-    if (
-      !after?.isFile() ||
-      !equal(identity(before), identity(after)) ||
-      before.size !== after.size ||
-      before.mtimeNs !== after.mtimeNs ||
-      before.ctimeNs !== after.ctimeNs
-    )
-      throw new Error(`Cleanup file changed: ${path}`);
-    await verifyParents(parents);
-    return bytes;
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let read = 0n;
+    while (read < before.size) {
+      await checkpoint();
+      const { bytesRead } = await handle.read(buffer, 0, Number(before.size - read < BigInt(buffer.length) ? before.size - read : BigInt(buffer.length)), null);
+      if (!bytesRead) throw new Error(`Cleanup file truncated: ${path}`);
+      consume(buffer.subarray(0, bytesRead));
+      read += BigInt(bytesRead);
+    }
+    await checkpoint();
+    await verifyEvidence(evidence);
+    return evidence;
   } finally {
     await handle.close();
   }
+}
+export async function readEvidence(path: string, control?: OperationControl) {
+  const chunks: Buffer[] = [];
+  const evidence = await readChunks(path, (chunk) => chunks.push(Buffer.from(chunk)), operationCheckpoint(control));
+  return { bytes: Buffer.concat(chunks), evidence };
+}
+export async function readRegular(path: string, control?: OperationControl): Promise<Buffer> {
+  return (await readEvidence(path, control)).bytes;
+}
+async function hashRegular(path: string, checkpoint: () => Promise<void>, onBytes?: (n: number) => void) {
+  const hash = createHash("sha256");
+  const evidence = await readChunks(path, (chunk) => { hash.update(chunk); onBytes?.(chunk.length); }, checkpoint);
+  return { evidence, sha256: hash.digest("hex"), size: evidence.stamp.size };
 }
 
 /** Read link metadata, not the target. Windows needs a creation kind that lstat omits. */
 export async function readSymlink(
   path: string,
+  control?: OperationControl,
 ): Promise<{ target: string; linkType: "file" | "dir" | "junction" }> {
+  checkOperation(control);
   const parents = await directoryStamps(path);
   const before = await statAt(path);
   if (!before?.isSymbolicLink())
@@ -236,14 +281,18 @@ export async function readSymlink(
   )
     throw new Error(`Cleanup symlink changed or replaced: ${path}`);
   await verifyParents(parents);
+  checkOperation(control);
   return { target, linkType };
 }
 
 /** Full async traversal, including ignored files and empty directories; never follows links. */
-export async function cleanupSnapshot(path: string): Promise<CleanupSnapshot> {
+export async function cleanupSnapshot(path: string, control?: OperationControl, onBytes?: (n: number) => void): Promise<CleanupSnapshot> {
+  const checkpoint = operationCheckpoint(control);
+  await checkpoint();
   const parents = await directoryStamps(path);
   const entries: SnapshotEntry[] = [];
   async function visit(rel: string): Promise<void> {
+    await checkpoint();
     const target = join(path, rel);
     const stat = await statAt(target);
     if (!stat && rel === "") return;
@@ -255,7 +304,7 @@ export async function cleanupSnapshot(path: string): Promise<CleanupSnapshot> {
     if (name.toLowerCase() === ".git" && (rel !== ".git" || !stat.isFile()))
       throw new Error(`Nested Git identity: ${target}`);
     if (stat.isSymbolicLink()) {
-      const metadata = await readSymlink(target);
+      const metadata = await readSymlink(target, control);
       const after = await statAt(target);
       if (!after?.isSymbolicLink() || !equal(identity(stat), identity(after)))
         throw new Error(`Cleanup symlink replaced: ${target}`);
@@ -283,21 +332,10 @@ export async function cleanupSnapshot(path: string): Promise<CleanupSnapshot> {
       )
         throw new Error(`Cleanup directory changed: ${target}`);
     } else if (stat.isFile() && rel) {
-      const bytes = await readRegular(target);
-      const after = await statAt(target);
-      if (
-        !after ||
-        !equal(identity(stat), identity(after)) ||
-        stat.size !== BigInt(bytes.length)
-      )
+      const file = await hashRegular(target, checkpoint, onBytes);
+      if (!equal(file.evidence.stamp, fileStamp(stat)))
         throw new Error(`Cleanup file changed: ${target}`);
-      entries.push({
-        path: rel,
-        identity: identity(stat),
-        type: "file",
-        size: String(bytes.length),
-        sha256: digest(bytes),
-      });
+      entries.push({ path: rel, identity: identity(stat), type: "file", size: file.size, sha256: file.sha256 });
     } else throw new Error(`Special cleanup file: ${target}`);
   }
   await visit("");
@@ -308,9 +346,11 @@ export async function cleanupSnapshot(path: string): Promise<CleanupSnapshot> {
 export async function verifySnapshot(
   expected: CleanupSnapshot,
   partial = true,
-): Promise<void> {
+  control?: OperationControl,
+): Promise<CleanupSnapshot> {
   await verifyParents(expected.parents, partial);
-  const actual = await cleanupSnapshot(expected.path);
+  const progress = byteProgress([expected], "verify-source", control);
+  const actual = await cleanupSnapshot(expected.path, control, progress);
   const entries = new Map(expected.entries.map((entry) => [entry.path, entry]));
   if (
     (!partial && actual.entries.length !== expected.entries.length) ||
@@ -322,6 +362,7 @@ export async function verifySnapshot(
       throw new Error(
         `Cleanup snapshot changed or added${entry.type === "symlink" ? " (symlink)" : ""}: ${join(expected.path, entry.path)}`,
       );
+  return actual;
 }
 
 /** Atomic, create-only publication. A failed publish never overwrites retry evidence. */
@@ -352,45 +393,153 @@ export async function writeCleanupEvidence(
   }
 }
 
-/** No recursive removal: every surviving entry and every ancestor is checked again. */
-export async function removeSnapshot(
-  snapshot: CleanupSnapshot,
-  guard: () => Promise<void>,
-): Promise<void> {
-  await guard();
-  for (const entry of [...snapshot.entries].reverse()) {
-    const path = join(snapshot.path, entry.path);
-    if (!(await statAt(path))) continue;
-    await guard();
-    // ponytail: full rechecks are O(n²); favor conservative cleanup over a second mutable journal.
-    await verifySnapshot(snapshot);
-    if (entry.type === "directory") await rmdir(path);
-    else await unlink(path);
+function byteProgress(snapshots: CleanupSnapshot[], phase: "verify-source" | "verify-backup", control?: OperationControl) {
+  const total = snapshots.reduce((sum, s) => sum + s.entries.reduce((n, e) => n + (e.type === "file" ? Number(e.size) : 0), 0), 0);
+  let completed = 0;
+  const advance = (bytes: number) => {
+    completed += bytes;
+    control?.onProgress?.({ phase, completed, total, unit: "bytes" });
+  };
+  advance(0);
+  return advance;
+}
+
+export interface PreparedSnapshot {
+  snapshot: CleanupSnapshot;
+  entries: Map<string, SnapshotEntry>;
+  remaining: SnapshotEntry[];
+  backup?: PreparedSnapshot;
+}
+export async function prepareSnapshot(snapshot: CleanupSnapshot, control?: OperationControl): Promise<PreparedSnapshot> {
+  const actual = await verifySnapshot(snapshot, true, control);
+  return { snapshot, entries: new Map(snapshot.entries.map((e) => [e.path, e])), remaining: actual.entries };
+}
+
+/** A batch is scoped to ONE attempt, and starts its window AFTER remote observation. */
+export function removalBatch(
+  authorize: () => Promise<void>,
+  local: () => Promise<void>,
+  control?: OperationControl,
+  now = () => performance.now(),
+) {
+  let used = 32, expires = -Infinity;
+  const current = () => used < 32 && now() < expires;
+  return {
+    current,
+    removed: () => { used++; },
+    async check() {
+      checkOperation(control);
+      await local();
+      if (!current()) {
+        await authorize();
+        checkOperation(control);
+        used = 0;
+        // authorize includes fresh local Git/record guards. Do not spend the
+        // newly observed window repeating them (slow Git can exceed 1s).
+        expires = now() + 1000;
+      }
+      checkOperation(control);
+    },
+  };
+}
+
+function entryParents(prepared: PreparedSnapshot, entry: SnapshotEntry): Stamp[] {
+  const stamps = [...prepared.snapshot.parents];
+  const parts = entry.path.split("/");
+  for (let i = 0; i < parts.length && entry.path; i++) {
+    const path = parts.slice(0, i).join("/");
+    const parent = prepared.entries.get(path);
+    if (parent?.type !== "directory") throw new Error("Missing cleanup parent evidence.");
+    stamps.push({ path: join(prepared.snapshot.path, path), identity: parent.identity });
   }
-  if (await statAt(snapshot.path))
-    throw new Error(`Cleanup directory remains: ${snapshot.path}`);
+  return stamps;
+}
+
+async function verifyEntry(prepared: PreparedSnapshot, entry: SnapshotEntry, checkpoint: () => Promise<void>, control?: OperationControl, phase: "verify-source" | "verify-backup" = "verify-source"): Promise<FileEvidence> {
+  const path = join(prepared.snapshot.path, entry.path);
+  const parents = entryParents(prepared, entry);
+  await verifyParents(parents);
+  const stat = await statAt(path);
+  if (!stat || !equal(identity(stat), entry.identity))
+    throw new Error(`Cleanup entry changed or replaced: ${path}`);
+  if (entry.type === "file") {
+    let completed = 0;
+    // Small files report item progress; long hashes must expose byte progress,
+    // not look stalled for the entire file. Chunk size is the same 1 MiB bound.
+    const file = await hashRegular(path, checkpoint, Number(entry.size) > 1024 * 1024
+      ? (n) => control?.onProgress?.({ phase, completed: completed += n, total: Number(entry.size), unit: "bytes" })
+      : undefined);
+    if (!stat.isFile() || file.size !== entry.size || file.sha256 !== entry.sha256 || !equal(file.evidence.stamp, fileStamp(stat)))
+      throw new Error(`Cleanup file changed: ${path}`);
+  } else if (entry.type === "symlink") {
+    const metadata = await readSymlink(path, control);
+    if (metadata.target !== entry.target || metadata.linkType !== entry.linkType)
+      throw new Error(`Cleanup symlink changed: ${path}`);
+  } else if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`Cleanup directory changed: ${path}`);
+  }
+  const evidence = { path, parents, stamp: fileStamp(stat) };
+  await verifyEvidence(evidence);
+  return evidence;
+}
+
+/** No recursive removal or whole-tree rescans. Removed receipt entries are never revisited. */
+export async function removeSnapshot(
+  prepared: PreparedSnapshot,
+  guard: ReturnType<typeof removalBatch>,
+  control?: OperationControl,
+): Promise<void> {
+  const checkpoint = operationCheckpoint(control);
+  const total = prepared.remaining.length;
+  let completed = 0;
+  control?.onProgress?.({ phase: "remove", completed, total, unit: "items" });
+  for (const entry of [...prepared.remaining].reverse()) {
+    await checkpoint();
+    // Check stop/owner/evidence BEFORE reading a potentially long file, too.
+    await guard.check();
+    const source = await verifyEntry(prepared, entry, checkpoint, control);
+    const backup = prepared.backup;
+    const copy = backup ? await verifyEntry(backup, backup.entries.get(entry.path)!, checkpoint, control, "verify-backup") : undefined;
+    if (entry.type === "directory" && (await readdir(source.path)).length)
+      throw new Error(`Unknown cleanup directory contents: ${source.path}`);
+    // A long hash may consume the entire window. Refresh, then recheck the
+    // exact just-verified identities/content stamps and ancestors, not the tree.
+    do {
+      await guard.check();
+      if (copy) await verifyEvidence(copy);
+      await verifyEvidence(source);
+      checkOperation(control);
+    } while (!guard.current());
+    if (entry.type === "directory") await rmdir(source.path);
+    else await unlink(source.path);
+    guard.removed();
+    control?.onProgress?.({ phase: "remove", completed: ++completed, total, unit: "items" });
+  }
+  await verifyParents(prepared.snapshot.parents, true);
+  if (await statAt(prepared.snapshot.path))
+    throw new Error(`Cleanup directory remains: ${prepared.snapshot.path}`);
 }
 
 export async function verifyBackupSnapshots(
   path: string,
   snapshots: CleanupSnapshot[],
-): Promise<void> {
+  control?: OperationControl,
+): Promise<{ copies: PreparedSnapshot[]; manifest: FileEvidence }> {
   try {
-    const manifest = JSON.parse(
-      (await readRegular(join(path, "verified.json"))).toString("utf8"),
-    );
-    if (!equal(manifest, { schemaVersion: 1, snapshots }))
+    const progress = byteProgress(snapshots, "verify-backup", control);
+    const manifest = await readEvidence(join(path, "verified.json"), control);
+    if (!equal(JSON.parse(manifest.bytes.toString("utf8")), { schemaVersion: 1, snapshots }))
       throw new Error("manifest changed");
+    const copies: PreparedSnapshot[] = [];
     for (const [i, snapshot] of snapshots.entries()) {
-      const copy = await cleanupSnapshot(join(path, String(i)));
-      const contents = (s: CleanupSnapshot) =>
-        s.entries.map(({ identity: _identity, ...entry }) => entry);
-      if (!equal(contents(copy), contents(snapshot)))
-        throw new Error("copy changed");
+      const copy = await cleanupSnapshot(join(path, String(i)), control, progress);
+      const contents = (s: CleanupSnapshot) => s.entries.map(({ identity: _identity, ...entry }) => entry);
+      if (!equal(contents(copy), contents(snapshot))) throw new Error("copy changed");
+      copies.push({ snapshot: copy, entries: new Map(copy.entries.map((e) => [e.path, e])), remaining: copy.entries });
     }
+    return { copies, manifest: manifest.evidence };
   } catch (error) {
-    throw new Error(`Cleanup backup verification failed: ${path}`, {
-      cause: error,
-    });
+    checkOperation(control);
+    throw new Error(`Cleanup backup verification failed: ${path}`, { cause: error });
   }
 }

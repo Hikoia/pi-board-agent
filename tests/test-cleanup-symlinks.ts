@@ -336,8 +336,8 @@ try {
   faults.beforeFs = (operation, path) => {
     if (path.startsWith(registered.record.path))
       assert.ok(
-        !["open", "readdir", "link", "unlink"].includes(operation),
-        "native cleanup must not snapshot or speculatively delete residuals",
+        !["open", "link", "unlink"].includes(operation),
+        "native cleanup may enumerate for nested-Git safety, but must not hash snapshots or speculatively delete residuals",
       );
   };
   try {

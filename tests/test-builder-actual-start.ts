@@ -206,7 +206,8 @@ async function check(change: string, patch?: Partial<Card>) {
     executor,
     worktrees,
   );
-  const tick = change.startsWith("revision-latched") ? loop.start() : loop.tickNow();
+  if (change.startsWith("revision-latched")) await loop.start();
+  const tick = loop.tickNow(); // start registers the tick; it no longer awaits it.
   let stopping: Promise<void> | undefined;
   try {
     await Promise.race([

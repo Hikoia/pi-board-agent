@@ -56,7 +56,7 @@ try {
     const executor = createProductionTicketExecutor({ cwd: f.repo, cfg: f.cfg, worktrees: f.store, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {}, meta: { projectId: "P", statusFieldId: "S", statusOptions: { Ready: "Ready" } } });
     try {
       const result = await executor.finalizeClosed(f.card);
-      assert.equal(result.status, corruptReopen ? "blocked" : "skipped", JSON.stringify(result));
+      assert.equal(result.status, "blocked", JSON.stringify(result)); // Integration still awaits conflict resolution, even after a successful handoff.
       assert.equal(f.card.closed, corruptReopen); assert.equal(f.card.status, corruptReopen ? f.cfg.columns.done : f.cfg.columns.ready);
       assert.equal(f.card.body, "Keep original task edits and integrate base behavior.");
       assert.equal(f.comments.length, 1);
