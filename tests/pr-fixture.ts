@@ -40,18 +40,20 @@ export function fakePullRequests(repo: string, autoMerge = false) {
     pr.state = "closed"; pr.merged = true;
     return pr.mergeCommitSha;
   }
-  async function call<T>(op: string, fn: () => T): Promise<T> {
-    calls.push(op); await hooks.before?.(op); const value = fn(); await hooks.after?.(op); return structuredClone(value);
+  async function call<T>(op: string, fn: () => T, authorize?: () => void | Promise<void>): Promise<T> {
+    calls.push(op); await hooks.before?.(op);
+    if (authorize) await authorize();
+    const value = fn(); await hooks.after?.(op); return structuredClone(value);
   }
   const api: TicketExecutorDeps["pullRequests"] = {
     findPullRequests: (scope) => call("find", () => prs.filter((p) => JSON.stringify(p.scope) === JSON.stringify(scope)).map(head)),
-    createPullRequest: (scope, _title, body) => call("create", () => {
+    createPullRequest: (scope, _title, body, authorize) => call("create", () => {
       const pr: PullRequestInfo = { scope, body, number: prs.length + 1, url: `https://github.com/${scope.owner}/${scope.repo}/pull/${prs.length + 1}`,
         state: "open", merged: false, headSha: git("ls-remote", "origin", `refs/heads/${scope.head}`).split(/\s+/)[0], mergeCommitSha: null };
       prs.push(pr);
       if (autoMerge) merge(pr, false);
       return pr;
-    }),
+    }, authorize),
     getPullRequest: (scope: PullRequestScope, number: number) => call("get", () => {
       const pr = prs.find((p) => p.number === number);
       assert.ok(pr, "Offline PR not found"); return head(pr);

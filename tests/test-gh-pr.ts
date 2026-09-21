@@ -205,6 +205,16 @@ assert.deepEqual({ ...creation[1], query: undefined }, {
 assert.ok(!creation[1].query.includes(body), "body is data, never GraphQL source");
 pass("creation is one same-repository mutation with exact title/body variables, no Issue conversion or human-body update");
 
+let authorizations = 0;
+await rejected(() => createPullRequest(scope, title, body, async () => {
+  authorizations++;
+  assert.equal(calls().length, 1, "repository lookup precedes authorization");
+  await Promise.resolve();
+  throw new Error("PR creation authorization withdrawn");
+}), [lookup(), created(raw())], ["repository"], /authorization withdrawn/);
+assert.equal(authorizations, 1);
+pass("final create authorization runs after repository lookup; awaited rejection sends no mutation or fallback");
+
 for (const [operation, responses, expected] of [
   [(input: PullRequestScope) => findPullRequests(input), [page([raw()])], ["find"]],
   [(input: PullRequestScope) => getPullRequest(input, 7), [read(raw())], ["get"]],

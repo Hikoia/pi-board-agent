@@ -1670,13 +1670,16 @@ export class ManagedTicketExecutor implements TicketExecutor {
               if (!remote || worktrees.fetchedSha(task.taskBranch) !== remote ||
                   !worktrees.isAncestor(saved.preparedHeadSha, remote) || !local || !worktrees.isAncestor(local, remote))
                 throw new Error("Prepared PR no longer covers current sources; work retained.");
-              worktrees.cleanupRecordV5(task);
-              if (worktrees.worktreeEntries().some((e) => e.branch === task.taskBranch) && !worktrees.check(record, true).ok)
-                throw new Error("Unsafe worktree before PR creation.");
-              await guard();
               control.onProgress?.({ phase: "create-pr" });
               pr = await this.deps.pullRequests.createPullRequest(this.scope(record), card.title,
-                `${this.marker(record)}\n\nRefs #${card.number}\n\nPrepared for human review and manual merge (Squash and merge recommended).`);
+                `${this.marker(record)}\n\nRefs #${card.number}\n\nPrepared for human review and manual merge (Squash and merge recommended).`, async () => {
+                  await guard();
+                  if (worktrees.localBranchSha(task.taskBranch) !== local || worktrees.fetchedSha(task.taskBranch) !== remote)
+                    throw new Error("Prepared PR creation sources changed; work retained.");
+                  worktrees.cleanupRecordV5(task);
+                  if (worktrees.worktreeEntries().some((e) => e.branch === task.taskBranch) && !worktrees.check(record!, true).ok)
+                    throw new Error("Unsafe worktree before PR creation.");
+                });
               await guard();
               this.validatePr(record, pr, true);
               await worktrees.verifyPullRequestSources(record, pr, guard);

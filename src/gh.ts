@@ -812,6 +812,7 @@ export async function createPullRequest(
   scope: PullRequestScope,
   title: string,
   body: string,
+  authorize?: () => void | Promise<void>,
 ): Promise<PullRequestInfo> {
   scope = validatePullRequestScope(scope);
   requiredString(title, "PR title");
@@ -825,6 +826,7 @@ export async function createPullRequest(
     repository.repository.id,
     "PR repository id",
   );
+  await authorize?.();
   const data = await graphql<any>(`
     mutation($repositoryId: ID!, $base: String!, $head: String!, $title: String!, $body: String!) {
       createPullRequest(input: {
