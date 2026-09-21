@@ -211,7 +211,12 @@ try {
     if (evidence === "corrupt receipt") writeFileSync(f.receipt, "broken");
     const bytes = readFileSync(f.recordFile);
     assert.equal((await f.finish()).status, "blocked");
-    assert.deepEqual(readFileSync(f.recordFile), bytes);
+    if (evidence === "corrupt receipt") {
+      const record = f.recordNow();
+      assert.equal(record.retry?.stage, "integrate", "unknown cleanup evidence is a technical failure, never approval");
+      assert.deepEqual({ ...record, retry: undefined }, { ...JSON.parse(bytes.toString()), retry: undefined });
+      assert.equal(readFileSync(f.receipt, "utf8"), "broken");
+    } else assert.deepEqual(readFileSync(f.recordFile), bytes);
     assert.equal(f.card.status, f.cfg.columns.done);
     assert.ok(existsSync(f.record.path));
     console.log(

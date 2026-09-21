@@ -1,3 +1,6 @@
+
+const { testOwner, noPullRequests } = await import("./pr-fixture.js");
+const { simulateHumanFinalization } = await import("./human-finalization-fixture.js");
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -90,7 +93,7 @@ try {
       });
       assert.ok(child, "real exclusive lock was acquired");
       if (lockedFile === "ignored") {
-        assert.equal(await f.store.remoteSha(f.task.taskBranch), f.taskSha, "ignored-file clean fails before remote ref deletion");
+        assert.equal(await f.store.remoteSha(f.task.taskBranch), (f.store.read(f.task.itemId)!.integration as import("../src/ticket-worktree.js").TicketPullRequestIntegration).preparedHeadSha, "ignored-file clean fails before remote ref deletion");
         assert.ok(f.store.worktreeEntries().some((entry) => resolve(entry.path) === resolve(f.record.path)));
       }
       const integrated = f.tip(),
@@ -116,8 +119,8 @@ try {
       } else {
         // Some Git-for-Windows versions remove registration even when a locked
         // child survives. V4 must not invent a snapshot or recursive fallback.
-        const restarted = new TicketWorktrees(f.repo);
-        await assert.rejects(restarted.finalizeAccepted(f.task, "merge"), /Unregistered residual requires existing legacy evidence/);
+        const restarted = new TicketWorktrees(f.repo, testOwner(f.repo));
+        await assert.rejects(simulateHumanFinalization(restarted, f.task), /Unregistered residual requires existing legacy evidence/);
         assert.deepEqual(readFileSync(f.recordFile), progress);
         assert.deepEqual(readFileSync(path), expected);
         assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);

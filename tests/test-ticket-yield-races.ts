@@ -17,6 +17,8 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
   if (specifier === './process-runner.js' && /\/(ticket-worktree|review)\.ts$/.test(context.parentURL ?? '')) return { url: shim, shortCircuit: true };
   return next(specifier, context);
 } });
+const { testOwner, noPullRequests } = await import("./pr-fixture.js");
+
 const { _DEFAULTS } = await import('../src/config.js');
 const { BoardLoop, createLoopState } = await import('../src/loop.js');
 const { ManagedTicketExecutor } = await import('../src/ticket-executor.js');
@@ -37,7 +39,7 @@ function fixture() {
   const writes: string[] = [], notices: string[] = [];
   let starts = 0, run: any;
   let readError = false, missing = false, releaseError = false;
-  const store = new TicketWorktrees(repo);
+  const store = new TicketWorktrees(repo, testOwner(repo));
   const board = {
     getCard: async (itemId = `AUDIT_${number}`) => { if (itemId !== `AUDIT_${number}`) return undefined; if (readError) throw new Error('fresh read unavailable'); return missing ? undefined : structuredClone(card); },
     claim: async () => { card.assignees = ['bot']; return true; },
@@ -45,7 +47,7 @@ function fixture() {
     setStatus: async (_id: string, status: string) => { writes.push(status); card.status = status; },
     listComments: async () => [], comment: async () => { writes.push('comment'); },
   };
-  const executor = new ManagedTicketExecutor({ cwd: repo, cfg, worktrees: store, board, botLogin: 'bot', repoOwner: 'owner', repoName: 'repo', callback: s => notices.push(s), createManager: () => {
+  const executor = new ManagedTicketExecutor({ owner: testOwner(repo), pullRequests: noPullRequests, cwd: repo, cfg, worktrees: store, board, botLogin: 'bot', repoOwner: 'owner', repoName: 'repo', callback: s => notices.push(s), createManager: () => {
     return { start: (_source: string, args: any) => { starts++; run = { runId: `audit-run-${number}`, status: 'running', args }; return run.runId; }, list: () => run ? [run] : [], resume: async () => false, pauseAndWait: async () => { if (run) run.status = 'paused'; }, stopAndWait: async () => { if (run) run.status = 'aborted'; }, dispose() {} };
   } });
   const loop = new BoardLoop({ cwd: repo, cfg, botLogin: 'bot', repoOwner: 'owner', repoName: 'repo', meta: { projectId: 'P', statusFieldId: 'S', statusOptions: {} }, callback: s => notices.push(s), listCards: async () => [structuredClone(card)], revisionCheck: async () => ({ ok: true }) }, createLoopState(), executor, store);

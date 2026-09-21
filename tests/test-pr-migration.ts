@@ -32,24 +32,33 @@ function noMigrationWrites() {
 function resetFaults() {
   faults.beforeGit = faults.afterGit = faults.beforeFs = faults.afterFs = faults.beforeSyncFs = undefined;
 }
-async function preparedLegacy(f: Fixture) {
-  // Reproduce a protected-base rejection using the old committed algorithm.
-  // Nothing is pushed: its exact persisted result is the migration input.
-  faults.beforeGit = (a) => { if (a[0] === "push") throw new Error("offline protected base rejection (#121)"); };
-  try { await assert.rejects(f.store.finalizeAccepted(f.task, "merge"), /protected base rejection/); }
-  finally { resetFaults(); }
-  return f.store.read(f.task.itemId)!.integration!;
+async function preparedLegacy(f: Fixture): Promise<import("../src/ticket-worktree.js").TicketIntegrationState> {
+  const remote = await f.store.remoteSha(f.task.taskBranch) ?? null;
+  const local = f.store.localBranchSha(f.task.taskBranch) ?? remote!;
+  if (!f.store.localBranchSha(f.task.taskBranch)) git(f.repo, "update-ref", `refs/heads/${f.task.taskBranch}`, local);
+  let source = local;
+  if (remote && remote !== local) {
+    await f.store.fetchRequired(f.task.taskBranch);
+    if (f.store.isAncestor(local, remote)) source = remote;
+    else if (!f.store.isAncestor(remote, local)) source = git(f.repo, "commit-tree",
+      await f.store.resultTree({ baseSha: local, taskSha: remote }), "-p", local, "-p", remote, "-m", "historical combined sources");
+  }
+  const resultSha = git(f.repo, "commit-tree", await f.store.resultTree({ baseSha: f.base, taskSha: source }),
+    "-p", f.base, "-p", source, "-m", "historical rejected base push");
+  const integration = { baseSha: f.base, taskSha: local, remoteTaskSha: remote, resultSha };
+  f.store.legacyUpdate(f.task.itemId, r => ({ ...r, integration, retry: { stage: "integrate", reason: "offline protected base rejection (#121)" } }));
+  return integration;
 }
 function oldV3(f: Fixture, squash = false) {
   const resultSha = git(f.repo, "commit-tree", `${f.taskSha}^{tree}`, "-p", f.base,
     ...(squash ? [] : ["-p", f.taskSha]), "-m", "original v3 result");
-  f.store.update(f.task.itemId, (r) => ({ ...r, lastRunId: "original-builder", reviewedTaskSha: f.taskSha,
+  f.store.legacyUpdate(f.task.itemId, (r) => ({ ...r, lastRunId: "original-builder", reviewedTaskSha: f.taskSha,
     finalization: { targetBranch: "main", baseSha: f.base, taskSha: f.taskSha, resultSha } }));
   return resultSha;
 }
 try {
   for (const variant of ["same", "local-only", "remote-only", "local-ahead", "remote-ahead", "divergent", "implicit-remote"] as const) {
-    const f = await fixture(false, true);
+    const f = await fixture(false, 4);
     if (["remote-ahead", "divergent"].includes(variant)) {
       git(f.repo, "checkout", "--detach", f.taskSha);
       writeFileSync(join(f.repo, "remote.txt"), "remote contribution\n");
@@ -68,7 +77,7 @@ try {
     }
     let state = await preparedLegacy(f);
     if (variant === "implicit-remote") {
-      const old = f.store.read(f.task.itemId)!;
+      const old = f.store.legacyRead(f.task.itemId)!;
       delete old.integration!.remoteTaskSha;
       writeFileSync(f.recordFile, JSON.stringify(old));
       state = old.integration!;
@@ -92,7 +101,7 @@ try {
       assert.equal(record.createdAt, f.record.createdAt);
       assert.equal(record.reviewedTaskSha, f.taskSha);
       assert.equal(legacy.blockedReason(f.task.itemId), undefined);
-      await assert.rejects(f.store.finalizeAccepted(f.task, "merge"), /PR executor/);
+      assert.equal("finalizeAccepted" in f.store, false);
       calls.length = 0;
       await f.store.preparePullRequest(f.task, scope(f), owner, async () => {});
       assert.equal(git(f.origin, "rev-parse", `refs/heads/${f.task.taskBranch}`), state.resultSha);
@@ -111,7 +120,7 @@ try {
 
   for (const version of [3, 4] as const) {
     for (const squash of version === 3 ? [false, true] : [false]) {
-      const f = await fixture(false, version === 4);
+      const f = await fixture(false, version === 4 ? 4 : false);
       const result = version === 3 ? oldV3(f, squash) : (await preparedLegacy(f)).resultSha;
       git(f.repo, "push", "origin", `${result}:refs/heads/main`);
       const advanced = git(f.repo, "commit-tree", `${result}^{tree}`, "-p", result, "-m", "later base");
@@ -145,7 +154,7 @@ try {
     const result = oldV3(f, true), owner = acquireOwnerLock(f.repo, "bot"), legacy = adapter(f);
     try {
       // A valid v3 squash previously converted to v4 keeps its original proof.
-      assert.deepEqual((await legacy.migrate(owner)).failures, []);
+      assert.deepEqual((await legacy.legacyMigrateV4(owner)).failures, []);
       const bytes = rawSource(f), archivedV3 = readFileSync(backup(f, 3));
       git(f.repo, "push", "origin", `${result}:refs/heads/main`);
       assert.deepEqual((await legacy.migrateV5(owner)).failures, []);
@@ -157,9 +166,9 @@ try {
   }
 
   for (const kind of ["unknown-result", "wrong-tree", "wrong-parents", "rewritten-base", "local-mismatch", "remote-mismatch", "cleanup-missing", "cleanup-unconfirmed", "corrupt", "future-version"] as const) {
-    const f = await fixture(false, true);
+    const f = await fixture(false, 4);
     const state = await preparedLegacy(f);
-    let record = f.store.read(f.task.itemId)!;
+    let record = f.store.legacyRead(f.task.itemId)!;
     if (kind === "unknown-result") record.integration!.resultSha = "0".repeat(40);
     if (kind === "wrong-tree") record.integration!.resultSha = git(f.repo, "commit-tree", `${f.base}^{tree}`, "-p", f.base, "-p", f.taskSha, "-m", "wrong tree");
     if (kind === "wrong-parents") record.integration!.resultSha = f.taskSha;
@@ -217,7 +226,7 @@ try {
 
   {
     const f = await fixture();
-    f.store.update(f.task.itemId, (r) => ({ ...r, reviewedTaskSha: f.taskSha,
+    f.store.legacyUpdate(f.task.itemId, (r) => ({ ...r, reviewedTaskSha: f.taskSha,
       finalization: { targetBranch: "main", baseSha: f.base, taskSha: f.taskSha } }));
     const bytes = rawSource(f), owner = acquireOwnerLock(f.repo, "bot");
     try {
@@ -235,7 +244,7 @@ try {
   }
 
   for (const cut of ["before-backup", "after-backup", "save", "after-publish", "source", "backup", "local-source", "remote-source", "owner", "stop"] as const) {
-    const f = await fixture(false, true);
+    const f = await fixture(false, 4);
     await preparedLegacy(f);
     const bytes = rawSource(f);
     let owner = acquireOwnerLock(f.repo, "bot"), canMigrate = true, reached = false;
@@ -311,8 +320,8 @@ try {
       for (const status of ["running", "paused"] as const) {
         const t = await f.ticket(`v${version}-${status}`);
         const j = f.journal(t.record, `original-v${version}-${status}`, status);
-        f.store.setActiveRun(t.card.itemId, j.run.runId, Date.parse(j.run.startedAt));
-        const record = { ...f.store.read(t.card.itemId)!, schemaVersion: version, lastRunId: "previous-run", reviewedTaskSha: f.sha };
+        f.store.legacySetActiveRun(t.card.itemId, j.run.runId, Date.parse(j.run.startedAt));
+        const record = { ...f.store.legacyRead(t.card.itemId)!, schemaVersion: version, lastRunId: "previous-run", reviewedTaskSha: f.sha };
         writeFileSync(t.file, JSON.stringify(record));
         writeFileSync(join(t.record.path, "work.txt"), "original partial work\n");
         writeFileSync(join(t.record.path, "untracked.txt"), "original untracked work\n");
@@ -322,8 +331,8 @@ try {
     }
     const unique = await f.ticket("launch-unique"), absent = await f.ticket("launch-absent"), ambiguous = await f.ticket("launch-ambiguous");
     for (const t of [unique, absent, ambiguous]) {
-      f.store.beginLaunch(t.card.itemId, t.record.createdAt);
-      expected.push({ file: t.file, bytes: readFileSync(t.file), record: f.store.read(t.card.itemId)! });
+      f.store.legacyBeginLaunch(t.card.itemId, t.record.createdAt);
+      expected.push({ file: t.file, bytes: readFileSync(t.file), record: f.store.legacyRead(t.card.itemId)! });
     }
     for (const [t, id] of [[unique, "unique-original"], [ambiguous, "first-original"], [ambiguous, "second-original"]] as const) {
       const j = f.journal(t.record, id); evidence.set(j.file, readFileSync(j.file));
@@ -349,7 +358,7 @@ try {
     assert.throws(() => git(repair.record.path, "merge", "--no-edit", "main"));
     const mergeHead = git(repair.record.path, "rev-parse", "MERGE_HEAD"), diff = git(repair.record.path, "diff");
     expected.push({ file: repair.file, bytes: readFileSync(repair.file), record: repair.record });
-    const owner = acquireOwnerLock(f.repo, "bot"), legacy = new LegacyTickets(f.deps);
+    const owner = f.deps.owner, legacy = new LegacyTickets(f.deps);
     try {
       const versions: number[] = [];
       faults.beforeSyncFs = (op, from, to) => { if (op === "renameSync" && String(to).endsWith(".json")) versions.push(JSON.parse(readFileSync(from, "utf8")).schemaVersion); };
@@ -447,7 +456,7 @@ try {
     git(f.repo, "push", "--force", "origin", `${receipt.resultSha}:refs/heads/main`);
     const owner = acquireOwnerLock(f.repo, "bot"), legacy = adapter(f);
     try {
-      assert.deepEqual((await legacy.migrate(owner)).failures, []);
+      assert.deepEqual((await legacy.legacyMigrateV4(owner)).failures, []);
       const v3Backup = readFileSync(backup(f, 3)), bytes = rawSource(f);
       assert.deepEqual((await legacy.migrateV5(owner)).failures, []);
       assert.deepEqual(readFileSync(backup(f, 3)), v3Backup);
@@ -461,7 +470,7 @@ try {
   }
 
   {
-    const f = await fixture(false, true);
+    const f = await fixture(false, 4);
     await preparedLegacy(f);
     const owner = acquireOwnerLock(f.repo, "bot");
     try {

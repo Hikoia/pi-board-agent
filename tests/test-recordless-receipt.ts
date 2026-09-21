@@ -29,7 +29,7 @@ try {
         };
       const bytes = readFileSync(f.receipt),
         base = f.tip(),
-        owner = acquireOwnerLock(f.repo, "bot");
+        owner = f.owner;
       const adapter = new LegacyTickets({
         worktrees: f.store,
         cfg: f.cfg,
@@ -39,7 +39,7 @@ try {
         repoName: "repo",
       });
       try {
-        const report = await adapter.migrate(owner);
+        const report = await adapter.migrateV5(owner);
         assert.deepEqual(report.failures, []);
         assert.equal(f.store.has(f.task.itemId), pending);
         calls.length = 0;
@@ -55,7 +55,7 @@ try {
         assert.ok(
           !calls.some((a) => ["merge-tree", "commit-tree"].includes(a[0])),
         );
-        assert.deepEqual((await adapter.migrate(owner)).converted, []);
+        assert.deepEqual((await adapter.migrateV5(owner)).converted, []);
         console.log(
           `PASS: recordless v${version} ${pending ? "pending ref" : "completed"} receipt finishes a closed non-Task without rewriting old evidence or reintegrating`,
         );

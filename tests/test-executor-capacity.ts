@@ -41,7 +41,7 @@ const board: TicketBoardAdapter = {
   setStatus: async (id, status) => { current(id).status = status; },
   listComments: async () => [], comment: async () => {},
 };
-const worktrees = new TicketWorktrees(repo);
+const worktrees = new TicketWorktrees(repo, testOwner(repo));
 const runs = new Map<string, PersistedRunState>();
 let starts = 0, resumes = 0, stops = 0, brokenManagerRead = false;
 const deferred = () => {
@@ -53,7 +53,7 @@ const contextEntered = deferred(), contextRelease = deferred();
 let context = async () => { contextEntered.resolve(); await contextRelease.promise; return undefined; };
 let executor: ManagedTicketExecutor;
 const makeExecutor = () => new ManagedTicketExecutor({
-  cwd: repo, cfg, worktrees, board, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {}, context: () => context(),
+  owner: testOwner(repo), pullRequests: noPullRequests, cwd: repo, cfg, worktrees, board, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {}, context: () => context(),
   createManager: (path): TicketWorkflowManager => ({
     start: (_script, args) => {
       starts++;
@@ -149,3 +149,5 @@ try {
   brokenManagerRead = unreadable = false;
   await loop.stop();
 }
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

@@ -48,15 +48,16 @@ export async function migrateCleanup(f: Omit<Awaited<ReturnType<typeof fixture>>
   const adapter = new LegacyTickets({ worktrees: f.store, cfg: structuredClone(_DEFAULTS), botLogin: "bot", repoOwner: "owner", repoName: "repo",
     board: { getCard: async () => ({ itemId: f.task.itemId, number: f.task.issueNumber, title: f.task.title, body: f.task.body, type: "Task", contentType: "Issue", status: "Done", closed: true, assignees: [], plan: "demo", repoOwner: "owner", repoName: "repo" }),
       setStatus: async () => { throw new Error("unexpected migration write"); } } });
-  const owner = acquireOwnerLock(f.repo, "bot");
+  const { testOwner } = await import("./pr-fixture.js");
+  const owner = testOwner(f.repo);
   try {
-    const report = await adapter.migrate(owner);
+    const report = await adapter.migrateV5(owner);
     if (report.failures.length) throw new Error(report.failures.map((f) => f.reason).join("; "));
-  } finally { owner.release(); }
+  } catch (e) { owner.release(); throw e; }
   return async () => {
-    const result = await f.store.finalizeAccepted(f.task, "merge", undefined,
-      (record, control) => adapter.cleanupResidual(record, control), (record) => adapter.approvedTaskSha(record));
-    if (result) await f.store.completeFinalization(f.task, result, async () => {});
+    const result = await f.store.cleanupLegacyCompleted(f.task, owner, async () => {},
+      (record, control) => adapter.cleanupResidual(record, control));
+    if (result) await f.store.completeFinalization(f.task, result, async () => {}, undefined, owner);
     return result;
   };
 }

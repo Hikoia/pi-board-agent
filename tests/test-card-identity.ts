@@ -14,7 +14,7 @@ import {
 import type { TicketExecutor } from "../src/ticket-executor.js";
 import {
   TicketWorktrees,
-  type TicketExecutionRecord,
+  type TicketExecutionRecordV5,
 } from "../src/ticket-worktree.js";
 
 const cwd = mkdtempSync(join(tmpdir(), "board-orchestration-"));
@@ -201,17 +201,17 @@ const reviewDrifts: [string, (card: Card) => void][] = [
   ],
 ];
 const reviewRoot = mkdtempSync(join(cwd, "review-"));
-const reviewWorktrees = new TicketWorktrees(reviewRoot);
+const reviewWorktrees = new TicketWorktrees(reviewRoot, testOwner(reviewRoot));
 async function reviewCase(
   phase?: "claim" | "model" | "comment",
   drift?: (card: Card) => void,
-  recordPatch?: Partial<TicketExecutionRecord>,
+  recordPatch?: Partial<TicketExecutionRecordV5>,
 ) {
   const root = reviewRoot;
   const current = card({ status: cfg.columns.review });
   const worktrees = reviewWorktrees;
-  const record: TicketExecutionRecord = {
-    schemaVersion: 4,
+  const record: TicketExecutionRecordV5 = {
+    schemaVersion: 5,
     itemId: "ITEM",
     issueNumber: 42,
     taskKey: "T042",
@@ -254,7 +254,7 @@ async function reviewCase(
         setStatus: async (_card, status) => {
           if (status === cfg.columns.done)
             assert.equal(
-              new TicketWorktrees(root).read("ITEM")?.reviewedTaskSha,
+              new TicketWorktrees(root, testOwner(root)).read("ITEM")?.reviewedTaskSha,
               reviewedSha,
               "exact reviewed SHA must be durable BEFORE Done",
             );
@@ -418,9 +418,11 @@ for (const verdict of ["model", "comment"] as const) {
   ]) {
     const h = await reviewCase(verdict, undefined, patch);
     assert.deepEqual(h.events, ["claim", "model"], "changed record retains claim for its new owner; no stale release/writeback");
-    for (const [key, value] of Object.entries(patch)) assert.equal(h.record?.[key as keyof TicketExecutionRecord], value);
+    for (const [key, value] of Object.entries(patch)) assert.equal(h.record?.[key as keyof TicketExecutionRecordV5], value);
   }
 }
 console.log(
   "PASS: both pass/fail review write-backs reject changed execution/review records and in-progress builder admission",
 );
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

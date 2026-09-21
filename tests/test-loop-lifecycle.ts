@@ -20,7 +20,7 @@ import type { TicketExecutor } from "../src/ticket-executor.js";
 const root = mkdtempSync(join(tmpdir(), "board-loop-lifecycle-"));
 try {
   execFileSync("git", ["init", "-b", "main", root], { stdio: "ignore" });
-  const worktrees = new TicketWorktrees(root);
+  const worktrees = new TicketWorktrees(root, testOwner(root));
   let reads = 0;
   let reconciles = 0;
   let heartbeats = 0;
@@ -71,7 +71,7 @@ try {
   );
 
   // A stop is a barrier, not merely a request to stop. All callers share it.
-  const barrierOwner = acquireOwnerLock(root, "bot");
+  const barrierOwner = testOwner(root);
   let finishDrain!: () => void;
   const drainBarrier = new Promise<void>((resolve) => { finishDrain = resolve; });
   let drains = 0;
@@ -112,7 +112,7 @@ try {
   console.log("PASS: repeated stop shares one drain barrier and cannot restart or promote the stopped loop");
 
   // An async busy-tick heartbeat is owner work too, not a detached continuation.
-  const heartbeatOwner = acquireOwnerLock(root, "bot");
+  const heartbeatOwner = testOwner(root);
   let finishBusyRead!: () => void, finishHeartbeat!: () => void, enterHeartbeat!: () => void;
   const busyRead = new Promise<void>((done) => { finishBusyRead = done; });
   const heartbeatPending = new Promise<void>((done) => { finishHeartbeat = done; });
@@ -165,7 +165,7 @@ try {
   assert.equal(recoveryCalls, 0, "a board read that finishes after stop cannot schedule recovery/finalization");
   console.log("PASS: stopping during the board read does not admit another recovery or finalization action");
 
-  const finalizerOwner = acquireOwnerLock(root, "bot");
+  const finalizerOwner = testOwner(root);
   let finishFinalization!: () => void;
   let enteredFinalization!: () => void;
   const finalizationGate = new Promise<void>((resolve) => { finishFinalization = resolve; });
@@ -192,7 +192,7 @@ try {
   console.log("PASS: stop never interrupts an operating finalizer or unlocks early, and schedules no further finalization");
 
   const events: string[] = [];
-  const owner = acquireOwnerLock(root, "bot");
+  const owner = testOwner(root);
   let rejectRead!: (error: Error) => void;
   const pendingRead = new Promise<never>((_resolve, reject) => {
     rejectRead = reject;
@@ -224,7 +224,7 @@ try {
     "PASS: a rejected in-flight tick still drains builders before releasing ownership",
   );
 
-  const retained = acquireOwnerLock(root, "bot");
+  const retained = testOwner(root);
   const unsafeStop = new BoardLoop(
     deps,
     createLoopState(),
@@ -246,3 +246,5 @@ try {
 } finally {
   rmSync(root, { recursive: true, force: true });
 }
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

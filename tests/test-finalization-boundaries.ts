@@ -49,49 +49,27 @@ try {
     );
   }
   {
-    const f = await fixture();
-    const advanced = git(
-      f.repo,
-      "commit-tree",
-      `${f.base}^{tree}`,
-      "-p",
-      f.base,
-      "-m",
-      "base advance",
-    );
-    faults.beforeGit = (a) => {
-      if (basePush(a)) {
-        faults.beforeGit = undefined;
-        git(f.repo, "push", "origin", `${advanced}:refs/heads/main`);
-      }
-    };
-    await f.finish();
-    const prepared = f.recordNow().integration!;
-    calls.length = 0;
+    const f = await fixture(false, false); await f.finish();
+    const prepared = f.prNow();
+    f.card.closed = false; f.card.status = f.cfg.columns.ready; await f.finish();
+    git(f.record.path, "merge", "--ff-only", prepared.preparedHeadSha);
+    git(f.record.path, "commit", "--allow-empty", "-m", "renewed repair");
+    const reviewed = git(f.record.path, "rev-parse", "HEAD");
+    f.store.setReviewedTaskSha(f.task.itemId, reviewed);
+    f.card.closed = true; f.card.status = f.cfg.columns.done; calls.length = 0;
     faults.beforeSyncFs = (op, path, destination) => {
-      if (op === "renameSync" && destination === f.recordFile) {
-        const next = JSON.parse(readFileSync(path, "utf8"));
-        if (next.integration?.resultSha !== prepared.resultSha)
-          throw new Error("offline supersession publication failure");
-      }
+      if (op === "renameSync" && destination === f.recordFile && JSON.parse(readFileSync(path, "utf8")).integration?.phase === "prepared")
+        throw new Error("offline renewed preparation publication failure");
     };
     await f.finish();
-    assert.deepEqual(f.recordNow().integration, prepared);
-    assert.equal(f.recordNow().reviewedTaskSha, f.taskSha);
-    assert.equal(f.recordNow().retry?.stage, "integrate");
-    assert.equal(calls.filter(basePush).length, 0);
-    assert.equal(f.card.closed, true);
+    assert.equal(f.prNow().preparedHeadSha, prepared.preparedHeadSha); assert.equal(f.prNow().phase, "suspended");
+    assert.equal(f.recordNow().reviewedTaskSha, reviewed); assert.equal(f.recordNow().retry?.stage, "integrate");
+    assert.equal(calls.filter(a => a[0] === "push").length, 0);
     faults.beforeSyncFs = undefined;
-    assert.equal((await f.finish()).status, "finalized");
-    assert.equal(
-      git(f.repo, "show", "-s", "--format=%P", f.tip()),
-      `${advanced} ${f.taskSha}`,
-    );
-    assert.equal(f.starts(), 0);
-    assert.equal(f.reviews(), 0);
-    console.log(
-      "PASS: failed atomic supersession retains the rejected result and original approval, never pushes the unpublished replacement, and retries integration only",
-    );
+    assert.equal((await f.finish()).status, "waiting"); assert.equal(f.prNow().prNumber, prepared.prNumber);
+    f.prs.merge(); assert.equal((await f.finish()).status, "finalized");
+    assert.equal(f.starts(), 0); assert.equal(f.reviews(), 0);
+    console.log("PASS: failed atomic renewal retains suspended source/PR identity; unpublished replacement is never pushed, and renewed approval reuses the PR");
   }
   for (const cut of [
     "remote-lease",
@@ -115,6 +93,7 @@ try {
         git(
           f.repo,
           "push",
+          "--force",
           "origin",
           `${newer}:refs/heads/${f.task.taskBranch}`,
         );
@@ -136,6 +115,7 @@ try {
         git(
           f.repo,
           "push",
+          "--force",
           "origin",
           `${newer}:refs/heads/${f.task.taskBranch}`,
         );
@@ -169,8 +149,8 @@ try {
     faults.beforeGit = (a) => {
       if (deleting(a)) throw new Error("offline retain integrated progress");
     };
-    await f.finish();
-    assert.equal(f.recordNow().retry?.stage, "cleanup");
+    const first = await f.finish();
+    assert.equal(f.recordNow().retry?.stage, "cleanup", JSON.stringify(first));
     faults.beforeGit = undefined;
     if (missing === "directory")
       rmSync(f.record.path, { recursive: true }); // simulate vanished directory, Git registration remains
@@ -212,10 +192,8 @@ try {
         "-m",
         "human-approved prepared result",
       );
-      f.store.update(f.task.itemId, (r) => ({
-        ...r,
-        integration: { baseSha: f.base, taskSha: f.taskSha, resultSha },
-      }));
+      f.store.recordPullRequestPreparation(f.recordNow(), { scope: { owner: "owner", repo: "repo", base: "main", head: f.task.taskBranch },
+        baseSha: f.base, taskSha: f.taskSha, remoteTaskSha: f.taskSha, preparedHeadSha: resultSha }, f.owner, () => {});
     }
     calls.length = 0;
     assert.equal((await f.finish()).status, "finalized");
@@ -251,6 +229,10 @@ try {
     const f = await fixture();
     calls.length = 0;
     git(f.repo, "push", "origin", `${f.taskSha}:refs/heads/main`);
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(f.recordFile, JSON.stringify({ ...f.record, schemaVersion: 3, reviewedTaskSha: f.taskSha,
+      finalization: { targetBranch: "main", baseSha: f.base, taskSha: f.taskSha, resultSha: f.taskSha } }));
+    assert.deepEqual((await f.executor.migrateLegacy(f.owner)).failures, []);
     const outcome = await f.finish();
     assert.equal(outcome.status, "finalized", JSON.stringify(outcome));
     assert.equal(
@@ -285,7 +267,7 @@ try {
         "update-ref",
         "refs/heads/main",
         other,
-        integration.resultSha,
+        f.mergedSha(),
       );
     } else
       faults.beforeGit = (a) => {

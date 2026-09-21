@@ -24,14 +24,14 @@ try {
   {
     const f = await fixture();
     const result = git(f.repo, "commit-tree", `${f.taskSha}^{tree}`, "-p", f.base, "-m", "old squash result");
-    f.store.update(f.task.itemId, (r) => ({ ...r, finalization: { targetBranch: "main", baseSha: f.base, taskSha: f.taskSha, resultSha: result } }));
+    f.store.legacyUpdate(f.task.itemId, (r) => ({ ...r, finalization: { targetBranch: "main", baseSha: f.base, taskSha: f.taskSha, resultSha: result } }));
     const raw = readFileSync(f.recordFile), owner = acquireOwnerLock(f.repo, "bot");
     try {
       calls.length = 0;
-      let report = await adapter(f).migrate(owner);
+      let report = await adapter(f).legacyMigrateV4(owner);
       assert.deepEqual(report.failures, []);
-      assert.deepEqual(f.store.read(f.task.itemId)!.integration, { baseSha: f.base, taskSha: f.taskSha, resultSha: result });
-      assert.equal(f.store.read(f.task.itemId)!.retry!.stage, "integrate", "recorded result is not proof it was pushed");
+      assert.deepEqual(f.store.legacyRead(f.task.itemId)!.integration, { baseSha: f.base, taskSha: f.taskSha, resultSha: result });
+      assert.equal(f.store.legacyRead(f.task.itemId)!.retry!.stage, "integrate", "recorded result is not proof it was pushed");
       noNewEvidence(f, [], []);
       // Second independent old-state observation: remote accepted this squash,
       // then advanced. Reuse the fixture's exact original v3 bytes, never guess.
@@ -40,10 +40,10 @@ try {
       git(f.repo, "push", "origin", `${advanced}:refs/heads/main`);
       writeFileSync(f.recordFile, raw);
       calls.length = 0;
-      report = await adapter(f).migrate(owner);
+      report = await adapter(f).legacyMigrateV4(owner);
       assert.deepEqual(report.failures, []);
-      assert.equal(f.store.read(f.task.itemId)!.integration!.resultSha, result);
-      assert.equal(f.store.read(f.task.itemId)!.retry!.stage, "cleanup");
+      assert.equal(f.store.legacyRead(f.task.itemId)!.integration!.resultSha, result);
+      assert.equal(f.store.legacyRead(f.task.itemId)!.retry!.stage, "cleanup");
       assert.equal(f.tip(), advanced);
       noNewEvidence(f, [], []);
       assert.deepEqual(readFileSync(join(f.repo, ".pi", "board-agent", "legacy-v3", f.recordFile.split(/[\\/]/).at(-1)!)), raw);
@@ -58,7 +58,7 @@ try {
     const owner = acquireOwnerLock(f.repo, "bot");
     try {
       calls.length = 0;
-      const rejected = await adapter(f).migrate(owner);
+      const rejected = await adapter(f).legacyMigrateV4(owner);
       assert.equal(rejected.failures.length, 1);
       assert.match(rejected.failures[0].reason, /snapshot changed|added/i);
       assert.deepEqual(readFileSync(f.recordFile), raw);
@@ -67,10 +67,10 @@ try {
       noNewEvidence(f, [f.receipt.split(/[\\/]/).at(-1)!], []);
       unlinkSync(unknown); // fixture removes only its deliberately injected unknown data
       calls.length = 0;
-      const report = await adapter(f).migrate(owner);
+      const report = await adapter(f).legacyMigrateV4(owner);
       assert.deepEqual(report.failures, []);
-      assert.equal(f.store.read(f.task.itemId)!.integration!.resultSha, result);
-      assert.equal(f.store.read(f.task.itemId)!.retry!.stage, "cleanup");
+      assert.equal(f.store.legacyRead(f.task.itemId)!.integration!.resultSha, result);
+      assert.equal(f.store.legacyRead(f.task.itemId)!.retry!.stage, "cleanup");
       assert.equal(existsSync(f.record.path), true, "migration adopts, not recursively removes, known residuals");
       assert.equal(existsSync(join(f.record.path, ".git")), false);
       assert.equal(readFileSync(join(f.record.path, "feature.txt"), "utf8"), "feature\n");
@@ -86,9 +86,9 @@ try {
     const receipt = readFileSync(f.receipt), owner = acquireOwnerLock(f.repo, "bot");
     try {
       calls.length = 0;
-      const report = await adapter(f, _DEFAULTS.columns.ready).migrate(owner);
+      const report = await adapter(f, _DEFAULTS.columns.ready).legacyMigrateV4(owner);
       assert.deepEqual(report.failures, []);
-      const record = f.store.read(f.task.itemId)!;
+      const record = f.store.legacyRead(f.task.itemId)!;
       assert.equal(record.schemaVersion, 4);
       assert.equal(record.retry!.stage, "cleanup");
       assert.equal(record.integration!.resultSha, f.tip());
@@ -99,7 +99,7 @@ try {
       assert.deepEqual(readFileSync(f.receipt), receipt);
       noNewEvidence(f, [f.receipt.split(/[\\/]/).at(-1)!], []);
       const saved = readFileSync(f.recordFile);
-      assert.deepEqual((await adapter(f).migrate(owner)).converted, []);
+      assert.deepEqual((await adapter(f).legacyMigrateV4(owner)).converted, []);
       assert.deepEqual(readFileSync(f.recordFile), saved);
       console.log("PASS: receipt-only cleanup (ticket/ref/worktree already removed) restores v4 progress from the validated surviving source, archives its exact raw receipt and never deletes or replays it");
     } finally { owner.release(); }

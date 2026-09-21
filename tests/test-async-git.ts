@@ -177,6 +177,9 @@ const hooks = registerHooks({
     return next(specifier, context);
   },
 });
+const { testOwner, noPullRequests } = await import("./pr-fixture.js");
+const { simulateHumanFinalization } = await import("./human-finalization-fixture.js");
+
 async function responsive(from: number) {
   const calls = observations.slice(from);
   assert.ok(calls.length, "operation must exercise the process boundary");
@@ -196,7 +199,7 @@ async function responsive(from: number) {
 }
 try {
   const { TicketWorktrees } = await import("../src/ticket-worktree.js");
-  const store = new TicketWorktrees(repo);
+  const store = new TicketWorktrees(repo, testOwner(repo));
   const record = await store.ensure(task, "demo");
   assert.equal(record.itemId, task.itemId);
   assert.equal(store.check(record).ok, true);
@@ -331,7 +334,7 @@ try {
   const baseSha = git(repo, "rev-parse", "origin/main");
   fault = { source: "worktree", command: "push", kind: "exit" };
   await assert.rejects(
-    store.finalizeAccepted(task, "merge"),
+    simulateHumanFinalization(store, task),
     /git push .*failed: controlled runner failure/,
   );
   assert.equal(
@@ -347,22 +350,23 @@ try {
 
   fault = { source: "worktree", command: "ls-remote", kind: "exit", afterPush: true };
   await assert.rejects(
-    store.finalizeAccepted(task, "merge"),
+    simulateHumanFinalization(store, task),
     /git ls-remote .*failed: controlled runner failure/,
   );
   assert.equal(store.localBranchSha(task.taskBranch), taskSha);
   assert.equal(existsSync(record.path), true);
   assert.equal(store.has(task.itemId), true);
-  const published = git(repo, "rev-parse", "origin/main");
-  assert.equal(published, store.read(task.itemId)!.integration!.resultSha);
+  const published = (store.read(task.itemId)!.integration as import("../src/ticket-worktree.js").TicketPullRequestIntegration).preparedHeadSha;
+  assert.equal(git(repo, "rev-parse", `origin/${task.taskBranch}`), published);
   assert.notEqual(published, baseSha, "the fault is deliberately AFTER the accepted base push");
   console.log(
     "PASS: post-push ls-remote failure retains both sources and cleanup evidence",
   );
 
+  const merged = (store.read(task.itemId)!.integration as Extract<import("../src/ticket-worktree.js").TicketPullRequestIntegration, { phase: "merged" }>).mergeCommitSha;
   from = observations.length;
-  const resultSha = await store.finalizeAccepted(task, "merge");
-  assert.equal(resultSha, published, "healthy cleanup retry must not integrate the task again");
+  const resultSha = await simulateHumanFinalization(store, task);
+  assert.equal(resultSha, merged, "healthy cleanup retry must not integrate the task again");
   assert.equal(
     git(repo, "ls-remote", "origin", "refs/heads/main").split(/\s+/)[0],
     resultSha,
@@ -370,7 +374,7 @@ try {
   assert.equal(store.localBranchSha(task.taskBranch), undefined);
   assert.equal(existsSync(record.path), false);
   assert.equal(store.has(task.itemId), true, "integration receipt remains until Project Done is confirmed");
-  await store.completeFinalization(task, resultSha!, async () => {});
+  await store.completeFinalization(task, resultSha!, async () => {}, undefined, testOwner(repo));
   assert.equal(store.has(task.itemId), false);
   await responsive(from);
   console.log(

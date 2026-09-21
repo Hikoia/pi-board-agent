@@ -12,6 +12,8 @@ import {
   type TicketBoardAdapter,
 } from "../src/ticket-executor.js";
 import { TicketWorktrees } from "../src/ticket-worktree.js";
+import { pendingTicketWrite } from "../src/ticket-retry.js";
+import { settledTicks } from "./async-loop-fixture.js";
 import { buildTasksForWave } from "../src/workflow-prompt.js";
 
 const root = process.env.TMP_DIR!;
@@ -62,7 +64,7 @@ function fixture() {
     status: cfg.columns.ready,
     assignees: [],
   };
-  const store = new TicketWorktrees(repo);
+  const store = new TicketWorktrees(repo, testOwner(repo));
   const writes: string[] = [],
     notices: string[] = [];
   let starts = 0,
@@ -88,7 +90,7 @@ function fixture() {
     },
   };
   const executor = new ManagedTicketExecutor({
-    cwd: repo,
+    owner: testOwner(repo), pullRequests: fakePullRequests(repo, true).api, cwd: repo,
     cfg,
     worktrees: store,
     board,
@@ -207,7 +209,11 @@ for (const change of ["unchanged", "revision", "human", "contract", "stop"]) {
     if (change === "unchanged") assert.equal(record.activeRunId, "run-1");
     else {
       assert.equal(record.activeRunId, undefined);
-      assert.deepEqual(f.card.assignees, []);
+      assert.deepEqual(f.card.assignees, change === "stop" ? ["bot"] : []);
+      if (change === "stop") {
+        assert.deepEqual(f.writes, [], "stop vetoes late remote release/status writes");
+        assert.equal(pendingTicketWrite(record)?.status, cfg.columns.ready, "restart retains the definitely unstarted reset");
+      }
       assert.equal(
         f.card.status,
         change === "human" ? cfg.columns.needs_human : cfg.columns.ready,
@@ -277,12 +283,13 @@ for (const delta of [false, true]) {
   f.card.closed = true;
   const entered = deferred(),
     finish = deferred(),
-    finalize = f.store.finalizeAccepted.bind(f.store);
-  f.store.finalizeAccepted = async (...args) => {
+    finalize = f.store.preparePullRequest.bind(f.store);
+  f.store.preparePullRequest = async (...args) => {
     entered.resolve();
     await finish.promise;
     return await finalize(...args);
   };
+  settledTicks(f.loop); // observe the held maintenance operation, not merely its nonblocking admission
   const tick = f.loop.tickNow();
   let stopped = false;
   try {
@@ -319,7 +326,9 @@ for (const delta of [false, true]) {
     assert.deepEqual(f.writes, []);
     // No Git operation had started when stop arrived. A fresh owner can finish
     // the retained, approved record, rather than deleting it to satisfy stop.
-    const result = await finalize(f.task, "merge");
+    f.store.preparePullRequest = finalize;
+    const { simulateHumanFinalization } = await import("./human-finalization-fixture.js");
+    const result = await simulateHumanFinalization(f.store, f.task);
     assert.ok(result);
     assert.equal(git(repo, "show", "origin/main:accepted.txt"), "accepted");
     assert.equal(existsSync(record.path), false);
@@ -333,3 +342,5 @@ for (const delta of [false, true]) {
     await f.loop.stop();
   }
 }
+
+import { testOwner, noPullRequests, fakePullRequests } from "./pr-fixture.js";

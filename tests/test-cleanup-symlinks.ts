@@ -1,3 +1,6 @@
+
+const { testOwner, noPullRequests } = await import("./pr-fixture.js");
+const { simulateHumanFinalization } = await import("./human-finalization-fixture.js");
 // Public cleanup seam: links are evidence, never paths to traverse or delete through.
 import assert from "node:assert/strict";
 import {
@@ -433,8 +436,8 @@ try {
     };
     await assertRetained();
     calls.length = 0;
-    const restarted = new TicketWorktrees(registered.repo);
-    await assert.rejects(restarted.finalizeAccepted(registered.task, "merge"), {
+    const restarted = new TicketWorktrees(registered.repo, testOwner(registered.repo));
+    await assert.rejects(simulateHumanFinalization(restarted, registered.task), {
       name: "Error",
       message:
         "Unregistered residual requires existing legacy evidence; work retained.",

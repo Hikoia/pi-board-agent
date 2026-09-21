@@ -13,14 +13,14 @@ for (const [name, status] of [["active", "running"], ["paused", "paused"], ["quo
   const t = await f.ticket(name);
   const j = f.journal(t.record, `${name}-original`, status);
   if (name === "quota") { j.run.pauseReason = "usage_limit"; writeFileSync(j.file, JSON.stringify(j.run)); }
-  f.store.setActiveRun(name, j.run.runId, Date.parse(j.run.startedAt));
+  f.store.legacySetActiveRun(name, j.run.runId, Date.parse(j.run.startedAt));
   writeFileSync(join(t.record.path, "work.txt"), `${name} partial dirty diff\n`);
   writeFileSync(join(t.record.path, "untracked.txt"), "keep this too\n");
   active.push({ ...t, ...j, diff: git(t.record.path, "diff") });
   journals.set(j.file, readFileSync(j.file));
 }
 const unique = await f.ticket("launch_unique"), absent = await f.ticket("launch_absent"), ambiguous = await f.ticket("launch_ambiguous");
-for (const t of [unique, absent, ambiguous]) f.store.beginLaunch(t.card.itemId, t.record.createdAt);
+for (const t of [unique, absent, ambiguous]) f.store.legacyBeginLaunch(t.card.itemId, t.record.createdAt);
 const match = f.journal(unique.record, "unique-original");
 const first = f.journal(ambiguous.record, "ambiguous-a"), second = f.journal(ambiguous.record, "ambiguous-b");
 for (const j of [match, first, second]) journals.set(j.file, readFileSync(j.file));
@@ -36,7 +36,7 @@ writeFileSync(brokenLedger.file, "{unreadable ledger");
 const repair = await f.ticket("repair");
 const h = f.ledger(repair.record, repair.card, "consumed", "repair-original");
 const rj = f.journal(repair.record, "repair-original", "paused", h.request);
-f.store.setActiveRun(repair.card.itemId, rj.run.runId, Date.parse(rj.run.startedAt));
+f.store.legacySetActiveRun(repair.card.itemId, rj.run.runId, Date.parse(rj.run.startedAt));
 ledgers.set(h.file, readFileSync(h.file)); journals.set(rj.file, readFileSync(rj.file));
 // An interrupted merge is real Git state, not a clean-gate mock.
 writeFileSync(join(repair.record.path, "work.txt"), "task change\n");
@@ -48,11 +48,11 @@ const mergeHead = git(repair.record.path, "rev-parse", "MERGE_HEAD"), dirtyRepai
 const design = await f.ticket("design", "Needs Design"), human = await f.ticket("human", f.cfg.columns.needs_human);
 const leased = await f.ticket("leased");
 const lj = f.journal(leased.record, "leased-original", "running");
-f.store.setActiveRun(leased.card.itemId, lj.run.runId, Date.parse(lj.run.startedAt));
+f.store.legacySetActiveRun(leased.card.itemId, lj.run.runId, Date.parse(lj.run.startedAt));
 const lease = join(workflowProjectPaths(leased.record.path).runsDir, `${lj.run.runId}.lock`);
 writeFileSync(lease, JSON.stringify({ runId: lj.run.runId, pid: process.pid }));
 for (const t of [design, human]) originals.set(t.file, readFileSync(t.file));
-for (const record of f.store.list()) originals.set(f.store.recordPath(record.itemId), readFileSync(f.store.recordPath(record.itemId)));
+for (const record of f.store.listStored()) originals.set(f.store.recordPath(record.itemId), readFileSync(f.store.recordPath(record.itemId)));
 const badFiles = new Map<string, string>();
 for (const version of [1, 2]) badFiles.set(join(f.store.recordsDir, `v${version}.json`), JSON.stringify({ ...unique.record, schemaVersion: version }));
 badFiles.set(join(f.store.recordsDir, "corrupt.json"), "{bad");
@@ -82,18 +82,18 @@ function fakeManager(path: string): TicketWorkflowManager {
   managers.set(path, manager); return manager;
 }
 let executor = new ManagedTicketExecutor({ ...f.deps, createManager: fakeManager });
-const owner = acquireOwnerLock(f.repo, "bot");
+const owner = f.deps.owner;
 try {
   assert.throws(() => acquireOwnerLock(f.repo, "bot"), /already running/);
   const report = await executor.migrateLegacy(owner);
   assert.ok(report.failures.some((e) => e.reason.includes("still alive")));
-  assert.equal(f.store.read("leased")?.schemaVersion, 3);
-  assert.equal(f.store.read("badledger")?.schemaVersion, 3);
+  assert.equal(f.store.readStored("leased")?.schemaVersion, 3);
+  assert.equal(f.store.readStored("badledger")?.schemaVersion, 3);
   assert.ok(executor.legacyBlocked("badledger"));
   assert.equal(readFileSync(brokenLedger.file, "utf8"), "{unreadable ledger");
   assert.equal(existsSync(join(f.repo, ".pi", "board-agent", "legacy-v3", "leased.json")), false);
   assert.equal(managers.size, 0, "conversion opens no WorkflowManager");
-  for (const record of f.store.list().filter((r) => r.schemaVersion === 4)) {
+  for (const record of f.store.list().filter((r) => r.schemaVersion === 5)) {
     const file = f.store.recordPath(record.itemId);
     assert.deepEqual(readFileSync(join(f.repo, ".pi", "board-agent", "legacy-v3", file.split(/[\\/]/).at(-1)!)), originals.get(file));
   }
@@ -155,7 +155,7 @@ try {
   assert.equal(starts, 0);
   console.log("PASS: active/paused/quota and repair runs keep IDs/script/args/dirty diff/MERGE_HEAD; zero/multiple launch matches stay occupied and uniquely reobserve without a builder");
 
-  const v4 = new Map(f.store.list().filter((r) => r.schemaVersion === 4).map((r) => [f.store.recordPath(r.itemId), readFileSync(f.store.recordPath(r.itemId))]));
+  const v4 = new Map(f.store.list().filter((r) => r.schemaVersion === 5).map((r) => [f.store.recordPath(r.itemId), readFileSync(f.store.recordPath(r.itemId))]));
   await executor.shutdown();
   executor = new ManagedTicketExecutor({ ...f.deps, createManager: fakeManager });
   const again = await executor.migrateLegacy(owner);

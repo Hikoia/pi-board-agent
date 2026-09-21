@@ -33,7 +33,7 @@ export async function fixture() {
   const cfg = structuredClone(_DEFAULTS);
   cfg.context.enabled = cfg.telegram.enabled = false;
   cfg.safety.require_clean_worktree = false;
-  const store = new TicketWorktrees(repo), cards: Card[] = [], comments: IssueComment[] = [], writes: string[] = [];
+  const store = new TicketWorktrees(repo, testOwner(repo)), cards: Card[] = [], comments: IssueComment[] = [], writes: string[] = [];
   const board: TicketBoardAdapter = {
     getCard: async (id) => structuredClone(cards.find((c) => c.itemId === id)),
     setStatus: async (id, status) => { writes.push(`status:${id}:${status}`); cards.find((c) => c.itemId === id)!.status = status; },
@@ -43,14 +43,15 @@ export async function fixture() {
     comment: async (_card, body) => { writes.push("comment"); comments.push({ id: `C${comments.length}`, author: "bot", body, createdAt: new Date().toISOString() }); },
   };
   board.decisionComments = async (card) => structuredClone(comments.filter((c) => c.id === `repair-${card.itemId}`));
-  const deps = { worktrees: store, cwd: repo, cfg, board, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {} };
+  const deps = { owner: testOwner(repo), pullRequests: noPullRequests, worktrees: store, cwd: repo, cfg, board, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {} };
   async function ticket(name: string, status: string = cfg.columns.building) {
     const card: Card = { itemId: name, number: cards.length + 1, contentType: "Issue", type: "Task", title: `T002 ${name}`,
       body: "Original question: which paid service? Option A or B; recommend A.", plan: "demo", status, closed: false,
       assignees: ["bot"], repoOwner: "owner", repoName: "repo" };
     cards.push(card);
     const task = buildTasksForWave(cfg, "demo", [card])[0];
-    const record = { ...await store.ensure(task, "demo"), schemaVersion: 3 as const };
+    const { integration: unused, ...identity } = await store.ensure(task, "demo");
+    const record: TicketExecutionRecord = { ...identity, schemaVersion: 3 };
     const file = store.recordPath(card.itemId);
     writeFileSync(file, JSON.stringify(record, null, 2)); // Explicit historical source; ensure now creates v4.
     return { card, task, record, file };
@@ -81,3 +82,5 @@ export async function fixture() {
   }
   return { repo, origin, sha, cfg, store, cards, comments, writes, board, deps, ticket, journal, ledger };
 }
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

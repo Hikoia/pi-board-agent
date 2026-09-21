@@ -46,7 +46,7 @@ async function fixture() {
     taskBranch: `task/issue-${sequence}`,
     baseBranch: "main",
   };
-  const store = new TicketWorktrees(repo);
+  const store = new TicketWorktrees(repo, testOwner(repo));
   const record = await store.ensure(task, "demo");
   writeFileSync(join(record.path, "feature.txt"), "feature\n");
   git(record.path, "add", ".");
@@ -57,8 +57,8 @@ async function fixture() {
     git(repo, "ls-remote", "origin", `refs/heads/${branch}`).split(/\s+/)[0];
   store.setReviewedTaskSha(task.itemId, taskSha);
   const finish = async (strategy: "squash" | "merge" = "squash") => {
-    const result = await store.finalizeAccepted(task, strategy);
-    if (result) await store.completeFinalization(task, result, async () => {}); // offline board confirms Done
+    const result = await simulateHumanFinalization(store, task);
+    if (result) await store.completeFinalization(task, result, async () => {}, undefined, testOwner(repo)); // offline board confirms Done
     return result;
   };
   const kept = () => {
@@ -161,11 +161,12 @@ async function fixture() {
   git(f.repo, "push", "origin", "main");
   const advanced = f.tip();
   assert.equal(f.store.read(f.task.itemId)!.reviewedTaskSha, f.taskSha);
+  const prepared = (f.store.read(f.task.itemId)!.integration as import("../src/ticket-worktree.js").TicketPullRequestIntegration).preparedHeadSha;
   const result = await f.finish();
   assert.equal(f.tip(), result);
   assert.equal(
     git(f.repo, "show", "-s", "--format=%P", result!),
-    `${advanced} ${f.taskSha}`,
+    `${advanced} ${prepared}`,
   );
   assert.equal(git(f.repo, "show", "origin/main:later.txt"), "later base work");
   assert.equal(git(f.repo, "show", "origin/main:feature.txt"), "feature");
@@ -213,9 +214,9 @@ async function fixture() {
     `#!/bin/sh\nwhile read local_ref local_sha remote_ref remote_sha; do\n if [ "$remote_ref" = refs/heads/main ]; then git update-ref refs/heads/${f.task.taskBranch} ${newer} ${f.taskSha}; fi\ndone\n`,
   );
   chmodSync(hook, 0o755);
-  await assert.rejects(() => f.finish(), /Local .* moved/);
+  await assert.rejects(() => f.finish(), /does not cover|Local .* moved/);
   assert.equal(f.store.localBranchSha(f.task.taskBranch), newer);
-  assert.equal(f.tip(f.task.taskBranch), f.taskSha);
+  assert.equal(f.tip(f.task.taskBranch), (f.store.read(f.task.itemId)!.integration as import("../src/ticket-worktree.js").TicketPullRequestIntegration).preparedHeadSha);
   assert.ok(existsSync(f.record.path));
   console.log(
     "PASS: local branch movement during the push prevents cleanup of newer work",
@@ -255,9 +256,12 @@ async function fixture() {
     `#!/bin/sh\nwhile read old new ref; do\n if [ "$ref" = refs/heads/main ]; then git update-ref refs/heads/main ${f.baseSha}; fi\ndone\n`,
   );
   chmodSync(hook, 0o755);
-  await assert.rejects(() => f.finish(), /is not on origin/);
+  await assert.rejects(() => f.finish(), /Actual PR merge commit is absent from fresh origin\/base/);
   f.kept();
   rmSync(hook);
+  const proof = f.store.read(f.task.itemId)!.integration;
+  assert.ok(proof?.kind === "pr" && proof.phase === "merged");
+  git(f.repo, "push", "origin", `${proof.mergeCommitSha}:refs/heads/main`); // human restores rewritten merge proof
   assert.ok(await f.finish());
   console.log(
     "PASS: a successful push response without verified integration never triggers cleanup",
@@ -272,8 +276,8 @@ async function fixture() {
   assert.equal(git(outside, "rev-parse", "HEAD"), f.taskSha);
   assert.equal(f.tip(), f.baseSha);
   await assert.rejects(
-    () => f.store.finalizeAccepted({ ...f.task, taskBranch: "main" }, "merge"),
-    /must differ/,
+    () => f.store.preparePullRequest({ ...f.task, taskBranch: "main" }, { owner: "owner", repo: "repo", base: "main", head: "main" }, testOwner(f.repo), async () => {}),
+    /identity changed|must differ/,
   );
   console.log(
     "PASS: finalization never removes external worktrees, symlink aliases or the base branch",
@@ -303,24 +307,7 @@ async function fixture() {
     () => f.store.ensure(collision, "demo"),
     /corrupt or unsupported/,
   );
-  f.store.update(f.task.itemId, (record) => ({
-    ...record,
-    integration: {
-      baseSha: f.baseSha,
-      taskSha: f.taskSha,
-      resultSha: git(
-        f.repo,
-        "commit-tree",
-        `${f.taskSha}^{tree}`,
-        "-p",
-        f.baseSha,
-        "-p",
-        f.taskSha,
-        "-m",
-        "prepared before push",
-      ),
-    },
-  }));
+  await f.store.preparePullRequest(f.task, { owner: "owner", repo: "repo", base: "main", head: f.task.taskBranch }, testOwner(f.repo), async () => {});
   const before = JSON.stringify(f.store.read(f.task.itemId));
   assert.throws(
     () => f.store.beginLaunch(f.task.itemId),
@@ -334,3 +321,7 @@ async function fixture() {
     "PASS: builder identity and immutable integration protections remain while approved finalization resumes its original result",
   );
 }
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";
+
+import { simulateHumanFinalization } from "./human-finalization-fixture.js";

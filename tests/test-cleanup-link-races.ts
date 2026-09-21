@@ -1,3 +1,5 @@
+
+const { simulateHumanFinalization } = await import("./human-finalization-fixture.js");
 // Ported from integration/ticket-simplification onto the v4 fixture.
 import assert from "node:assert/strict";
 import {
@@ -42,7 +44,7 @@ try {
     };
     calls.length = 0;
     await assert.rejects(
-      f.store.finalizeAccepted(f.task, "merge", async () => {
+      simulateHumanFinalization(f.store, f.task, async () => {
         if (!scanned || changed) return;
         changed = true;
         faults.afterFs = undefined;
@@ -82,7 +84,7 @@ try {
     if (race === "ignore rule") assert.ok(lstatSync(link).isSymbolicLink());
     assert.ok(existsSync(join(f.record.path, ".git")));
     assert.ok(existsSync(f.admin));
-    assert.equal(await f.store.remoteSha(f.task.taskBranch), f.taskSha);
+    assert.equal(await f.store.remoteSha(f.task.taskBranch), (f.store.read(f.task.itemId)!.integration as import("../src/ticket-worktree.js").TicketPullRequestIntegration).preparedHeadSha);
     assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
     assert.equal(f.store.read(f.task.itemId)?.retry?.stage, "cleanup");
     assert.ok(!calls.some((a) => a[0] === "worktree" && a[1] === "remove"));

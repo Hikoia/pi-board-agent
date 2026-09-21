@@ -48,8 +48,11 @@ function observed(mode: "sync" | "async", command: ProcessCommand, args: string[
     fault = undefined;
     return mode === "async" ? Promise.resolve(result) : result;
   }
-  if (mode === "sync") return runProcessSync(command, args, options);
-  return runProcess(command, args, options).then((result) => {
+  if (mode === "sync") return process.platform === "win32"
+    ? fixtureProcess(mode, command, args, options) : runProcessSync(command, args, options);
+  const result = process.platform === "win32"
+    ? fixtureProcess(mode, command, args, options) as Promise<ProcessResult> : runProcess(command, args, options);
+  return result.then((result) => {
     if (args[0] === "merge-tree") merges.push(result);
     return result;
   });
@@ -67,10 +70,16 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
   };
   return next(specifier, context);
 } });
+const { simulateHumanFinalization } = await import("./human-finalization-fixture.js");
+const { testOwner } = await import("./pr-fixture.js");
+// Worktrees was loaded through OUR hook above; native transport cannot bypass
+// the merge-result/fault counters. Actual runner supervision has separate tests.
+const { fixtureProcess, dispose: disposeTransport } = await import("./cleanup-fixture.js");
+
 
 try {
   const worktrees = await import("../src/ticket-worktree.js");
-  const store = new worktrees.TicketWorktrees(repo);
+  const store = new worktrees.TicketWorktrees(repo, testOwner(repo));
   const cfg = structuredClone(_DEFAULTS);
   cfg.context.enabled = cfg.telegram.enabled = false;
   const card: Card = {
@@ -99,7 +108,7 @@ try {
     assert.equal(git(repo, "show-ref"), localRefs, "all local refs are preserved");
     assert.equal(git(origin, "show-ref"), remoteRefs, "all remote refs are preserved");
     assert.equal(git(repo, "worktree", "list", "--porcelain"), registration);
-    assert.deepEqual(readFileSync(recordFile), recordBytes, "v4 record remains byte-identical; a conflict never publishes a result");
+    assert.deepEqual(readFileSync(recordFile), recordBytes, "v5 record remains byte-identical; a conflict never publishes a result");
     assert.equal(existsSync(record.path), true);
     assert.equal(readFileSync(join(record.path, "shared.txt"), "utf8"), "task edit\n");
     assert.equal(readFileSync(join(repo, "shared.txt"), "utf8"), "base edit\n");
@@ -112,7 +121,7 @@ try {
   for (const strategy of ["merge", "squash"] as const) {
     calls.length = 0;
     let caught: unknown;
-    try { await store.finalizeAccepted(task, strategy); } catch (error) { caught = error; }
+    try { await simulateHumanFinalization(store, task); } catch (error) { caught = error; }
     const result = merges.at(-1)!;
     assert.equal(result.ok, false);
     assert.equal(result.status, 1);
@@ -168,7 +177,7 @@ try {
   for (const scenario of cases) {
     calls.length = 0;
     fault = { command: scenario.command ?? "merge-tree", result: scenario.result };
-    await assert.rejects(store.finalizeAccepted(task, "merge"), (error: unknown) => {
+    await assert.rejects(simulateHumanFinalization(store, task), (error: unknown) => {
       assert.ok(error instanceof Error, scenario.label);
       assert.ok(!(error instanceof worktrees.MergeConflictError), scenario.label);
       assert.notEqual(error.name, "MergeConflictError", scenario.label);
@@ -181,5 +190,6 @@ try {
   }
 } finally {
   hooks.deregister();
+  disposeTransport();
   delete globals.__conflictGit;
 }

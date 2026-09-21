@@ -1,9 +1,11 @@
+import { assertOwnerLock, type OwnerLock } from "./owner-lock.js";
 import { createHash } from "node:crypto";
 import { checkOperation, type OperationControl } from "./operation.js";
 import { isTargetIssue, type Card } from "./gh.js";
 import {
   TicketWorktrees,
-  type TicketExecutionRecord,
+  type TicketExecutionRecordV5,
+  type StoredTicketExecutionRecord,
   type TicketRetryState,
 } from "./ticket-worktree.js";
 
@@ -20,7 +22,7 @@ interface PendingWrite {
 const PREFIX = "Pending ticket writeback:\n";
 
 export function pendingTicketWrite(
-  record: TicketExecutionRecord,
+  record: StoredTicketExecutionRecord,
 ): PendingWrite | undefined {
   if (!record.retry?.reason.startsWith(PREFIX)) return undefined;
   let value: PendingWrite;
@@ -71,19 +73,21 @@ export function pendingTicketWrite(
 
 export function queueTicketWrite(
   store: TicketWorktrees,
-  record: TicketExecutionRecord,
+  record: TicketExecutionRecordV5,
   stage: TicketRetryState["stage"],
   write: PendingWrite,
-): TicketExecutionRecord {
-  if (record.schemaVersion !== 4)
-    throw new Error("Migrate ticket before executing v4 writeback.");
+  owner: OwnerLock | undefined = store.owner,
+  assertCurrent: () => void = () => {},
+): TicketExecutionRecordV5 {
+  if (record.schemaVersion !== 5)
+    throw new Error("Migrate ticket before executing v5 writeback.");
   if (JSON.stringify(store.read(record.itemId)) !== JSON.stringify(record))
     throw new Error("Ticket record changed before writeback.");
   if (pendingTicketWrite(record)) return record;
   return store.update(record.itemId, (current) => ({
     ...current,
     retry: { stage, reason: PREFIX + JSON.stringify(write) },
-  }));
+  }), owner, assertCurrent);
 }
 
 export interface TicketWriteBoard {
@@ -113,12 +117,16 @@ export function sameTicketContract(a: Card, b: Card): boolean {
  * exception retains the pending write AND execution identity for the next tick. */
 export async function settleTicketWrite(
   store: TicketWorktrees,
-  record: TicketExecutionRecord,
+  record: TicketExecutionRecordV5,
   board: TicketWriteBoard,
   botLogin: string,
   drain: () => Promise<void> = async () => {},
   control?: OperationControl,
+  owner: OwnerLock | undefined = store.owner,
 ): Promise<"settled" | "withdrawn"> {
+  if (!owner) throw new Error("V5 writeback requires the exclusive owner.");
+  const external = control;
+  control = { ...control, check: () => { checkOperation(external); assertOwnerLock(owner, store.repoRoot); } };
   checkOperation(control);
   const write = pendingTicketWrite(record);
   if (!write) throw new Error("No pending ticket writeback.");
@@ -131,7 +139,7 @@ export async function settleTicketWrite(
     // Conflict reopening must retain exclusive branch/path ownership across
     // each awaited board operation, not only the initial merge-tree check.
     if (write.reopen)
-      store.cleanupRecord({
+      store.cleanupRecordV5({
         ...record,
         title: write.card.title,
         body: write.card.body,
@@ -177,7 +185,7 @@ export async function settleTicketWrite(
         technical || (!withdrawn && write.retry)
           ? { stage: current.retry!.stage, reason: write.reason }
           : undefined,
-    }));
+    }), owner, () => checkOperation(control));
   const guard = async (): Promise<Card | undefined> => {
     const card = await fresh();
     if (allowed(card)) return card;

@@ -63,7 +63,7 @@ try {
         assert.ok(existsSync(join(f.record.path, ".git")));
         assert.ok(existsSync(f.admin));
         if (boundary === "ignored clean")
-          assert.equal(await f.store.remoteSha(f.task.taskBranch), f.taskSha);
+          assert.equal(await f.store.remoteSha(f.task.taskBranch), (f.store.read(f.task.itemId)!.integration as import("../src/ticket-worktree.js").TicketPullRequestIntegration).preparedHeadSha);
         if (race === "dirty") {
           assert.equal(
             readFileSync(file, "utf8"),

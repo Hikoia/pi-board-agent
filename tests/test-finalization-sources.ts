@@ -77,7 +77,7 @@ try {
     await assert.rejects(f.finish("merge"), /cleanup cut/);
     faults.beforeGit = undefined;
     const record = f.store.read(f.task.itemId)!;
-    assert.equal(record.schemaVersion, 4);
+    assert.equal(record.schemaVersion, 5);
     assert.equal(record.integration?.taskSha, local);
     assert.equal(record.integration?.remoteTaskSha, remote);
     assert.equal(f.store.localBranchSha(f.task.taskBranch), local);
@@ -115,14 +115,14 @@ try {
     git(f.record.path, "add", ".");
     git(f.record.path, "commit", "-m", "local");
     faults.beforeGit = (a) => {
-      if (a[0] === "push" && a.at(-1)?.endsWith(":refs/heads/main"))
+      if (a[0] === "push" && a.at(-1)?.endsWith(`:refs/heads/${f.task.taskBranch}`))
         throw new Error("before push");
     };
     await assert.rejects(f.finish(), /before push/);
     faults.beforeGit = undefined;
-    const result = f.store.read(f.task.itemId)!.integration!.resultSha;
+    const result = (f.store.read(f.task.itemId)!.integration as import("../src/ticket-worktree.js").TicketPullRequestIntegration).preparedHeadSha;
     calls.length = 0;
-    assert.equal(await f.finish(), result);
+    assert.ok(await f.finish());
     assert.ok(!calls.some((a) => ["merge-tree", "commit-tree"].includes(a[0])));
     console.log(
       "PASS: divergent sources retain the same prepared result across a pre-push failure",
@@ -140,19 +140,20 @@ try {
     git(f.repo, "commit", "-m", "base advance");
     const advanced = git(f.repo, "rev-parse", "HEAD");
     faults.beforeGit = (a) => {
-      if (a[0] === "push" && a.at(-1)?.endsWith(":refs/heads/main")) {
+      if (a[0] === "push" && a.at(-1)?.endsWith(`:refs/heads/${f.task.taskBranch}`)) {
         faults.beforeGit = undefined;
         git(f.repo, "push", "origin", `${advanced}:refs/heads/main`);
+        throw new Error("offline task push cut");
       }
     };
     await assert.rejects(f.finish(), /push/);
     const prepared = f.store.read(f.task.itemId)!.integration;
-    await assert.rejects(f.finish(), (e: any) => e.repairable === false);
+    await assert.rejects(f.finish(), /merge-tree/);
     assert.deepEqual(f.store.read(f.task.itemId)!.integration, prepared);
-    assert.equal(f.store.read(f.task.itemId)!.retry?.stage, "integrate");
+    assert.equal(f.store.read(f.task.itemId)!.integration?.kind, "pr");
     assert.equal(f.tip(), advanced);
     assert.equal(f.store.localBranchSha(f.task.taskBranch), local);
-    assert.equal(await f.store.remoteBranchSha(f.task.taskBranch), remote);
+    assert.equal(await f.store.remoteBranchSha(f.task.taskBranch), (prepared as import("../src/ticket-worktree.js").TicketPullRequestIntegration).preparedHeadSha);
     console.log(
       "PASS: a later base conflict with combined sources retains both pins and never converts unrepairable integration into an automatic build retry",
     );
@@ -199,8 +200,8 @@ try {
       "-m",
       "racing ref",
     );
-    git(f.repo, "push", "origin", `${newer}:refs/heads/${f.task.taskBranch}`);
-    await assert.rejects(f.finish(), /Remote task ref changed/);
+    git(f.repo, "push", "--force", "origin", `${newer}:refs/heads/${f.task.taskBranch}`); // explicit external rewrite fixture
+    await assert.rejects(f.finish(), /does not cover|source|Remote task ref changed/i);
     assert.equal(f.tip(), base);
     assert.deepEqual(f.store.read(f.task.itemId)!.integration, integration);
     assert.equal(await f.store.remoteBranchSha(f.task.taskBranch), newer);

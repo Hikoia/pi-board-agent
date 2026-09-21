@@ -13,7 +13,7 @@ import { pendingTicketWrite } from "../src/ticket-retry.js";
 const cwd = process.env.TMP_DIR!;
 assert.ok(cwd, "Run via bash tests/run-offline.sh");
 execFileSync("git", ["init", "-b", "main", cwd], { stdio: "ignore" });
-const worktrees = new TicketWorktrees(cwd);
+const worktrees = new TicketWorktrees(cwd, testOwner(cwd));
 const cfg = structuredClone(_DEFAULTS);
 cfg.safety.require_clean_worktree = false;
 const deps: LoopDeps = {
@@ -39,7 +39,7 @@ const disposed = [0, 0];
 const schedulingStopped = [false, false];
 let created = 0;
 const executor = new ManagedTicketExecutor({
-  cwd, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo", worktrees,
+  owner: testOwner(cwd), pullRequests: noPullRequests, cwd, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo", worktrees,
   callback: () => {},
   board: {
     getCard: async () => undefined, claim: async () => false,
@@ -65,7 +65,7 @@ const executor = new ManagedTicketExecutor({
   },
 });
 assert.equal(executor.activeCount(), 2);
-const owner = acquireOwnerLock(cwd, "bot");
+const owner = testOwner(cwd);
 const loop = new BoardLoop(deps, createLoopState(), executor, worktrees, owner);
 try {
   const stopping = loop.stop();
@@ -108,7 +108,7 @@ try {
   git(repo, "push", "origin", "main");
   const cfg = structuredClone(deps.cfg);
 
-  const worktrees = new TicketWorktrees(repo);
+  const worktrees = new TicketWorktrees(repo, testOwner(repo));
   const card = {
     itemId: "PVTI_9", contentType: "Issue" as const, number: 9, title: "Task", body: "Acceptance",
     repoOwner: "owner", repoName: "repo", plan: "demo", type: "Task", closed: false,
@@ -124,7 +124,7 @@ try {
   let beforeRead = async () => {};
   let run: PersistedRunState | undefined;
   const makeExecutor = () => new ManagedTicketExecutor({
-    cwd: repo, cfg, worktrees, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {},
+    owner: testOwner(repo), pullRequests: noPullRequests, cwd: repo, cfg, worktrees, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {},
     context: () => context(),
     board: {
       getCard: async () => { reads++; await beforeRead(); return structuredClone(card); },
@@ -143,7 +143,7 @@ try {
     }),
   });
   const makeLoop = (executor: ManagedTicketExecutor) => {
-    const owner = acquireOwnerLock(repo, "bot");
+    const owner = testOwner(repo);
     return { owner, loop: new BoardLoop({ ...deps, cwd: repo, cfg, listCards: async () => [structuredClone(card)] }, createLoopState(), executor, worktrees, owner) };
   };
   let executor = makeExecutor();
@@ -190,3 +190,5 @@ try {
   assert.equal(existsSync(recovery.owner.path), false);
   console.log("PASS: stop disables paused-run recovery across an in-flight fresh read without discarding execution evidence");
 }
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

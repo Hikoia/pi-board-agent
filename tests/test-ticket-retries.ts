@@ -34,7 +34,7 @@ function fixture() {
 
   cfg.safety.require_clean_worktree = cfg.context.enabled = cfg.telegram.enabled = false;
   const card: Card = { itemId: `RETRY_${number}`, number, contentType: "Issue", type: "Task", title: `T${number} task`, body: "Approved acceptance criteria", repoOwner: "owner", repoName: "repo", closed: false, status: cfg.columns.ready, assignees: [] };
-  const store = new TicketWorktrees(repo), comments: IssueComment[] = [], events: string[] = [], notices: string[] = [];
+  const store = new TicketWorktrees(repo, testOwner(repo)), comments: IssueComment[] = [], events: string[] = [], notices: string[] = [];
   const runs: PersistedRunState[] = [];
   let starts = 0, reviews = 0, drains = 0, failAt = "", failOnce = true;
   const fail = (step: string) => { events.push(step); if (step === failAt && failOnce) { failOnce = false; throw new Error(`offline ${step} failure`); } };
@@ -55,7 +55,7 @@ function fixture() {
     stopAndWait: async () => { fail("drain"); drains++; },
     pauseAndWait: async () => {}, dispose() {},
   };
-  const executor = new ManagedTicketExecutor({ cwd: repo, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo", worktrees: store, board, callback: (s) => notices.push(s), createManager: () => manager });
+  const executor = new ManagedTicketExecutor({ owner: testOwner(repo), pullRequests: fakePullRequests(repo, true).api, cwd: repo, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo", worktrees: store, board, callback: (s) => notices.push(s), createManager: () => manager });
   assert.equal("repairFor" in executor, false, "New path has no repair authority API");
   assert.equal("repairForReview" in executor, false, "New path has no test-history evidence API");
   let reviewImpl = async (_input: ReviewInput): Promise<CompletedReview> => ({ verdict: "pass", summary: "Looks good", findings: [], taskSha: baseSha });
@@ -89,7 +89,7 @@ console.log("PASS: builder/reviewer decisions require complete nonblank question
 for (const mode of ["failure", "malformed-decision", "tool-exception", "timeout"]) {
   const f = fixture();
   await f.loop.tickNow();
-  assert.equal(f.starts(), 1); assert.equal(f.record().schemaVersion, 4); assert.equal(f.record().plan, undefined);
+  assert.equal(f.starts(), 1); assert.equal(f.record().schemaVersion, 5); assert.equal(f.record().plan, undefined);
   const path = f.record().path;
   writeFileSync(join(path, "partial.txt"), "preserve useful work");
   if (mode === "tool-exception") { f.runs[0].status = "failed"; f.runs[0].error = "tool unavailable"; }
@@ -170,7 +170,7 @@ for (const step of ["comment", "reopen", "status", "release"]) {
   const f = fixture(); const record = await f.store.ensure(buildTasksForWave(f.cfg, "", [f.card])[0]);
   f.card.status = f.cfg.columns.done; f.card.closed = true;
   let integrations = 0;
-  f.store.finalizeAccepted = async () => { integrations++; throw new MergeConflictError(baseSha, baseSha, "work.txt conflict"); };
+  f.store.preparePullRequest = async () => { integrations++; throw new MergeConflictError(baseSha, baseSha, "work.txt conflict"); };
   f.failAt(step); await f.loop.tickNow(); assert.ok(pendingTicketWrite(f.record())); assert.equal(integrations, 1);
   await f.loop.tickNow(); assert.equal(integrations, 1, "only settle I/O, not another merge"); assert.equal(f.starts(), 0);
   assert.equal(f.card.closed, false); assert.equal(f.card.status, f.cfg.columns.ready); assert.equal(f.record().retry?.stage, "build");
@@ -200,10 +200,19 @@ for (const step of ["comment", "reopen", "status", "release"]) {
 for (const stage of ["integrate", "cleanup"] as const) {
   const f = fixture(); await f.store.ensure(buildTasksForWave(f.cfg, "", [f.card])[0]);
   f.card.status = f.cfg.columns.ready; f.card.closed = true;
-  f.store.update(f.card.itemId, (r) => ({ ...r, retry: { stage, reason: "offline prior Git failure" } }));
+  if (stage === "cleanup") {
+    // Explicit old, completed squash proof; a bare cleanup retry is invalid v5.
+    const original = f.record(), taskSha = f.store.localBranchSha(original.taskBranch)!;
+    const resultSha = git(repo, "commit-tree", `${taskSha}^{tree}`, "-p", taskSha, "-m", "historical human-approved squash");
+    git(repo, "push", "origin", `${resultSha}:refs/heads/main`);
+    f.card.plan = "demo";
+    writeFileSync(f.store.recordPath(f.card.itemId), JSON.stringify({ ...original, schemaVersion: 3, plan: "demo",
+      finalization: { targetBranch: "main", baseSha: taskSha, taskSha, resultSha } }));
+    assert.deepEqual((await f.executor.migrateLegacy(testOwner(repo))).failures, []);
+  } else f.store.update(f.card.itemId, (r) => ({ ...r, retry: { stage, reason: "offline prior Git failure" } }));
   let calls = 0;
-  f.store.finalizeAccepted = async () => { calls++; throw new Error(`offline ${stage} failed`); };
-  await f.loop.tickNow(); assert.equal(calls, 1); assert.equal(f.starts(), 0); assert.equal(f.reviews(), 0);
+  f.store.preparePullRequest = async () => { calls++; throw new Error(`offline ${stage} failed`); };
+  await f.loop.tickNow(); assert.equal(calls, 0); assert.equal(f.starts(), 0); assert.equal(f.reviews(), 0);
   assert.equal(f.card.closed, true); assert.equal(f.card.status, f.cfg.columns.ready); assert.equal(f.record().retry?.stage, stage);
   await f.loop.stop();
   console.log(`PASS: closed Ready ${stage} retries finalization only and preserves closed approval (Git implementation remains T004)`);
@@ -384,3 +393,5 @@ for (const cut of ["manual-drain", "manual-release", "missing-drain", "pending-r
   await f.loop.stop();
   console.log("PASS: withdrawal retains an uncertain launch until its original execution can be observed and drained");
 }
+
+import { testOwner, noPullRequests, fakePullRequests } from "./pr-fixture.js";

@@ -9,17 +9,17 @@ try {
     const f = await fixture(false, true);
     const lock = kind === "admin-index" ? join(f.admin, "index.lock") : kind === "admin-locked" ? join(f.admin, "locked") :
       kind === "common" ? join(f.repo, ".git", "index.lock") : join(f.repo, ".git", "refs", "heads", `${f.task.taskBranch}.lock`);
-    if (afterPush) faults.afterGit = (a) => { if (a[0] === "push" && a.some((s) => s.endsWith(":refs/heads/main"))) { faults.afterGit = undefined; writeFileSync(lock, "occupied"); } };
+    if (afterPush) faults.afterGit = (a) => { if (a[0] === "push" && a.at(-1)?.endsWith(`:refs/heads/${f.task.taskBranch}`)) { faults.afterGit = undefined; writeFileSync(lock, "occupied"); } };
     else writeFileSync(lock, "occupied");
     calls.length = 0;
     await assert.rejects(f.finish(), /Locked|locked/);
     assert.ok(existsSync(f.recordFile)); assert.ok(existsSync(f.record.path));
     assert.equal(f.store.localBranchSha(f.task.taskBranch), f.taskSha);
-    assert.equal(git(f.origin, "rev-parse", `refs/heads/${f.task.taskBranch}`), f.taskSha);
+    assert.equal(git(f.origin, "rev-parse", `refs/heads/${f.task.taskBranch}`), afterPush ? (f.store.read(f.task.itemId)!.integration as import("../src/ticket-worktree.js").TicketPullRequestIntegration).preparedHeadSha : f.taskSha);
     assert.equal(calls.some((a) => a[0] === "update-ref" || a[0] === "worktree" && a[1] === "remove"), false);
     unlinkSync(lock); const integrated = f.tip(); calls.length = 0;
     assert.ok(await f.finish());
-    if (afterPush) { assert.equal(f.tip(), integrated); assert.equal(calls.some((a) => a[0] === "commit-tree"), false); }
+    if (afterPush) { assert.notEqual(f.tip(), integrated); assert.equal(calls.some((a) => a[0] === "commit-tree"), false); }
     console.log(`PASS: ${kind} lock ${afterPush ? "after" : "before"} push blocks cleanup, retains evidence and safely retries after release`);
   }
   {

@@ -89,9 +89,9 @@ try {
       assert.deepEqual(restart.readV5(idle.itemId), f.record);
       assert.deepEqual(restart.readStored(idle.itemId), f.record);
       assert.deepEqual(restart.listStored(), [f.record]);
-      assert.throws(() => restart.read(idle.itemId), /PR executor/);
-      assert.throws(() => restart.list(), /PR executor/);
-      assert.throws(() => restart.update(idle.itemId, (r) => r), /PR executor/);
+      assert.throws(() => restart.legacyRead(idle.itemId), /PR executor/);
+      assert.throws(() => restart.legacyList(), /PR executor/);
+      assert.throws(() => restart.legacyUpdate(idle.itemId, (r) => r), /PR executor/);
       assert.deepEqual(readFileSync(f.file), bytes, "all readers are read-only");
       f.store.assertOwnedPath(f.record);
     }
@@ -237,7 +237,7 @@ try {
         writeFileSync(f.file, raw);
         const next: TicketExecutionRecordV5 = { ...f.record, plan: "original-plan", ...execution };
         const checks: number[] = [];
-        assert.deepEqual(f.store.read(idle.itemId), original);
+        assert.deepEqual(f.store.legacyRead(idle.itemId), original);
         assert.throws(() => f.store.readV5(idle.itemId), /migration/);
         expectUnchanged(f, () => f.store.publishV5(original, { ...next, lastRunId: "replacement" }, raw, f.owner, noop), /execution identity/);
         expectUnchanged(f, () => f.store.publishV5({ ...original, taskKey: "different" }, next, raw, f.owner, noop));

@@ -12,6 +12,8 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
   };
   return next(specifier, context);
 } });
+const { testOwner, noPullRequests } = await import("./pr-fixture.js");
+
 const { fixture } = await import("./conflict-handoff-fixture.js");
 const { createProductionTicketExecutor } = await import("../src/ticket-executor.js");
 const { reopenIssue } = await import("../src/gh.js");
@@ -34,6 +36,7 @@ try {
         fieldValues: connection([{ name: f.card.status, field: { name: f.cfg.status_field } }, { name: f.card.plan, field: { name: f.cfg.plan_field } }, { name: f.card.type, field: { name: f.cfg.type_field } }]),
         content: { __typename: "Issue", number: f.card.number, title: f.card.title, body: f.card.body, closed: f.card.closed, assignees: { nodes: f.card.assignees.map((login) => ({ login })) }, repository: { owner: { login: "owner" }, name: "repo" } },
       } } };
+      if (q.includes("pullRequests(first:")) return { data: { repository: { name: "repo", owner: { login: "owner" }, pullRequests: connection([]) } } };
       if (q.includes("comments(first:")) return { data: { repository: { issue: { comments: connection(f.comments.map((c) => ({ ...c, author: { login: c.author } }))) } } } };
       if (q.includes("addComment(input:")) {
         await f.board.comment(f.card, fields.body);
@@ -53,7 +56,7 @@ try {
       if (q.includes("issue(number:")) return { data: { repository: { issue: { id: "ISSUE" } } } };
       assert.fail(`Unexpected production gh command: ${q}`);
     };
-    const executor = createProductionTicketExecutor({ cwd: f.repo, cfg: f.cfg, worktrees: f.store, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {}, meta: { projectId: "P", statusFieldId: "S", statusOptions: { Ready: "Ready" } } });
+    const executor = createProductionTicketExecutor({ owner: testOwner(f.repo), cwd: f.repo, cfg: f.cfg, worktrees: f.store, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {}, meta: { projectId: "P", statusFieldId: "S", statusOptions: { Ready: "Ready" } } });
     try {
       const result = await executor.finalizeClosed(f.card);
       assert.equal(result.status, "blocked", JSON.stringify(result)); // Integration still awaits conflict resolution, even after a successful handoff.

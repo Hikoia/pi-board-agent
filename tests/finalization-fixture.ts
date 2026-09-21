@@ -1,3 +1,5 @@
+
+const { testOwner, noPullRequests, fakePullRequests } = await import("./pr-fixture.js");
 // Real local bare remote; only Git/GitHub I/O fault boundaries are controlled.
 import assert from "node:assert/strict";
 import { settledTicks } from "./async-loop-fixture.js";
@@ -13,18 +15,18 @@ import {
 } from "./cleanup-fixture.js";
 import { _DEFAULTS } from "../src/config.js";
 import type { Card } from "../src/gh.js";
-import type { TicketBoardAdapter } from "../src/ticket-executor.js";
+import type { TicketBoardAdapter, TicketExecutorDeps } from "../src/ticket-executor.js";
 const { ManagedTicketExecutor } = await import("../src/ticket-executor.js");
 const { BoardLoop, createLoopState } = await import("../src/loop.js");
 export { git, calls, faults, dispose, TicketWorktrees };
-export async function fixture(legacy = false) {
+export async function fixture(legacy = false, autoMerge = true) {
   faults.beforeGit =
     faults.afterGit =
     faults.beforeFs =
     faults.afterFs =
     faults.beforeSyncFs =
       undefined;
-  const f = await oldFixture();
+  const f = await oldFixture(false, !legacy);
   const cfg = structuredClone(_DEFAULTS);
   cfg.safety.require_clean_worktree =
     cfg.context.enabled =
@@ -38,7 +40,7 @@ export async function fixture(legacy = false) {
     JSON.stringify(
       {
         ...f.record,
-        schemaVersion: legacy ? 3 : 4,
+        schemaVersion: legacy ? 3 : 5,
         reviewedTaskSha: f.taskSha,
       },
       null,
@@ -105,20 +107,21 @@ export async function fixture(legacy = false) {
         throw new Error("offline lost Done response");
     },
   };
-  const make = () =>
+  const prs = fakePullRequests(f.repo, autoMerge);
+  const make = (createManager?: TicketExecutorDeps["createManager"], worktrees = new TicketWorktrees(f.repo, testOwner(f.repo))) =>
     new ManagedTicketExecutor({
-      cwd: f.repo,
+      owner: testOwner(f.repo), pullRequests: prs.api, cwd: f.repo,
       cfg,
       board,
-      worktrees: new TicketWorktrees(f.repo),
+      worktrees,
       botLogin: "bot",
       repoOwner: "owner",
       repoName: "repo",
       callback: (s) => notices.push(s),
-      createManager: () => {
+      createManager: createManager ?? (() => {
         starts++;
         throw new Error("No model/manager during integrate or cleanup");
-      },
+      }),
     });
   const executor = make();
   const loop = new BoardLoop(
@@ -169,6 +172,8 @@ export async function fixture(legacy = false) {
   const finish = () => make().finalizeClosed(structuredClone(card));
   return {
     ...f,
+    prs,
+    owner: testOwner(f.repo),
     cfg,
     card,
     board,
@@ -181,6 +186,14 @@ export async function fixture(legacy = false) {
     finish,
     noNewEvidence,
     recordNow: () => f.store.read(f.task.itemId)!,
+    prNow: () => {
+      const pr = f.store.read(f.task.itemId)?.integration;
+      assert.ok(pr?.kind === "pr"); return pr;
+    },
+    mergedSha: () => {
+      const pr = f.store.read(f.task.itemId)?.integration;
+      assert.ok(pr?.kind === "pr" && pr.phase === "merged"); return pr.mergeCommitSha;
+    },
     starts: () => starts,
     reviews: () => reviews,
     failDone: (value: boolean) => {

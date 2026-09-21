@@ -33,7 +33,11 @@ export const calls: string[][] = [];
 // Opt-in for large Git matrices: exercise the same real Git/filesystem and
 // asynchronous fault boundaries without recompiling the Windows Job Object
 // bridge for every read-only probe. Supervisor/tree-kill policy has its own tests.
-let nativeGit = false;
+let nativeGit = process.platform === "win32";
+if (nativeGit) {
+  assert.equal(process.env.GIT_ALLOW_PROTOCOL, "file");
+  assert.equal(process.env.PI_OFFLINE, "1");
+}
 export function useNativeGitFixture(): void {
   assert.equal(process.env.GIT_ALLOW_PROTOCOL, "file");
   assert.equal(process.env.PI_OFFLINE, "1");
@@ -105,6 +109,11 @@ globals.__cleanupGit = (
     return result;
   })();
 };
+/** Transport for matrices with their own hooks. Import only after installing
+ * those hooks/loading the observed module so its instrumentation stays real. */
+export const fixtureProcess = globals.__cleanupGit as (
+  mode: "sync" | "async", command: ProcessCommand, args: string[], options?: ProcessOptions,
+) => any;
 const worktreeUrl = new URL("../src/ticket-worktree.ts", import.meta.url).href;
 const runnerUrl = new URL("../src/process-runner.ts", import.meta.url).href;
 const hooks = registerHooks({
@@ -143,8 +152,10 @@ const hooks = registerHooks({
   },
 });
 export const { TicketWorktrees } = await import("../src/ticket-worktree.js");
+const { testOwner } = await import("./pr-fixture.js");
+const { simulateHumanFinalization } = await import("./human-finalization-fixture.js");
 let sequence = 0;
-export async function fixture(lockfiles = false, current = false) {
+export async function fixture(lockfiles = false, current: boolean | 4 = false) {
   const dir = join(root, `case-${++sequence}`),
     repo = join(dir, "repo"),
     origin = join(dir, "origin.git");
@@ -174,17 +185,19 @@ export async function fixture(lockfiles = false, current = false) {
     taskBranch: `task/issue-${sequence}`,
     baseBranch: "main",
   };
-  const store = new TicketWorktrees(repo),
-    record = { ...await store.ensure(task, "demo"), schemaVersion: current ? 4 as const : 3 as const };
-  // Historical cleanup/receipt tests intentionally exercise the legacy finalizer.
-  // New ensure/admission now produces v4; do not accidentally migrate this fixture.
-  writeFileSync(store.recordPath(task.itemId), JSON.stringify(record, null, 2));
+  const owner = testOwner(repo), store = new TicketWorktrees(repo, owner);
+  const { integration: unused, ...identity } = await store.ensure(task, "demo");
+  const record = { ...identity, schemaVersion: 3 as const };
+  // Historical inputs are constructed explicitly; runtime ensure always writes v5.
+  writeFileSync(store.recordPath(task.itemId), JSON.stringify({ ...record, schemaVersion: current === 4 ? 4 : current ? 5 : 3 }, null, 2));
   writeFileSync(join(record.path, "feature.txt"), "feature\n");
   git(record.path, "add", ".");
   git(record.path, "commit", "-m", "feature");
   git(record.path, "push", "origin", task.taskBranch);
   const taskSha = git(record.path, "rev-parse", "HEAD");
-  if (current) store.setReviewedTaskSha(task.itemId, taskSha);
+  if (current === 4) store.legacyUpdate(task.itemId, r => ({ ...r, reviewedTaskSha: taskSha }));
+  else if (current) store.setReviewedTaskSha(task.itemId, taskSha);
+  if (!current || current === 4) owner.release();
   const admin = git(record.path, "rev-parse", "--absolute-git-dir");
   mkdirSync(join(record.path, "ignored", "empty"), { recursive: true });
   writeFileSync(
@@ -214,8 +227,8 @@ export async function fixture(lockfiles = false, current = false) {
   );
   const tip = () => git(origin, "rev-parse", "refs/heads/main");
   const finish = async (strategy: "merge" | "squash" = "merge") => {
-    const result = await store.finalizeAccepted(task, strategy);
-    if (result) await store.completeFinalization(task, result, async () => {});
+    const result = await simulateHumanFinalization(store, task);
+    if (result) await store.completeFinalization(task, result, async () => {}, undefined, testOwner(repo));
     return result;
   };
   const vanish = () => {
@@ -224,6 +237,7 @@ export async function fixture(lockfiles = false, current = false) {
   };
   return {
     repo,
+    owner,
     origin,
     base,
     task,
@@ -256,7 +270,7 @@ export function legacy(
   );
   git(f.repo, "push", "origin", `${result}:refs/heads/main`);
   if (journal !== "none")
-    f.store.update(f.task.itemId, (record) => ({
+    f.store.legacyUpdate(f.task.itemId, (record) => ({
       ...record,
       finalization: {
         targetBranch: "main",
