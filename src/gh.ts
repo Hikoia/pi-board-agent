@@ -1,4 +1,4 @@
-/** Read-only Project discovery and guarded Task Issue status/claim/comment I/O. */
+/** Project discovery, guarded Task Issue I/O, and strict PR observation/creation. */
 import type { Config } from "./config.js";
 import {
   GIT_GH_TIMEOUT_MS,
@@ -627,6 +627,215 @@ export async function release(card: Card, botLogin: string): Promise<void> {
 }
 
 export { runGh as _runGh, graphql as _graphql };
+
+export interface PullRequestScope {
+  owner: string;
+  repo: string;
+  base: string;
+  head: string;
+}
+
+export interface PullRequestInfo {
+  scope: PullRequestScope;
+  number: number;
+  url: string;
+  body: string;
+  state: "open" | "closed";
+  merged: boolean;
+  headSha: string;
+  /** May be a test merge while unmerged; only merged=true is merge evidence. */
+  mergeCommitSha: string | null;
+}
+
+const PULL_REQUEST_FIELDS = `
+  id number url body state merged headRefOid baseRefName headRefName
+  mergeCommit { oid }
+  repository { name owner { login } }
+  baseRepository { name owner { login } }
+  headRepository { name owner { login } }
+`;
+
+function validatePullRequestScope(scope: PullRequestScope): PullRequestScope {
+  // Snapshot only these fields: no mutable scope or extra GraphQL variables.
+  const { owner, repo, base, head } = scope;
+  const result = { owner, repo, base, head };
+  for (const field of ["owner", "repo", "base", "head"] as const) {
+    const value = requiredString(result[field], `PR scope ${field}`);
+    // In particular, a qualified head (fork:branch) must never reach creation.
+    if (
+      /[\s\x00-\x1f\x7f:]/.test(value) ||
+      ((field === "owner" || field === "repo") && /[\/\\]/.test(value))
+    )
+      throw new Error(`Invalid PR scope ${field}.`);
+  }
+  if (base === head) throw new Error("PR base and head must differ.");
+  return result;
+}
+
+function validatePullRequestRepository(
+  repository: any,
+  scope: PullRequestScope,
+): void {
+  const owner = requiredString(
+    repository?.owner?.login,
+    "PR repository owner",
+  );
+  const name = requiredString(repository?.name, "PR repository name");
+  if (
+    owner.toLowerCase() !== scope.owner.toLowerCase() ||
+    name.toLowerCase() !== scope.repo.toLowerCase()
+  )
+    throw new Error("GitHub returned a different PR repository.");
+}
+
+function hydratePullRequest(
+  value: any,
+  scope: PullRequestScope,
+  number?: number,
+): PullRequestInfo {
+  requiredString(value?.id, "PR id");
+  for (const repository of [
+    value.repository,
+    value.baseRepository,
+    value.headRepository,
+  ])
+    validatePullRequestRepository(repository, scope);
+  if (value.baseRefName !== scope.base || value.headRefName !== scope.head)
+    throw new Error("GitHub returned different PR branches.");
+  if (
+    !Number.isSafeInteger(value.number) || value.number <= 0 ||
+    (number !== undefined && value.number !== number)
+  )
+    throw new Error("GitHub returned a missing or different PR number.");
+  if (
+    typeof value.body !== "string" || typeof value.merged !== "boolean" ||
+    !["OPEN", "CLOSED", "MERGED"].includes(value.state) ||
+    value.merged !== (value.state === "MERGED")
+  )
+    throw new Error("GitHub returned invalid PR state/body/merged data.");
+  const sha = /^[0-9a-f]{40}$/i;
+  if (
+    typeof value.headRefOid !== "string" || !sha.test(value.headRefOid) ||
+    (value.mergeCommit !== null &&
+      (typeof value.mergeCommit?.oid !== "string" ||
+        !sha.test(value.mergeCommit.oid))) ||
+    (value.merged && value.mergeCommit === null)
+  )
+    throw new Error("GitHub returned missing or invalid PR commit data.");
+  const url = new URL(requiredString(value.url, "PR URL"));
+  if (
+    value.url !== value.url.trim() ||
+    url.protocol !== "https:" || url.username || url.password ||
+    url.search || url.hash ||
+    url.pathname.toLowerCase() !==
+      `/${scope.owner}/${scope.repo}/pull/${value.number}`.toLowerCase()
+  )
+    throw new Error("GitHub returned a different or invalid PR URL.");
+  return {
+    scope: { ...scope },
+    number: value.number,
+    url: value.url,
+    body: value.body,
+    state: value.state === "OPEN" ? "open" : "closed",
+    merged: value.merged,
+    headSha: value.headRefOid,
+    mergeCommitSha: value.mergeCommit?.oid ?? null,
+  };
+}
+
+/** Complete, all-state recovery lookup. Unknown identity is never absence. */
+export async function findPullRequests(
+  scope: PullRequestScope,
+): Promise<PullRequestInfo[]> {
+  scope = validatePullRequestScope(scope);
+  const requests: PullRequestInfo[] = [];
+  const cursors = new Set<string>();
+  const ids = new Set<string>();
+  const numbers = new Set<number>();
+  let after: string | null = null;
+  while (true) {
+    const data = await graphql<any>(`
+      query($owner: String!, $repo: String!, $base: String!, $head: String!, $after: String) {
+        repository(owner: $owner, name: $repo) {
+          name owner { login }
+          pullRequests(first: 100, after: $after, states: [OPEN, CLOSED, MERGED], baseRefName: $base, headRefName: $head) {
+            pageInfo { hasNextPage endCursor }
+            nodes { ${PULL_REQUEST_FIELDS} }
+          }
+        }
+      }`, { ...scope, after });
+    validatePullRequestRepository(data?.repository, scope);
+    const connection = data.repository.pullRequests;
+    const end = connection?.pageInfo?.endCursor;
+    // Check terminal cursors too; the shared helper checks continuing pages.
+    if (
+      end !== null &&
+      (typeof end !== "string" || !end.trim() || cursors.has(end))
+    )
+      throw new Error("GitHub PR pagination returned a missing or repeated cursor.");
+    const page = connectionPage(connection, "PR pagination", cursors);
+    for (const node of page.nodes) {
+      const request = hydratePullRequest(node, scope);
+      if (ids.has(node.id) || numbers.has(request.number))
+        throw new Error("GitHub returned duplicate PR identities/pages.");
+      ids.add(node.id);
+      numbers.add(request.number);
+      requests.push(request);
+    }
+    if (!page.next) return requests;
+    after = page.next;
+  }
+}
+
+/** Known-number reads never fall back to discovery, including on missing data. */
+export async function getPullRequest(
+  scope: PullRequestScope,
+  number: number,
+): Promise<PullRequestInfo> {
+  scope = validatePullRequestScope(scope);
+  if (!Number.isSafeInteger(number) || number <= 0)
+    throw new Error("Invalid PR number.");
+  const data = await graphql<any>(`
+    query($owner: String!, $repo: String!, $number: Int!) {
+      repository(owner: $owner, name: $repo) {
+        name owner { login }
+        pullRequest(number: $number) { ${PULL_REQUEST_FIELDS} }
+      }
+    }`, { owner: scope.owner, repo: scope.repo, number });
+  validatePullRequestRepository(data?.repository, scope);
+  return hydratePullRequest(data.repository.pullRequest, scope, number);
+}
+
+/** Caller must persist recovery data and observe before creating. Never replay
+ * an ambiguous write here: recover via find/get on the next guarded attempt. */
+export async function createPullRequest(
+  scope: PullRequestScope,
+  title: string,
+  body: string,
+): Promise<PullRequestInfo> {
+  scope = validatePullRequestScope(scope);
+  requiredString(title, "PR title");
+  if (typeof body !== "string") throw new Error("Invalid PR body.");
+  const repository = await graphql<any>(`
+    query($owner: String!, $repo: String!) {
+      repository(owner: $owner, name: $repo) { id name owner { login } }
+    }`, { owner: scope.owner, repo: scope.repo });
+  validatePullRequestRepository(repository?.repository, scope);
+  const repositoryId = requiredString(
+    repository.repository.id,
+    "PR repository id",
+  );
+  const data = await graphql<any>(`
+    mutation($repositoryId: ID!, $base: String!, $head: String!, $title: String!, $body: String!) {
+      createPullRequest(input: {
+        repositoryId: $repositoryId, baseRefName: $base, headRefName: $head, title: $title, body: $body
+      }) { pullRequest { ${PULL_REQUEST_FIELDS} } }
+    }`, { repositoryId, base: scope.base, head: scope.head, title, body });
+  const request = hydratePullRequest(data?.createPullRequest?.pullRequest, scope);
+  if (request.state !== "open" || request.merged)
+    throw new Error("GitHub returned an unexpected created PR state.");
+  return request;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Explicit Project initialization and Issue comments
