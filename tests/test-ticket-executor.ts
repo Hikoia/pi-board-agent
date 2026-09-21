@@ -1436,9 +1436,13 @@ async function finalFixture(strategy: "merge" | "squash" = "merge") {
     `task_merge_strategy: ${strategy}
 `,
   );
+  const warnings: string[] = [];
+  const loaded = loadConfig(checkout, (message) => warnings.push(message));
+  assert.ok(!Object.hasOwn(loaded, "task_merge_strategy"));
+  assert.ok(warnings.some((message) => message.includes(`task_merge_strategy=${strategy}`) && message.includes("ignored")));
   const finalCfg: Config = {
+    ...loaded,
     ...cfg,
-    task_merge_strategy: loadConfig(checkout, () => {}).task_merge_strategy,
     review: { ...cfg.review },
     safety: { ...cfg.safety, require_clean_worktree: true },
   };
@@ -1722,7 +1726,7 @@ for (const strategy of ["squash", "merge"] as const) {
   f.assertNoAdmissions();
   await loop.stop();
   console.log(
-    `PASS: closed Done ${strategy === "squash" ? "legacy squash normalized to merge" : "merge"} E2E finalizes the exact SHA and notifies branch cleanup once; repeated ticks/restart are no-ops`,
+    `PASS: closed Done with ignored legacy ${strategy} config E2E finalizes the exact SHA and notifies branch cleanup once; repeated ticks/restart are no-ops`,
   );
 }
 

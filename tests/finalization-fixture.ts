@@ -32,7 +32,6 @@ export async function fixture(legacy = false, autoMerge = true) {
     cfg.context.enabled =
     cfg.telegram.enabled =
       false;
-  cfg.task_merge_strategy = "merge"; // compatibility input must never create a new squash
   f.task.taskKey =
     f.record.taskKey = `T${String(f.task.issueNumber).padStart(3, "0")}`;
   writeFileSync(

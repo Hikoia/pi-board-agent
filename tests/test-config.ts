@@ -56,6 +56,8 @@ try {
     cfg.max_workers === 2 &&
       !Object.hasOwn(cfg, "watchdog") &&
       !("pr" in cfg) &&
+      !Object.hasOwn(cfg, "task_merge_strategy") &&
+      !Object.hasOwn(_DEFAULTS, "task_merge_strategy") &&
       !("builder_tier" in cfg) &&
       !("plan_prefix" in cfg.branches) &&
       !Object.hasOwn(cfg.models, "refine"),
@@ -64,6 +66,7 @@ try {
 
   const template = readConfigTemplate();
   const parsedTemplate = parseYaml(template);
+  assert.equal(Object.hasOwn(parsedTemplate, "task_merge_strategy"), false, "recommended template omits the retired merge strategy");
   assert.equal(Object.hasOwn(parsedTemplate.safety, "skip_closed_issues"), false, "recommended template omits the deprecated no-op key");
   writeFileSync(file, template.replace("number: 0", "number: 1"));
   const templateWarnings: string[] = [];
@@ -75,6 +78,17 @@ try {
       !Object.hasOwn(parsedTemplate, "watchdog"),
     "the actual packaged YAML validates as 0.2.0 config",
   );
+
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  const example = readme.match(/## Configuration\r?\n\r?\n```yaml\r?\n([\s\S]*?)```/)?.[1];
+  assert.ok(example, "README contains its configuration example");
+  assert.ok(!Object.hasOwn(parseYaml(example), "task_merge_strategy"));
+  writeFileSync(file, example);
+  const exampleWarnings: string[] = [];
+  validateConfig(loadConfig(cwd, (message) => exampleWarnings.push(message)));
+  assert.equal(exampleWarnings.length, 0);
+  rmSync(file);
+  check(true, "README configuration loads without retired fields or migration warnings");
 
   for (const [name, yaml] of [
     ["pr", "pr: null\n"],

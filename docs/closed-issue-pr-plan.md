@@ -1,8 +1,8 @@
 # Closed Issue → PR → 人工合併：實作方案
 
-狀態：規劃，尚未實作。使用者已選擇「人工合併 PR」。
+狀態：使用者已選擇「人工合併 PR」；v5 實作已進入離線驗收。MAIN 已接受 G4（typecheck + 222 focused tests，含獨立重現並修正 authorization races）；T06 更新設定／現行文件，**最終全套離線驗收仍待 MAIN T07**，尚未部署。
 
-查核基準：本地 `21918074819ddef7caf3b69e48b202410368612f`，以及 GitHub 上 `Hikoia/lazypie` 的目前設定。
+原始方案查核基準：本地 `21918074819ddef7caf3b69e48b202410368612f` 及當時記錄的 `Hikoia/lazypie` 設定。以下保留原方案脈絡；本輪僅本地／離線，未重新查核 live GitHub、CI、權限或保護規則，也未操作真實 #121。
 
 ## 1. 已決定的行為
 
@@ -16,7 +16,7 @@
 
 這是明確的語意調整：**關閉 Issue 表示「提交 PR」；人工合併 PR 才表示「程式碼整合完成」。**
 
-### 已查核的 lazypie 設定
+### 原方案已記錄的 lazypie 設定（本輪未重新查核）
 
 - base：`main`；允許 squash 與 rebase。
 - `main` 要求 PR、線性歷史，且保護規則適用管理員。
@@ -48,7 +48,7 @@ PR 等待期間，Issue 維持 closed、Project 維持 Done，分支與 worktree
 
 ### 3.1 重用目前準備合併內容的程式
 
-重用 `TicketWorktrees.finalizeAccepted()` 目前的來源驗證、`merge-tree` 與 `commit-tree`：
+原 `TicketWorktrees.finalizeAccepted()` 的準備流程現由 `preparePullRequest()`／共用 `prepareIntegration()` 承接來源驗證、`merge-tree` 與 `commit-tree`；已合併清理分為 `cleanupMergedPullRequest()`／`completeFinalization()`：
 
 1. 取得新鮮的 base 與 task 本地／遠端來源，保存來源 SHA。
 2. 保留 local-only、remote-only、local-ahead、remote-ahead、divergent 的既有支援；不得只選 origin/task 而丟棄本地提交。
@@ -58,7 +58,7 @@ PR 等待期間，Issue 維持 closed、Project 維持 Done，分支與 worktree
 
 ```text
 舊：git push origin <preparedSha>:refs/heads/main
-新：git push origin <preparedSha>:refs/heads/task/issue-121
+新：git push origin <preparedSha>:refs/heads/task/issue-<number>
 ```
 
 prepared head 可以是 merge commit；它只存在於 task 分支。人工 squash merge 後，main 上是 GitHub 產生的線性提交。**prepared head 不等於最終 merged commit。**
@@ -67,11 +67,11 @@ prepared head 可以是 merge commit；它只存在於 task 分支。人工 squa
 
 ### 3.2 PR 建立與找回
 
-在 `src/gh.ts` 重用 `runGh`／JSON 驗證／分頁與 timeout，新增最少的查詢、建立、讀取 PR 操作，不新增 merge API。
+`src/gh.ts` 重用既有 `gh` GraphQL／JSON 驗證／分頁與 timeout，提供 `findPullRequests(scope)`、`createPullRequest(scope, title, body, authorize?)`、`getPullRequest(scope, number)`，沒有 merge API。Production 透過 `TicketExecutorDeps.pullRequests` 明確注入；測試只能注入 fake，不回退 live gh。
 
 - head 固定為 ticket 的 task 分支，base 固定為設定的 base，兩端皆須在目標 repository。
-- PR body 寫入 Issue URL、Project item ID、提交批次的 prepared head SHA。用 `Refs #121`，不使用會在重新合併時再次關閉 Issue 的 `Closes`／`Fixes` 指令。
-- 每個提交批次先查 `state=all` 的相符 PR，再決定是否建立；不能只找 open PR，否則回應遺失或人工已合併時會重複建立。
+- PR body 寫入 `Refs #N` 與 machine marker（Project item ID、`createdAt`、`initialPreparedHeadSha`）；不用 `Closes`／`Fixes`。初始 SHA 是跨修復的穩定身份，不要求後續 head 永遠相等。
+- 每個 `itemId + createdAt` execution 最多一個受管 PR；已保存 number 優先。未保存時查完整 OPEN／CLOSED／MERGED 分頁再決定建立，避免回應遺失或人工已合併時重複建立。
 - PR marker 只用於尋址；認領還須驗證 repository、base/head refs、ticket 身份及來源證據，不能只憑標題或文字標記。
 - 建立成功但回應遺失／儲存失敗：下一 tick 查回同一個 PR 並保存 number、URL。
 - 有多個候選，或同 head/base 已有不屬於本批次的 PR：保留現況並提示，不擅自認領、關閉或取代。
@@ -79,12 +79,12 @@ prepared head 可以是 merge commit；它只存在於 task 分支。人工 squa
 
 ### 3.3 等待人工合併
 
-使用現有 maintenance round-robin，每次只查一次 PR 後返回。新增 `waiting` outcome 與 PR URL，不使用 `gh pr checks --watch`、長時間等待或獨立輪詢程序。
+使用現有 maintenance round-robin，每次有界觀測後返回 `waiting` outcome 與 PR number／URL／reason；不使用 `gh pr checks --watch`、長時間等待或獨立輪詢程序。
 
 - 顯示「等待人工合併 PR #N」與連結；這不是 `Maintenance blocked` 技術錯誤。
 - 等待不占 builder 名額，也不占住唯一 finalizer，其他 ticket 可繼續前進。
 - CI pending／failed、required review 未滿足時仍保留 PR，GitHub 負責阻止合併。
-- strict checks 下 main 前進時，提示人工在 GitHub 更新 PR 分支；第一版不自動替等待中的 PR 產生更新提交。
+- strict checks 下 main 前進時，人工可能需要以 merge 方式 **Update branch**；PR 連結供人工處理，Bot 不另判 CI 放行，也不自動替等待中的 PR 產生更新提交。
 - 人工用 merge 方式 Update branch 或追加修正是正常流程；不能要求最終 PR head 永遠等於首次 prepared head。
 
 ### 3.4 已合併證據與清理
@@ -102,7 +102,9 @@ prepared head 可以是 merge commit；它只存在於 task 分支。人工 squa
 
 人工追加提交或 Update branch 後，採用**已合併 PR 的 head** 作為覆蓋證據，而不是將新的 head 誤判成必須刪除或重新建 PR。若人工 rebase／force rewrite 令 ancestry 證據消失，安全阻擋；第一版不做 patch-equivalence 猜測。
 
-merged 證據必須先保存，再執行清理。沿用現有 dirty／nested Git／symlink／Windows lock／ref race 防護；remote task 刪除繼續使用精確 lease，本地 ref 刪除使用 compare-and-delete。這不是 force-push base。
+merged 證據必須先保存，再執行清理。沿用現有 dirty／nested Git／symlink／Windows lock／owner／stop／ref race 防護；remote task 刪除使用精確 lease，本地 ref 刪除使用 compare-and-delete，逐步更新授權／來源檢查。這不是 force-push base；未知、dirty 或新工作被觀測到時保留，絕不 force delete 來通過清理。
+
+**使用者接受的限制：latest-observation cleanup boundary，不是跨系統原子性。** GitHub 與 remote Git 無法原子讀取；若 remote task ref 在最後 GitHub authorizer 期間重新建立，新的遠端 commits 仍受保護，但已合併的本地 worktree／ref／record 仍可能被移除。這是最後跨系統觀測之後被接受的 race，不宣稱絕對防止；不新增 distributed lock、watchdog 或 retry engine。
 
 如果 GitHub／人工已刪除 task 遠端分支，不能因此判定 ticket 沒有 PR 或完成；必須照已保存的 PR 合併證據繼續驗證。
 
@@ -110,23 +112,23 @@ merged 證據必須先保存，再執行清理。沿用現有 dirty／nested Git
 
 ### Schema
 
-新增 ticket schema v5；已知 v3/v4 透過既有遷移入口處理，新執行只寫 v5。新 PR 狀態不能偽裝成舊版的 direct integration result，讓舊程式繼續嘗試推 main。
+現行 ticket schema v5；已知 v3/v4 透過 owner-held `LegacyTickets.migrateV5()` 處理，新執行只寫 v5。`integration.kind` 明確區分 `pr` 與 `legacy-completed`，不能把 PR 偽裝成舊 direct integration result。
 
 PR 整合紀錄至少包含：
 
-- 已有的 Issue／Project item／repository／task/base 身份。
-- 初次提交的 base SHA、本地／遠端來源 SHA、prepared head SHA。
-- PR number、URL（建立／找回後保存）。
-- merged head SHA、實際 merged commit SHA（確認已合併後保存）。
-- 暫停的 PR 關聯與尚未完成的技術重試，不能因 UI 或一次 API 錯誤消失。
+- 已有 Issue／Project item／`createdAt` 身份及 `scope: {owner, repo, base, head}`。
+- `baseSha`、`taskSha`、nullable `remoteTaskSha`、`preparedHeadSha` 與穩定的 `initialPreparedHeadSha`。
+- `prNumber`、`prUrl`（建立／找回後保存）。
+- `mergedHeadSha`、實際 `mergeCommitSha`（確認已合併後保存）。
+- `phase: prepared | open | suspended | merged` 與尚未完成的技術重試，不能因 UI 或一次 API 錯誤消失。
 
-沿用 `retry.stage = integrate | cleanup`，不新增另一個重試引擎；正常等待 PR 不算重試失敗。修改 record validation、原子寫入及不可回退檢查，讓合法的 prepared → PR known → merged → cleanup 可以推進，但不能抹除 confirmed merged 證據。
+沿用 `retry.stage = integrate | cleanup`，不新增另一個重試引擎；正常等待 PR 不算重試失敗。record validation、原子寫入及不可回退檢查允許 prepared → open → merged → cleanup；withdrawal 可 suspended，只有 renewed close 可重新準備。一般 update 不得替換來源／PR reference／evidence，confirmed merged 證據不可抹除或降級。
 
 ### 人工退回工作
 
 Issue 重新開啟或移出已批准 lane 時，停止本批次整合／清理，保留 PR 與 worktree，不代替人關閉 PR。
 
-若人工明確退回 open Ready，未合併 PR 的關聯本身不能永久卡住 `assertNoFinalization()`：退役本次提交批准／技術等待，保留 PR 身份，允許既有 builder 在原 worktree 修復。重新 AI Review → Done → 人工 close 後，驗證並更新同一個仍開啟的受管 PR。已確認 merged 的 cleanup-only 狀態不可直接退回重建。
+若人工明確退回 open Ready，未合併 PR 的關聯本身不能永久卡住 `assertNoFinalization()`：退役本次提交批准／技術等待，保留 PR 身份，允許既有 builder 在原 worktree 修復。Builder 先完成原有 MERGE_HEAD／保留並提交工作，**正常 push 前 fetch 並 merge 已發布的 origin/task ancestry**，不 rebase／force rewrite 必要來源證據。重新 AI Review → Done → 人工 close 後，驗證並更新同一個仍開啟的受管 PR；人工 merge 仍是唯一最終批准。已確認 merged／legacy-completed 的 cleanup-only 狀態不可直接退回重建。
 
 若有人在 Issue 已撤回或 builder 仍工作時合併 PR，Bot 不立即刪除工作；必須重新符合 lane／execution 及目前來源覆蓋條件。舊 merged PR 沒有涵蓋後續工作時，明確提示需要新的提交／PR，不拿舊證據清理。
 
@@ -146,17 +148,17 @@ Issue 重新開啟或移出已批准 lane 時，停止本批次整合／清理�
 
 ## 5. 舊資料與 #121 的處理
 
-部署前停止並 drain 舊 owner，備份現有 ticket 紀錄與 refs；不刪除 worktree、prepared commit 或 recovery evidence。所有寫入端一起升級到新版本，不混跑 direct executor。
+部署前停止並 drain 舊 owner，備份 ticket 原始位元組、dirty／untracked／ignored worktree、refs 與外部 WorkflowManager journals；不刪除 prepared commit 或 recovery evidence。所有寫入端一起升級，不混跑 direct executor。本輪沒有部署或處理真實 #121。
 
 每筆舊 integration 先觀察遠端：
 
 1. **舊 result 已在 origin/base 上**：保留為 legacy completed evidence，只走原本安全 cleanup；不再開 PR。
-2. **尚未整合且 stage=integrate**：重新驗證來源。舊 prepared result 若吻合來源，可以重用為 PR head，正常推到 task 分支，再建立 PR；不再推 main。
+2. **尚未整合且 stage=integrate**：重新驗證來源／result。舊 prepared result 若吻合並保留來源 ancestry，可以重用為 PR head，正常推到 task 分支，再建立 PR；不再推 main。失去來源 ancestry 的 pending 舊 squash 不可用 patch-equivalence 猜測通過。
 3. **已進入 cleanup 但 result 不在遠端，或資料／refs 不明**：保留並阻擋，不猜測、不把它當全新 ticket。
 
-因此 #121 的 `f103630...` 不必直接刪掉，也不代表工作要重做：經來源驗證後，它可以成為 task 分支上的 PR head；你透過 GitHub squash merge，Bot 再使用新的 merged SHA 做清理。
+原方案以 #121 的 `f103630...` 說明 pending result 的遷移：不應直接刪除，也不預設需重做；只有來源／result 驗證通過且 ancestry 保留時，才可作為 task PR head，再用 GitHub squash merge 的實際 SHA 清理。這是處理規則，不是對真實 #121 的驗證或操作授權。
 
-遷移需先備份原始位元組、確認 owner 與來源未變，再原子發布新紀錄。active／paused builder 的 run ID、worktree、review 及既有 conflict recovery 都要保留，不能為升 schema 另開 builder。
+遷移先將原始位元組備份至 `.pi/board-agent/legacy-v3/` 或 `legacy-v4/`，確認 owner 與來源未變，再原子發布 v5 紀錄。active／paused builder 的 run ID、worktree、review 及既有 conflict recovery 都要保留，不能為升 schema 另開 builder。
 
 ## 6. 改動範圍與實作順序
 
@@ -167,7 +169,7 @@ Issue 重新開啟或移出已批准 lane 時，停止本批次整合／清理�
 | 3. 人工合併觀測／清理 | `src/ticket-executor.ts`、`src/ticket-worktree.ts` | 將大 finalizer 拆出 PR preparation 與 merged-proof cleanup；不另加通用策略層 |
 | 4. 等待狀態與生命週期 | `src/loop.ts`、`src/operation.ts`、`src/runtime.ts`／`src/index.ts` 的必要顯示與版本接點 | PR 連結、waiting outcome、非阻塞 round-robin、stop/drain、人工退回 Ready |
 | 5. 設定與文件 | `src/config.ts`、`config-template.yml`、`README.md`、`docs/runbook.md`、現行架構文件及 builder 操作說明 | 移除 direct-push 部署要求；退休 `task_merge_strategy`，舊值驗證後警告忽略；不新增只有一種值的模式設定 |
-| 6. 驗收與部署 | 現有 `tests/test-finalization-*`、`tests/test-ticket-finalization.ts`、`tests/test-gh-boundaries.ts` 及最少的新 PR 測試 | 離線回歸通過，再做受保護測試 repo 的人工合併驗收，最後處理 #121 |
+| 6. 驗收（部署另行批准） | `tests/test-pr-*.ts`、`tests/test-gh-pr.ts`、現有 finalization／migration／lifecycle 測試 | MAIN T07 完成全套離線回歸；受保護測試 repo 的人工合併驗收與真實 #121 處理不在本輪 |
 
 不需要獨立 PR watchdog：PR 的所有前進由現有 `finalizeClosed()`／maintenance tick 驅動。GitHub 呼叫集中在現有 `gh.ts`，Git／filesystem 保護集中在 `TicketWorktrees`。
 
@@ -177,26 +179,28 @@ Issue 重新開啟或移出已批准 lane 時，停止本批次整合／清理�
 2. 所有新整合路徑均不包含 push base、PR merge mutation、Auto-merge 或 admin bypass。
 3. CI pending／failed、等待審核或等待人工合併期間，零 cleanup、零 Backlog 寫入，builder 排程不受阻。
 4. 真正的 squash PR 合併後，即使 task SHA 不是 main 祖先，仍以 merged PR 證據安全完成清理。
-5. 人工 Update branch／追加提交後仍能完成；未被 PR 涵蓋的本地／遠端新提交、dirty worktree 必須阻擋刪除。
+5. 人工 merge-based Update branch／追加提交後仍能完成；guards 觀測到未被 PR 涵蓋的新提交或 dirty worktree 必須保留。適用 §3.4 明確接受的最後跨系統觀測邊界，不宣稱跨系統原子清理。
 6. 測試同名錯誤 repo/base/head、偽造或重複 marker、PR closed-not-merged、未合併 test merge SHA、主線證據消失，均不得誤清理。
 7. 涵蓋 local-only、remote-only、ahead、divergent、GitHub 已刪 head branch，以及每個 durable write／遠端 side effect 之間的 crash cut。
-8. Issue 撤回／重新 Ready、重新 close、stop、owner 變更及 active run 恢復不產生第二個 builder 或不受批准的清理。
+8. Issue 撤回／重新 Ready、重新 close、stop、owner 變更及 active run 恢復不產生第二個 builder；每步清理更新授權與來源 guards，遵守 §3.4 latest-observation 邊界。
 9. #121 類型的 rejected direct result 可轉 PR；舊 completed integration 只 cleanup；corrupt／未知狀態仍 fail closed。
-10. 執行 `npm run check`；另在保留 PR + linear history + required checks 的測試 repository，人工確認不能提前合併、Squash and merge 後 main 無新增 merge commit、Bot 隨後完成清理。
+10. 最終由 MAIN T07 執行 `npm run check`（`test-*.ts` 自動發現，不維護手動清單）；線上驗收另行批准，在保留 PR + linear history + required checks 的測試 repository 人工確認檢查／merge／cleanup。還須驗證 bot 的 task push／PR read-create／Issue-Project 權限，不要求 direct base push 或 protection bypass。
 
 實作與部署都不得修改 main 保護規則來讓驗收過關。
 
 ## 8. 本輪範圍
 
-本輪只產出方案。沒有修改程式、建立 PR、push、合併、刪除任何 ticket artifact 或更動 GitHub 設定。
+本輪是 v5 實作與離線驗收，不是部署。T06 退休 runtime `task_merge_strategy`：Config/default/result 均無此欄位；舊 `merge`／`squash` 驗證後警告並忽略，無效值仍報錯，不新增單值 manual mode。現行 README／runbook／architecture／builder skill 同步更新。沒有 live GitHub 呼叫、真實 push／PR 建立／合併／artifact 刪除或保護規則變更；真實 #121 未動。最終全套驗收仍待 MAIN T07，不能把 focused checks 當成已完成部署或線上驗收。
 
 第一版刻意不做：自動合併、原生 Auto-merge、merge queue 整合、自動重跑 CI、自動更新等待中的 PR、rebase 後的 patch-equivalence 推測，以及不相符 PR 的自動接管。
 
 ## 參考
 
-- 現行入口：`src/loop.ts:747`、`src/ticket-executor.ts:1303`。
-- 現行 direct preparation／push／cleanup：`src/ticket-worktree.ts:930–1301`。
-- 現行嚴格狀態驗證／不可覆寫檢查：`src/ticket-worktree.ts:258–318`、`:547–600`。
+- 現行入口：`src/loop.ts` 的 `processClosedDoneCards()`、`src/ticket-executor.ts` 的 `finalizeClosed()`。
+- PR API：`src/gh.ts` 的 `findPullRequests()`、`createPullRequest()`、`getPullRequest()`（實際使用 GraphQL）。
+- PR preparation／push／cleanup：`src/ticket-worktree.ts` 的 `preparePullRequest()`、`cleanupMergedPullRequest()`、`cleanupLegacyCompleted()`、`completeFinalization()`。
+- v5 驗證／單調寫入：同檔的 `isTicketIntegrationStateV5()`、`recordPullRequestPreparation()`、`progressPullRequest()`；遷移：`src/legacy-tickets.ts` 的 `migrateV5()`。
+- 現行操作：[runbook.md](runbook.md)；模組／狀態：[architecture.md](architecture.md)。
 - [GitHub REST：Get a pull request；merged 與 merge_commit_sha 的意義](https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request)。
 - [GitHub REST：Create a pull request](https://docs.github.com/en/rest/pulls/pulls#create-a-pull-request)。
 - [GitHub：Pull request merge strategies](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/about-pull-request-merges)。

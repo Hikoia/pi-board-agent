@@ -22,7 +22,6 @@ export interface Config {
   max_workers: number;
   tick_seconds: number;
   branches: { base: string; task_prefix: string };
-  task_merge_strategy: "merge";
   builder_timeout_ms?: number;
   builder_retries: number;
   models: { builder: string; review: string };
@@ -55,7 +54,6 @@ const DEFAULTS: Config = {
   max_workers: 2,
   tick_seconds: 90,
   branches: { base: "main", task_prefix: "task/" },
-  task_merge_strategy: "merge",
   builder_retries: 1,
   models: {
     builder: "deepseek-v4-flash-0731",
@@ -181,13 +179,14 @@ function rejectRemovedKeys(
   const keys = removedKeys(value);
   if (keys.length)
     throw new ConfigError(
-      `${source} uses key(s) removed in 0.2.0: ${keys.join(", ")}. Migration: back up the file and remove those keys. Use models.builder instead of builder_tier, branches.base/task_prefix plus task_merge_strategy instead of plan/PR settings, and tick_seconds for polling.`,
+      `${source} uses key(s) removed in 0.2.0: ${keys.join(", ")}. Migration: back up the file and remove those keys. Use models.builder instead of builder_tier, branches.base/task_prefix for task PRs instead of plan/PR settings, and tick_seconds for polling.`,
     );
 }
 
 // Finite input-only compatibility. Do not spread arbitrary old keys into Config.
 const LEGACY_INPUT = {
   ...DEFAULTS,
+  task_merge_strategy: "merge",
   builder_timeout_ms: 0,
   columns: { ...DEFAULTS.columns, needs_design: "Needs Design" },
   models: { ...DEFAULTS.models, refine: "", watch: "" },
@@ -203,7 +202,7 @@ export function legacyNeedsDesignColumn(cfg: Config): string {
 }
 
 function normalizeLegacy(value: Record<string, unknown>, source: string, warn?: (message: string) => void): string | undefined {
-  const retired = (key: string) => warn?.(`${source}: ${key} is retired and ignored; Task-only execution never runs Story refinement, designers or PR maintenance. Remove this key manually.`);
+  const retired = (key: string) => warn?.(`${source}: ${key} is retired and ignored; Task-only execution never runs Story refinement, designers or legacy PR watchdogs. Remove this key manually.`);
   const columns = value.columns as Record<string, unknown> | undefined;
   const design = columns?.needs_design as string | undefined;
   for (const [section, keys] of [
@@ -242,12 +241,12 @@ function normalizeLegacy(value: Record<string, unknown>, source: string, warn?: 
     warn?.(`${source}: review.enabled=${review.enabled} is retired; AI review is always enabled. Remove this key manually.`);
     delete review.enabled;
   }
-  if (value.task_merge_strategy === "squash") {
-    warn?.(`${source}: task_merge_strategy=squash is retired; normalized to merge. Existing legacy squash results can finish; new tasks use merge only. Update the file manually.`);
-    value.task_merge_strategy = "merge";
+  if (Object.hasOwn(value, "task_merge_strategy")) {
+    if (value.task_merge_strategy !== "merge" && value.task_merge_strategy !== "squash")
+      throw new ConfigError(`${source}.task_merge_strategy must be 'merge' or 'squash' (retired input only).`);
+    warn?.(`${source}: task_merge_strategy=${value.task_merge_strategy} is retired and ignored; closed Done Issues request a PR for human manual merge. Remove this key manually.`);
+    delete value.task_merge_strategy;
   }
-  if (value.task_merge_strategy !== undefined && value.task_merge_strategy !== "merge")
-    throw new ConfigError(`${source}.task_merge_strategy must be 'merge' (legacy 'squash' is accepted).`);
   return design;
 }
 
@@ -265,7 +264,7 @@ export function loadConfig(cwd: string, warn?: (message: string) => void): Confi
     designColumn = normalizeLegacy(overlay, path, warn) ?? designColumn;
     if (overlay.safety && Object.hasOwn(overlay.safety, "skip_closed_issues"))
       warn?.(
-        `${path}: safety.skip_closed_issues is deprecated and has no effect (true or false). Remove this key from the file. Closed Issues never start builders or review; only closed Done Tasks can be finalized.`,
+        `${path}: safety.skip_closed_issues is deprecated and has no effect (true or false). Remove this key from the file. Closed Issues never start builders or review; closed Done Issues request managed PR integration, with cleanup only after verified completion.`,
       );
     cfg = deepMerge(cfg, overlay as Partial<Config>);
   }
@@ -367,10 +366,6 @@ export function validateConfig(cfg: Config): void {
     statuses.length
   )
     throw new ConfigError("config.columns status names must be distinct.");
-  if (cfg.task_merge_strategy !== "merge")
-    throw new ConfigError(
-      "config.task_merge_strategy must be 'merge'.",
-    );
   if (!cfg.branches.base || !cfg.branches.task_prefix)
     throw new ConfigError("config.branches.base and task_prefix are required.");
   if (!cfg.models.builder)

@@ -28,7 +28,7 @@ assert.equal(cfg.max_workers, 6); assert.deepEqual(cfg.models, { builder: "custo
 assert.equal(cfg.builder_timeout_ms, 123456); assert.equal(cfg.builder_retries, 3); assert.equal(cfg.review.timeout_ms, 654321);
 assert.deepEqual(cfg.context, { enabled: true, max_chars: 3210, exclude: ["vendor"] });
 assert.deepEqual(cfg.telegram, { enabled: true, bot_token_env: "CUSTOM_TOKEN", chat_id_env: "CUSTOM_CHAT", on: ["needs_human", "ci_fixed", "refine_done"] });
-assert.equal(cfg.task_merge_strategy, "merge"); assert.deepEqual(cfg.review, { timeout_ms: 654321 });
+assert.ok(!Object.hasOwn(cfg, "task_merge_strategy")); assert.deepEqual(cfg.review, { timeout_ms: 654321 });
 for (const key of ["refine", "watchdog"]) assert.ok(!Object.hasOwn(cfg, key));
 assert.ok(!Object.hasOwn(cfg.columns, "needs_design")); assert.equal(legacyNeedsDesignColumn(cfg), "Project Design");
 for (const key of ["models.refine", "models.watch", "refine", "watchdog", "columns.needs_design", "review.enabled=false", "task_merge_strategy=squash"])
@@ -36,8 +36,53 @@ for (const key of ["models.refine", "models.watch", "refine", "watchdog", "colum
 for (const key of ["columns.needs_design", "review.enabled=false"])
   assert.ok(warnings.some((s) => s.includes(project) && s.includes(key)), `project warning for ${key}`);
 assert.equal(readFileSync(global, "utf8"), inherited); assert.ok(readFileSync(project, "utf8").includes("enabled: false"));
-console.log("PASS: finite legacy lane config warns per file/key without rewrite, forces merge/AI review, preserves models/budget/timeouts/context/notification configuration and custom migration label");
+console.log("PASS: finite legacy lane config warns per file/key without rewrite, omits retired merge strategy, requires AI review and preserves models/budget/timeouts/context/notification configuration and custom migration label");
 rmSync(global); rmSync(project);
+
+for (const strategy of ["merge", "squash"]) {
+  for (const file of [global, project]) {
+    const raw = `project: {number: 1}\ntask_merge_strategy: ${strategy}\n`;
+    writeFileSync(file, raw);
+    warnings.length = 0;
+    const loaded = loadConfig(cwd, (s) => warnings.push(s));
+    validateConfig(loaded);
+    assert.ok(!Object.hasOwn(loaded, "task_merge_strategy"));
+    assert.ok(!Object.hasOwn(loadConfig(cwd), "task_merge_strategy"), "warning callback stays optional");
+    assert.equal(warnings.length, 1);
+    assert.ok(warnings[0].includes(file));
+    assert.ok(warnings[0].includes(`task_merge_strategy=${strategy}`));
+    assert.match(warnings[0], /retired and ignored.*PR.*human manual merge.*Remove/);
+    assert.equal(readFileSync(file, "utf8"), raw);
+    rmSync(file);
+  }
+  writeFileSync(global, `task_merge_strategy: ${strategy}\n`);
+  writeFileSync(project, `task_merge_strategy: ${strategy === "merge" ? "squash" : "merge"}\n`);
+  warnings.length = 0;
+  assert.ok(!Object.hasOwn(loadConfig(cwd, (s) => warnings.push(s)), "task_merge_strategy"));
+  assert.equal(warnings.length, 2, "both explicit sources warn, even when project shadows global");
+  assert.ok(warnings[0].includes(global) && warnings[1].includes(project));
+  rmSync(global); rmSync(project);
+}
+warnings.length = 0;
+assert.ok(!Object.hasOwn(loadConfig(cwd, (s) => warnings.push(s)), "task_merge_strategy"));
+assert.equal(warnings.length, 0, "defaults stay quiet");
+console.log("PASS: merge/squash are input-only compatibility in both scopes, warn actionably without rewriting and never enter runtime Config");
+
+for (const value of ["rebase", "manual", "' merge '", "''", "null", "true", "0", "[]", "{}"])
+  for (const file of [global, project]) {
+    const raw = `task_merge_strategy: ${value}\n`;
+    writeFileSync(file, raw);
+    // An invalid global input must fail even if a valid project value shadows it.
+    if (file === global) writeFileSync(project, "task_merge_strategy: merge\n");
+    warnings.length = 0;
+    assert.throws(() => loadConfig(cwd, (s) => warnings.push(s)),
+      (e) => e instanceof ConfigError && e.message.includes(file) && e.message.includes("task_merge_strategy"));
+    assert.equal(warnings.length, 0, "validate before warning/ignoring");
+    assert.equal(readFileSync(file, "utf8"), raw);
+    rmSync(file);
+    if (file === global) rmSync(project);
+  }
+console.log("PASS: retired merge strategy rejects invalid values before warning, including shadowed global inputs; no manual-mode setting is accepted");
 for (const yaml of [
   "refine: null", "refine: {enabled: 'false'}", "refine: {timeout_ms: -1}", "refine: {max_tasks: 13}", "refine: {unknown: true}",
   "watchdog: []", "watchdog: {enabled: 'true'}", "watchdog: {fix_rounds_max: 11}", "watchdog: {fix_cooldown_minutes: -1}",

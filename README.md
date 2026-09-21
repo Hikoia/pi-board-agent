@@ -8,14 +8,15 @@ foreground [Pi](https://pi.dev/) session. One Issue owns one persistent task
 branch/worktree and a recoverable WorkflowManager run.
 
 > Git-only package: install a reviewed, full 40-character commit SHA. Not
-> published to npm. Ticket **schema v4** is not a package version number.
+> published to npm. Ticket **schema v5** is not a package version number.
 
 ## Workflow
 
 ```text
 Ready → In Progress → mandatory AI Review → Done (Issue remains OPEN)
-  → human validates the retained worktree and manually closes the Issue
-  → native merge into fresh origin/base → normal push → verify integration
+  → human validates the retained worktree and closes the Issue to request a PR
+  → prepare and normally push task branch → create/recover managed PR
+  → human manually merges PR (Squash and merge recommended) → verify merge proof
   → delete remote task ref → normal worktree removal → delete local task ref
   → confirm Project Backlog → delete the ticket record
 ```
@@ -24,18 +25,27 @@ Only target-repository **Issue + Type:Task** cards enter model execution.
 Closed **Done Issues of any Type** may finalize without an AI-review marker,
 then move to **Backlog**. PRs, Drafts and foreign-repository Issues are excluded.
 Plan is optional grouping/context, never an admission gate. There is no Story
-splitting, designer/Needs Design model, PR watchdog, comment listener or PR merge
-workflow. Backlog is also a manual holding column. Tasks in Ready must be independently
+splitting, designer/Needs Design model, PR watchdog, comment listener or automatic
+PR merge. Backlog is also a manual holding column. Tasks in Ready must be independently
 implementable and testable against the available base; numbering and
 `max_workers: 1` do not provide dependency scheduling.
 
 AI review uses an isolated detached worktree at the exact pushed task SHA.
-Done is not merged and does not close the Issue. Human closure approves the
-fresh local and/or remote task sources, including safe ahead/divergent histories;
-both tips are pinned and their ancestry preserved. Local/remote conflicts retain
-both sources for manual resolution. No-ref history moves to Backlog without
-altering idle records or leftover files; pending/corrupt recovery is never absence.
-Builders must commit and push their task branch, never close/merge their own Issue.
+Done is not merged and does not close the Issue. Closing it requests a managed
+PR; **human PR merge is the sole final integration approval**. Fresh local and/or
+remote task sources, including safe ahead/divergent histories, are pinned and
+their ancestry preserved. Preparation may publish a merge commit on task without
+moving the user's worktree HEAD. Local/remote conflicts retain both sources for
+manual resolution. No-ref history moves to Backlog without altering idle records
+or leftovers only when no PR/integration/pending recovery evidence exists.
+Builders commit and normally push only their task branch.
+
+Waiting retains closed Done, worktree and refs, consumes no model slot and releases
+the finalizer after bounded observation. CI failures do not trigger a rebuild.
+Closing a PR **without merging** is not completion. Cleanup requires explicit
+`merged=true`, the actual GitHub merge commit on fresh `origin/base`, and merged
+PR-head ancestry covering prepared, saved and current work—not task ancestry in
+base (which squash does not preserve), nor an unmerged test-merge SHA.
 
 ### Retries and decisions
 
@@ -48,8 +58,8 @@ warn without claiming, commenting or reopening:
 | --- | --- |
 | `build` | Continue the original branch/worktree, including partial dirty work or MERGE_HEAD; then review |
 | `review` | Retry review of the original pinned commit, not a successful build |
-| `integrate` | Re-observe the remote and retry Git only; preserve closed approval |
-| `cleanup` | Reconfirm remote integration, finish cleanup/Backlog only; preserve closed approval |
+| `integrate` | Re-observe task/PR state before retrying preparation or PR creation; preserve closed submission |
+| `cleanup` | Reconfirm saved merged/legacy-completed proof, finish cleanup/Backlog only |
 
 Review code findings retry build. Setup/model errors, malformed output, failed
 tests, timeouts and retry exhaustion are **not** product decisions. Failed
@@ -57,16 +67,26 @@ comment/status/reopen/release writes remain pending I/O; they do not relaunch a
 model or pretend Ready was written. Old technical pending Ready writes are retired
 without replaying Ready/comments; claim release still requires fresh guards.
 Withdrawal cancels the obsolete write, not confirmed cleanup-only evidence.
-Existing closed Ready integrate/cleanup retries can finish directly to Backlog
-without a builder or an artificial Done transition. Manual Needs Human/open
-Backlog holds remain unchanged. No same-ticket immediate retry in a tick.
+Manual Needs Human/open Backlog holds remain unchanged. No same-ticket immediate
+retry occurs in a tick; normal PR waiting is not a failure retry.
 
-A real merge conflict comments, reopens and returns to Ready. The builder merges
-base into the **original task branch**, resolves both sides, tests and pushes;
-AI review and a **renewed human close** are required. A nonconflicting base
-advance that rejects a push is integration-only: no rebuild, review or reopen.
-An accepted push with a lost response is observed before attempting anything
-else. A locally saved result SHA is never proof that the push succeeded.
+An initial deterministic, repairable base conflict comments, reopens and returns
+to Ready. The builder merges base into the **original task branch**, resolves both
+sides, tests and normally pushes; AI review and a **renewed human close** are required.
+An accepted task push or PR creation with a lost response is observed/recovered
+before retrying. Saved preparation alone proves neither publication nor merge.
+
+Reopening the Issue or leaving the approval lane pauses integration/cleanup,
+retaining the PR. **Open Ready** retires unmerged submission approval and permits
+the original builder; review → Done → renewed close updates the same still-open
+managed PR. Before pushing returned work, fetch and merge published `origin/task`
+ancestry (finish any owned interrupted merge first). Do not rebase/force-rewrite
+required source evidence. Confirmed merged/legacy-completed state remains
+cleanup-only; uncovered later work needs a new submission/PR.
+
+Strict required checks may need a human **merge-based Update branch** when base
+advances. Appended commits and ancestry-preserving updates are supported; the bot
+does not update waiting PRs, watch CI, auto-merge or bypass protection.
 
 Only an explicit `needs_decision` with a concrete question, missing context,
 viable options and recommendation moves a ticket to Needs Human. Work stays in
@@ -77,6 +97,8 @@ A reply alone never resumes work; trusted replies inform the resumed builder.
 ## Requirements and install
 
 - Node.js `>=22.19.0`, Pi `>=0.80.8`, Git and authenticated `gh` with Project scope.
+- Repository/Project permissions for Issue/Project writes, normal task-branch
+  pushes, PR read/create APIs and exact-lease task-ref deletion.
 - Windows: PowerShell FullLanguage with `Add-Type`/PInvoke allowed for process
   Job Objects and deadline enforcement.
 - Project single-select Status: **Backlog, Ready, In Progress, Review, Done, Needs Human**.
@@ -98,10 +120,10 @@ pi install "git:github.com/Hikoia/pi-board-agent@<FULL_40_CHARACTER_GIT_SHA>"
 ```
 
 The repository is resolved from `origin`; `project.owner` selects the Project,
-not the repository allowed for Issue mutations. Deployment must permit **normal
-merge commits and normal pushes to the configured base**. Do not bypass branch
-protection, force-push or silently substitute squash/PR merging to deploy this
-executor. See the [runbook](docs/runbook.md#deployment-checklist).
+not the repository allowed for Issue mutations. The bot needs no direct base-push
+or PR-merge privilege. Keep PR requirements, required checks and base protections;
+allow preparation merge commits on task and let humans merge the PR (squash is
+recommended for linear base history). See the [runbook](docs/runbook.md#deployment-checklist).
 
 ## Configuration
 
@@ -115,7 +137,6 @@ plan_field: "Plan" # optional
 branches:
   base: "main"
   task_prefix: "task/"
-task_merge_strategy: "merge"
 max_workers: 2
 tick_seconds: 90
 builder_timeout_ms: 21600000
@@ -138,8 +159,10 @@ auto_start: false
 identity and Telegram notifications. Project config overrides
 `~/.pi/board-agent.yml`. Both files are validated before compatibility
 normalization; neither is rewritten automatically. Finite retired lane settings
-warn and are ignored; `review.enabled: false` cannot disable AI review and
-legacy `squash` normalizes to `merge`. Unknown keys/invalid values still fail.
+warn and are ignored; `review.enabled: false` cannot disable AI review.
+`task_merge_strategy: merge` or `squash` is validated, then warned and ignored;
+remove it from both files. It is absent from runtime config, with no replacement
+mode setting. Unknown keys/invalid values still fail.
 See [config compatibility](docs/runbook.md#configuration-compatibility).
 
 `max_workers` is the shared model budget: managed builders plus one foreground
@@ -163,15 +186,18 @@ checkout and settings immutable while an owner is running.
    a live lock to force takeover.
 2. Back up records, dirty/untracked worktrees, refs and external WorkflowManager
    journals. You do **not** have to finish every Task before upgrading.
-3. Install the reviewed SHA, restart Pi, lint and run with one exclusive owner.
-   Current v3 Task records convert per ticket, preserving run identity and exact
-   raw sources in `legacy-v3/` before atomic v4 publication.
+3. Upgrade **all writers together**, install the reviewed SHA, restart Pi, lint
+   and run with one exclusive owner. Never mix the old direct executor with v5.
+   Known v3/v4 records convert per ticket, preserving run identity and exact raw
+   sources in `legacy-v3/` / `legacy-v4/` before atomic v5 publication.
 
 Running/paused work resumes the same persisted run; launch-window recovery
 adopts only a unique matching journal. Uncertainty stays occupied and is
 re-observed, never replaced by a second builder. Old repair ledgers and cleanup
-receipts stay read-only; old merge/squash results can finish without creating a
-new squash. Closed Done Issues, including non-Tasks, can complete; unrelated
+receipts stay read-only. Legacy results verified already on fresh base are
+cleanup-only; pending results with valid source ancestry are reused as PR heads,
+never pushed to base. Corrupt/missing proof or a cleanup result absent from base
+blocks migration. Closed Done Issues, including non-Tasks, can complete; unrelated
 Story/PR records and Issues are not closed or deleted.
 Unsupported v1/v2, legacy inflight and corrupt data are not guessed or deleted.
 
@@ -185,6 +211,12 @@ validated legacy receipt evidence can authorize residual legacy removal. Each
 attempt prepares evidence once, removes verified items non-recursively, and
 verifies completion. Full backup verification occurs at most twice per attempt;
 no cross-attempt cache or new snapshots/backups/archives are created by cleanup.
+
+Cleanup uses exact remote leases, local compare-and-delete and renewed stepwise
+authorization/source checks, **not a cross-system transaction**. If a remote task
+ref is recreated during the final GitHub authorizer, new remote commits remain
+protected but already-merged local worktree/record may still be removed. This is
+the accepted [latest-observation boundary](docs/runbook.md#cleanup-observation-boundary).
 
 `/run` and auto-start register tracked startup and return control to the UI.
 Migration is still a model-admission barrier. Widget, status and schema-1
@@ -255,6 +287,9 @@ npm pack --dry-run
 CI uses Node **22.19.0** on Linux and Windows. `tests/run-offline.sh` discovers
 all `test-*.ts`/`test-*.mjs` files and isolates each test's home/state/credentials.
 Local bare remotes and fake board/model adapters are offline evidence, not live
-GitHub, deployment-policy or real-model certification.
+GitHub, deployment-policy or real-model certification. This manual-PR delivery
+has not deployed or acted on real #121; live permissions, CI/protections and
+GitHub behavior remain unverified. Final full-suite offline acceptance is pending
+MAIN T07, not claimed by this documentation update.
 
 MIT © Alessandro Mancini. See [LICENSE](LICENSE).
