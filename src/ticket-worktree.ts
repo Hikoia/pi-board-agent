@@ -663,16 +663,28 @@ export class TicketWorktrees {
     expectedBytes: Buffer | undefined,
     owner: OwnerLock,
     assertSource: () => void,
+    observedLegacyRun?: { runId: string; startedAt: number } | { launchingAt: number },
   ): TicketExecutionRecordV5 {
     const receipted = this.hasCleanupReceipt(original.itemId);
-    const receiptOnly = expectedBytes === undefined && original.schemaVersion === 4 && receipted;
+    const receiptOnly = expectedBytes === undefined && receipted;
+    // The v3 interpreter may uniquely bind a persisted launch/repair journal,
+    // without publishing its old intermediate v4 draft. Never replace a known run.
+    const execution = !observedLegacyRun ? original : "launchingAt" in observedLegacyRun
+      ? { ...original, launchingAt: observedLegacyRun.launchingAt }
+      : { ...original, launchingAt: undefined, activeRunId: observedLegacyRun.runId,
+          activeRunStartedAt: observedLegacyRun.startedAt };
+    if (observedLegacyRun && (original.schemaVersion !== 3 || original.activeRunId || original.finalization ||
+        ("launchingAt" in observedLegacyRun
+          ? original.launchingAt !== undefined || observedLegacyRun.launchingAt !== original.createdAt
+          : !singleLine(observedLegacyRun.runId) || !optionalNumber(observedLegacyRun.startedAt))))
+      throw new Error("Invalid observed legacy run identity.");
     if (!isTicketExecutionRecord(original) || !isTicketExecutionRecordV5(next) ||
         !sameIdentity(original, next) || (!expectedBytes && !receiptOnly) ||
         (original.finalization && original.finalization.targetBranch !== original.baseBranch) ||
         (original.retry && ["build", "review"].includes(original.retry.stage) &&
           !isDeepStrictEqual(original.retry, next.retry)) ||
         ["launchingAt", "activeRunId", "activeRunStartedAt", "lastRunId", "reviewedTaskSha"].some(
-          (key) => original[key as keyof TicketExecutionRecord] !== next[key as keyof TicketExecutionRecordV5],
+          (key) => execution[key as keyof TicketExecutionRecord] !== next[key as keyof TicketExecutionRecordV5],
         )) throw new Error("Invalid v5 ticket conversion or execution identity.");
     if (expectedBytes) {
       const source: unknown = JSON.parse(expectedBytes.toString("utf8"));
@@ -681,7 +693,7 @@ export class TicketWorktrees {
     }
     const previous = original.integration ?? original.finalization;
     const integration = next.integration;
-    if (previous && (!integration || integration.baseSha !== previous.baseSha ||
+    if (previous && (previous.resultSha || integration) && (!integration || integration.baseSha !== previous.baseSha ||
         integration.taskSha !== previous.taskSha ||
         integration.remoteTaskSha !== (original.integration?.remoteTaskSha === undefined
           ? previous.taskSha : original.integration.remoteTaskSha)))
@@ -690,7 +702,8 @@ export class TicketWorktrees {
         (integration?.kind === "legacy-completed" &&
           (previous?.resultSha ? integration.resultSha !== previous.resultSha : !receipted)) ||
         (integration?.kind === "pr" && (integration.phase !== "prepared" ||
-          integration.prNumber !== undefined || integration.initialPreparedHeadSha !== integration.preparedHeadSha)))
+          integration.prNumber !== undefined || integration.initialPreparedHeadSha !== integration.preparedHeadSha ||
+          (previous?.resultSha !== undefined && integration.preparedHeadSha !== previous.resultSha))))
       throw new Error("Invalid v5 migration completion/preparation evidence.");
     const guard = this.v5Guard(owner, () => {
       assertSource();
