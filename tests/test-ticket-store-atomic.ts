@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import { registerHooks } from "node:module";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { TicketExecutionRecordV4 } from "../src/ticket-worktree.js";
+import type { TicketExecutionRecordV4, TicketExecutionRecordV5, TicketPullRequestIntegration } from "../src/ticket-worktree.js";
 
 // Intercept the real filesystem boundary, not store methods. No live state or GitHub.
 let cut: (operation: string) => void = () => {};
@@ -34,9 +34,24 @@ const hooks = registerHooks({
   },
 });
 const { TicketWorktrees } = await import("../src/ticket-worktree.js");
+const { acquireOwnerLock } = await import("../src/owner-lock.js");
 const itemId = "PVTI_ATOMIC";
 const integration = { baseSha: "a".repeat(40), taskSha: "b".repeat(40), resultSha: "c".repeat(40) };
 const progress = { integration, retry: { stage: "integrate" as const, reason: "push observation pending" } };
+const pr: TicketPullRequestIntegration = {
+  kind: "pr", phase: "prepared",
+  scope: { owner: "offline-owner", repo: "offline-repo", base: "main", head: "task/issue-1" },
+  baseSha: integration.baseSha, taskSha: integration.taskSha, remoteTaskSha: null,
+  preparedHeadSha: integration.resultSha, initialPreparedHeadSha: integration.resultSha,
+};
+const opened: TicketPullRequestIntegration = {
+  ...pr, phase: "open", prNumber: 1, prUrl: "https://github.com/offline-owner/offline-repo/pull/1",
+};
+const preparation = {
+  scope: pr.scope, baseSha: pr.baseSha, taskSha: pr.taskSha,
+  remoteTaskSha: pr.remoteTaskSha, preparedHeadSha: pr.preparedHeadSha,
+};
+const noop = () => {};
 
 try {
   if (process.argv[2] === "crash") {
@@ -45,6 +60,17 @@ try {
       if (operation === process.argv[4]) process.exit(73);
     };
     store.update(itemId, (r) => ({ ...r, ...progress }));
+    throw new Error("Crash cut did not execute");
+  }
+
+  if (process.argv[2] === "crash-v5") {
+    const store = new TicketWorktrees(process.argv[3]);
+    const owner = acquireOwnerLock(store.repoRoot, "offline-bot");
+    const original = store.read(itemId)!;
+    const source = fs.readFileSync(store.recordPath(itemId));
+    const next: TicketExecutionRecordV5 = { ...original, schemaVersion: 5, integration: pr };
+    cut = (operation) => { if (operation === process.argv[4]) process.exit(73); };
+    store.publishV5(original, next, source, owner, noop);
     throw new Error("Crash cut did not execute");
   }
 
@@ -140,6 +166,121 @@ try {
     assert.equal(fs.readdirSync(f.dir).some((name) => name.endsWith(".tmp")), false);
   }
   console.log("PASS: disappeared, corrupt or changed source at the atomic boundary is never overwritten or reported settled");
+
+  for (const version of [3, 4] as const) {
+    for (const operation of ["write", "flush", "rename", "renamed"]) {
+      const f = fixture(version), owner = acquireOwnerLock(f.repo, "offline-bot");
+      try {
+        const original = f.store.read(itemId)!;
+        const raw = Buffer.from(JSON.stringify(original, null, "\t").replaceAll("\n", "\r\n") + "\r\n\r\n");
+        fs.writeFileSync(f.file, raw);
+        const next: TicketExecutionRecordV5 = { ...original, schemaVersion: 5, integration: pr };
+        cut = (step) => { if (step === operation) throw new Error(`offline ${step} interruption`); };
+        assert.throws(() => f.store.publishV5(original, next, raw, owner, noop), /offline .* interruption/);
+        cut = () => {};
+        const reopened = new TicketWorktrees(f.repo);
+        if (operation === "renamed") assert.deepEqual(reopened.readV5(itemId), next);
+        else {
+          assert.deepEqual(fs.readFileSync(f.file), raw, "prepublication failure preserves exact readable legacy bytes");
+          assert.deepEqual(reopened.read(itemId), original);
+        }
+        assert.deepEqual(fs.readdirSync(f.dir), ["pvti_atomic.json"]);
+      } finally { cut = () => {}; owner.release(); }
+    }
+    console.log(`PASS: owner-held v${version} to v5 write/flush/rename cuts preserve exact source bytes or one whole PR preparation, never a partial migration`);
+  }
+
+  for (const action of ["create", "update", "prepare", "observe", "renew", "merge"] as const) {
+    for (const operation of ["write", "flush", "rename", "renamed"]) {
+      const f = fixture(4, false), owner = acquireOwnerLock(f.repo, "offline-bot");
+      try {
+        const initial: TicketExecutionRecordV5 = { ...f.record, schemaVersion: 5, integration: undefined };
+        let previous = initial;
+        if (action !== "create") {
+          if (action === "observe" || action === "renew" || action === "merge")
+            previous = { ...initial, integration: action === "renew" ? { ...opened, phase: "suspended" } : pr };
+          fs.writeFileSync(f.file, JSON.stringify(previous));
+        }
+        const before = action === "create" ? undefined : fs.readFileSync(f.file);
+        const next: TicketExecutionRecordV5 = action === "update" ? { ...previous, lastRunId: "saved-builder" }
+          : action === "observe" ? { ...previous, integration: opened }
+          : action === "merge" ? { ...previous, integration: { ...opened, phase: "merged", mergedHeadSha: "d".repeat(40), mergeCommitSha: "e".repeat(40) } }
+          : action === "prepare" ? { ...previous, integration: pr }
+          : action === "renew" ? { ...previous, integration: { ...opened, phase: "prepared", taskSha: "d".repeat(40), preparedHeadSha: "e".repeat(40) } }
+          : initial;
+        cut = (step) => { if (step === operation) throw new Error(`offline ${step} interruption`); };
+        assert.throws(() => {
+          if (action === "create") f.store.createV5(initial, owner, noop);
+          else if (action === "update") f.store.updateV5(previous, () => next, owner, noop);
+          else if (action === "prepare") f.store.preparePullRequest(previous, preparation, owner, noop);
+          else if (action === "renew") f.store.preparePullRequest(previous, { ...preparation, taskSha: "d".repeat(40), preparedHeadSha: "e".repeat(40) }, owner, noop);
+          else f.store.progressPullRequest(previous, next.integration as TicketPullRequestIntegration, undefined, owner, noop);
+        }, /offline .* interruption/);
+        cut = () => {};
+        const reopened = new TicketWorktrees(f.repo);
+        if (operation === "renamed") assert.deepEqual(reopened.readV5(itemId), JSON.parse(JSON.stringify(next)));
+        else if (before) assert.deepEqual(fs.readFileSync(f.file), before);
+        else assert.equal(reopened.has(itemId), false);
+        assert.equal(fs.readdirSync(f.dir).some((name) => name.endsWith(".tmp")), false);
+      } finally { cut = () => {}; owner.release(); }
+    }
+    console.log(`PASS: v5 ${action} failures publish exactly old or complete new evidence, retaining PR/source/merge recovery through interrupted I/O`);
+  }
+
+  for (const operation of ["flushed", "renamed"]) {
+    const f = fixture();
+    const before = fs.readFileSync(f.file);
+    const child = spawnSync(process.execPath, ["--import", "tsx", fileURLToPath(import.meta.url), "crash-v5", f.repo, operation], {
+      encoding: "utf8", env: process.env,
+    });
+    assert.equal(child.status, 73, child.stderr);
+    const reopened = new TicketWorktrees(f.repo);
+    if (operation === "flushed") {
+      assert.deepEqual(fs.readFileSync(f.file), before);
+      assert.equal(reopened.read(itemId)?.schemaVersion, 4);
+      assert.equal(fs.readdirSync(f.dir).filter((name) => name.endsWith(".tmp")).length, 1);
+    } else assert.deepEqual(reopened.readV5(itemId)?.integration, pr);
+    assert.equal(reopened.listStored().length, 1);
+  }
+  console.log("PASS: real child exits after v5 flush/rename retain an authoritative old/new record; orphan temporaries never become approval or PR evidence");
+
+  for (const api of ["migrate", "progress"] as const) {
+    for (const change of ["missing", "corrupt", "newer", "format", "owner-lost", "stopped", "task-moved", "owner-lost-in-guard"]) {
+      const f = fixture(), owner = acquireOwnerLock(f.repo, "offline-bot");
+      try {
+        const original = f.store.read(itemId)!;
+        const next: TicketExecutionRecordV5 = { ...original, schemaVersion: 5, integration: pr };
+        if (api === "progress") fs.writeFileSync(f.file, JSON.stringify(next));
+        const raw = fs.readFileSync(f.file);
+        const newer = JSON.stringify({ ...(api === "progress" ? next : original), lastRunId: "external-update" });
+        let stopped = false, taskMoved = false, checks = 0;
+        const guard = () => {
+          if (stopped) throw new Error("offline stopped");
+          if (taskMoved) throw new Error("offline task moved");
+          if (++checks === 2 && change === "owner-lost-in-guard") owner.release();
+        };
+        cut = (operation) => {
+          if (operation !== "flushed") return;
+          if (change === "missing") fs.unlinkSync(f.file);
+          if (change === "corrupt") fs.writeFileSync(f.file, "{external corrupt");
+          if (change === "newer") fs.writeFileSync(f.file, newer);
+          if (change === "format") fs.writeFileSync(f.file, raw.toString() + "\n");
+          if (change === "owner-lost") owner.release();
+          if (change === "stopped") stopped = true;
+          if (change === "task-moved") taskMoved = true;
+        };
+        assert.throws(() => api === "migrate"
+          ? f.store.publishV5(original, next, raw, owner, guard)
+          : f.store.progressPullRequest(next, opened, undefined, owner, guard), /atomic write boundary|owner.lock|owner was lost|offline stopped|offline task moved/);
+        cut = () => {};
+        if (change === "missing") assert.equal(fs.existsSync(f.file), false);
+        else assert.deepEqual(fs.readFileSync(f.file), Buffer.from(change === "corrupt" ? "{external corrupt" :
+          change === "newer" ? newer : change === "format" ? raw.toString() + "\n" : raw));
+        assert.equal(fs.readdirSync(f.dir).some((name) => name.endsWith(".tmp")), false);
+      } finally { cut = () => {}; owner.release(); }
+    }
+    console.log(`PASS: v5 ${api} rechecks exact bytes, owner (including guard-time loss), stop and approved task sources at publication; no raced source is overwritten`);
+  }
 
   {
     const f = fixture();

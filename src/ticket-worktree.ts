@@ -14,6 +14,8 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { lstat, readdir } from "node:fs/promises";
+import { isDeepStrictEqual } from "node:util";
+import { assertOwnerLock, type OwnerLock } from "./owner-lock.js";
 import {
   GIT_GH_TIMEOUT_MS,
   processFailure,
@@ -37,6 +39,7 @@ export interface TicketRetryState {
   reason: string;
 }
 
+/** v4 direct integration only. Never interpret a v5 PR as this journal. */
 export interface TicketIntegrationState {
   baseSha: string;
   taskSha: string;
@@ -75,6 +78,75 @@ export type TicketExecutionRecordV4 = Omit<
   "schemaVersion" | "finalization"
 > & { schemaVersion: 4 };
 
+/** Structurally compatible with the PR API's PullRequestScope. Both refs belong
+ * to this one repository; forks are not represented by this state contract. */
+export interface TicketPullRequestScope {
+  owner: string;
+  repo: string;
+  base: string;
+  head: string;
+}
+
+export interface TicketPullRequestPreparation {
+  scope: TicketPullRequestScope;
+  baseSha: string;
+  /** Always local: restore a remote-only task before preparing. */
+  taskSha: string;
+  remoteTaskSha: string | null;
+  /** A merge-tree/commit-tree result for the task, never merge proof. */
+  preparedHeadSha: string;
+}
+
+export interface TicketPullRequestReference {
+  prNumber: number;
+  prUrl: string;
+}
+
+type OptionalPullRequestReference = TicketPullRequestReference | {
+  prNumber?: never;
+  prUrl?: never;
+};
+
+type TicketPullRequestSources = TicketPullRequestPreparation & {
+  kind: "pr";
+  /** Stable marker identity across suspended-approval repairs. */
+  initialPreparedHeadSha: string;
+};
+
+export type TicketPullRequestIntegration = TicketPullRequestSources & (
+  | ({ phase: "prepared" | "suspended" } & OptionalPullRequestReference)
+  | ({ phase: "open" } & TicketPullRequestReference)
+  | ({
+      phase: "merged";
+      /** Exact PR head covered by the observed merge (including squash). */
+      mergedHeadSha: string;
+      /** Actual merged commit on base, NOT an unmerged test-merge SHA. */
+      mergeCommitSha: string;
+    } & TicketPullRequestReference)
+);
+
+/** Only the owner-held legacy migration may attest to an old direct result.
+ * A prepared v3/v4 result alone is insufficient; its caller verifies fresh base. */
+export interface TicketLegacyCompletedIntegration {
+  kind: "legacy-completed";
+  scope: TicketPullRequestScope;
+  baseSha: string;
+  taskSha: string;
+  remoteTaskSha: string | null;
+  resultSha: string;
+}
+
+export type TicketIntegrationStateV5 =
+  | TicketPullRequestIntegration
+  | TicketLegacyCompletedIntegration;
+
+export type TicketExecutionRecordV5 = Omit<
+  TicketExecutionRecord,
+  "schemaVersion" | "finalization" | "integration"
+> & { schemaVersion: 5; integration?: TicketIntegrationStateV5 };
+
+/** Explicit during the staged rollout: existing execution APIs remain v3/v4. */
+export type StoredTicketExecutionRecord = TicketExecutionRecord | TicketExecutionRecordV5;
 export type TicketWorktreeRecord = TicketExecutionRecord;
 
 export interface WorktreeCheck {
@@ -120,6 +192,17 @@ const INTEGRATION_FIELDS = new Set([
   "taskSha",
   "remoteTaskSha",
   "resultSha",
+]);
+const PR_SCOPE_FIELDS = new Set(["owner", "repo", "base", "head"]);
+const PR_SOURCE_FIELDS = [
+  "scope", "baseSha", "taskSha", "remoteTaskSha", "preparedHeadSha",
+  "initialPreparedHeadSha",
+] as const;
+const PR_FIELDS = new Set([
+  "kind", "phase", ...PR_SOURCE_FIELDS, "prNumber", "prUrl",
+]);
+const LEGACY_COMPLETED_FIELDS = new Set([
+  "kind", "scope", "baseSha", "taskSha", "remoteTaskSha", "resultSha",
 ]);
 const FINALIZATION_FIELDS = new Set([
   "targetBranch",
@@ -203,8 +286,8 @@ export function singleLine(value: unknown): value is string {
 }
 
 function sameIdentity(
-  a: TicketExecutionRecord,
-  b: TicketExecutionRecord,
+  a: StoredTicketExecutionRecord,
+  b: StoredTicketExecutionRecord,
 ): boolean {
   return (
     a.itemId === b.itemId &&
@@ -317,6 +400,87 @@ export function isTicketExecutionRecord(
   );
 }
 
+function isSha(value: unknown): value is string {
+  return typeof value === "string" && SHA.test(value);
+}
+
+function isBranch(value: unknown): value is string {
+  return singleLine(value) && value !== "@" && !value.startsWith("-") &&
+    !/[\s~^:?*\[\\]/.test(value) && !value.includes("..") && !value.includes("@{") &&
+    value.split("/").every((part) => !!part && !part.startsWith(".") &&
+      !part.endsWith(".") && !part.endsWith(".lock"));
+}
+
+function isPullRequestScope(value: unknown): value is TicketPullRequestScope {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const scope = value as Record<string, unknown>;
+  return Object.keys(scope).every((key) => PR_SCOPE_FIELDS.has(key)) &&
+    typeof scope.owner === "string" && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(scope.owner) &&
+    typeof scope.repo === "string" && /^[a-z0-9_.-]+$/i.test(scope.repo) &&
+    scope.repo !== "." && scope.repo !== ".." &&
+    isBranch(scope.base) && isBranch(scope.head) && scope.base !== scope.head;
+}
+
+function isPullRequestUrl(value: unknown, scope: TicketPullRequestScope, number: number): boolean {
+  if (!singleLine(value)) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password &&
+      !url.search && !url.hash && url.href === value &&
+      url.pathname.toLowerCase() === `/${scope.owner}/${scope.repo}/pull/${number}`.toLowerCase();
+  } catch { return false; }
+}
+
+export function isTicketIntegrationStateV5(value: unknown): value is TicketIntegrationStateV5 {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const state = value as Record<string, unknown>;
+  if (!isPullRequestScope(state.scope) || !isSha(state.baseSha) || !isSha(state.taskSha) ||
+      !(state.remoteTaskSha === null || isSha(state.remoteTaskSha))) return false;
+  if (state.kind === "legacy-completed")
+    return Object.keys(state).every((key) => LEGACY_COMPLETED_FIELDS.has(key)) && isSha(state.resultSha);
+  if (state.kind !== "pr" || typeof state.phase !== "string" ||
+      !["prepared", "open", "suspended", "merged"].includes(state.phase) ||
+      !isSha(state.preparedHeadSha) || !isSha(state.initialPreparedHeadSha) ||
+      !Object.keys(state).every((key) => PR_FIELDS.has(key) ||
+        (state.phase === "merged" && ["mergedHeadSha", "mergeCommitSha"].includes(key)))) return false;
+  const reference = Object.hasOwn(state, "prNumber") || Object.hasOwn(state, "prUrl");
+  if (reference) {
+    if (!Number.isSafeInteger(state.prNumber) || Number(state.prNumber) <= 0 ||
+        !isPullRequestUrl(state.prUrl, state.scope, Number(state.prNumber))) return false;
+  } else if (state.phase === "open" || state.phase === "merged") return false;
+  return state.phase !== "merged" || (isSha(state.mergedHeadSha) && isSha(state.mergeCommitSha));
+}
+
+/** V5 is deliberately NOT accepted by the old direct-integration reader. */
+export function isTicketExecutionRecordV5(value: unknown): value is TicketExecutionRecordV5 {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (record.schemaVersion !== 5 ||
+      !isBranch(record.baseBranch) || !isBranch(record.taskBranch) || record.baseBranch === record.taskBranch ||
+      !isTicketExecutionRecord({ ...record, schemaVersion: 4, integration: undefined, retry: undefined }) ||
+      (record.retry !== undefined && !isRetry(record.retry)) ||
+      (record.integration !== undefined && !isTicketIntegrationStateV5(record.integration))) return false;
+  const integration = record.integration as TicketIntegrationStateV5 | undefined;
+  const retry = record.retry as TicketRetryState | undefined;
+  const executing = record.launchingAt !== undefined || record.activeRunId !== undefined;
+  if (!integration) return retry?.stage !== "cleanup" && !(executing && retry?.stage === "integrate");
+  if (integration.scope.base !== record.baseBranch || integration.scope.head !== record.taskBranch) return false;
+  if (integration.kind === "pr" && integration.phase === "suspended")
+    return retry?.stage !== "cleanup" && !(executing && retry?.stage === "integrate");
+  if (executing) return false;
+  const completed = integration.kind === "legacy-completed" || integration.phase === "merged";
+  return retry === undefined || retry.stage === (completed ? "cleanup" : "integrate");
+}
+
+export function isStoredTicketExecutionRecord(value: unknown): value is StoredTicketExecutionRecord {
+  return isTicketExecutionRecord(value) || isTicketExecutionRecordV5(value);
+}
+
+/** Compare persisted values, ignoring only optional undefined fields. */
+function sameRecord(a: StoredTicketExecutionRecord, b: StoredTicketExecutionRecord): boolean {
+  return isDeepStrictEqual(JSON.parse(JSON.stringify(a)), JSON.parse(JSON.stringify(b)));
+}
+
 /** Persistent builder worktrees and local-branch finalization. */
 export class TicketWorktrees {
   readonly repoRoot: string;
@@ -380,19 +544,49 @@ export class TicketWorktrees {
     return join(this.recordsDir, `${safe(itemId)}.json`);
   }
 
-  private load(
+  private loadStored(
     path: string,
-  ): { record: TicketExecutionRecord; bytes: Buffer } | undefined {
+  ): { record: StoredTicketExecutionRecord; bytes: Buffer } | undefined {
     try {
       if (this.hasSymlink(path) || !lstatSync(path).isFile()) return undefined;
       const bytes = readFileSync(path);
       const value: unknown = JSON.parse(bytes.toString("utf8"));
-      return isTicketExecutionRecord(value)
+      return isStoredTicketExecutionRecord(value)
         ? { record: value, bytes }
         : undefined;
     } catch {
       return undefined;
     }
+  }
+
+  private load(path: string): { record: TicketExecutionRecord; bytes: Buffer } | undefined {
+    const loaded = this.loadStored(path);
+    if (!loaded) return undefined;
+    if (loaded.record.schemaVersion === 5)
+      throw new Error("V5 ticket requires the PR executor; direct integration is forbidden.");
+    return { record: loaded.record, bytes: loaded.bytes };
+  }
+
+  readStored(itemId: string): StoredTicketExecutionRecord | undefined {
+    const record = this.loadStored(this.recordPath(itemId))?.record;
+    return record?.itemId === itemId ? record : undefined;
+  }
+
+  readV5(itemId: string): TicketExecutionRecordV5 | undefined {
+    const record = this.readStored(itemId);
+    if (record && record.schemaVersion !== 5)
+      throw new Error("Owner-held v5 migration is required.");
+    return record;
+  }
+
+  listStored(): StoredTicketExecutionRecord[] {
+    if (!existsSync(this.recordsDir)) return [];
+    return readdirSync(this.recordsDir)
+      .filter((name) => name.endsWith(".json"))
+      .flatMap((name) => {
+        const record = this.loadStored(join(this.recordsDir, name))?.record;
+        return record && name === `${safe(record.itemId)}.json` ? [record] : [];
+      });
   }
 
   read(itemId: string): TicketExecutionRecord | undefined {
@@ -422,6 +616,168 @@ export class TicketWorktrees {
       throw new Error("Ticket has a pending cleanup receipt.");
     this.save(record);
     return record;
+  }
+
+  /** All v5 publication is owner-held, with caller stop/approval/source checks
+   * repeated after the temporary is flushed and immediately before rename. */
+  private v5Guard(owner: OwnerLock, assertCurrent: () => void): () => void {
+    const assertOwner = () => {
+      if (this.hasSymlink(owner.path)) throw new Error("Symlinked owner state.");
+      assertOwnerLock(owner, this.repoRoot);
+    };
+    return () => { assertOwner(); assertCurrent(); assertOwner(); };
+  }
+
+  createV5(
+    record: TicketExecutionRecordV5,
+    owner: OwnerLock,
+    assertCurrent: () => void,
+  ): TicketExecutionRecordV5 {
+    if (!isTicketExecutionRecordV5(record) ||
+        (record.integration && (record.integration.kind !== "pr" ||
+          record.integration.phase !== "prepared" || record.integration.prNumber !== undefined ||
+          record.integration.initialPreparedHeadSha !== record.integration.preparedHeadSha)))
+      throw new Error("Invalid initial v5 ticket execution record.");
+    const guard = this.v5Guard(owner, () => {
+      assertCurrent();
+      if (this.hasCleanupReceipt(record.itemId)) throw new Error("Ticket has a pending cleanup receipt.");
+    });
+    guard();
+    this.save(record, undefined, guard);
+    return record;
+  }
+
+  /** Caller archives raw sources and proves any legacy completion before this
+   * explicit conversion. No read or ordinary update can migrate implicitly.
+   * An absent source is allowed ONLY for an existing receipt, checked by caller. */
+  publishV5(
+    original: TicketExecutionRecord,
+    next: TicketExecutionRecordV5,
+    expectedBytes: Buffer | undefined,
+    owner: OwnerLock,
+    assertSource: () => void,
+  ): TicketExecutionRecordV5 {
+    const receipted = this.hasCleanupReceipt(original.itemId);
+    const receiptOnly = expectedBytes === undefined && original.schemaVersion === 4 && receipted;
+    if (!isTicketExecutionRecord(original) || !isTicketExecutionRecordV5(next) ||
+        !sameIdentity(original, next) || (!expectedBytes && !receiptOnly) ||
+        (original.finalization && original.finalization.targetBranch !== original.baseBranch) ||
+        (original.retry && ["build", "review"].includes(original.retry.stage) &&
+          !isDeepStrictEqual(original.retry, next.retry)) ||
+        ["launchingAt", "activeRunId", "activeRunStartedAt", "lastRunId", "reviewedTaskSha"].some(
+          (key) => original[key as keyof TicketExecutionRecord] !== next[key as keyof TicketExecutionRecordV5],
+        )) throw new Error("Invalid v5 ticket conversion or execution identity.");
+    if (expectedBytes) {
+      const source: unknown = JSON.parse(expectedBytes.toString("utf8"));
+      if (!isTicketExecutionRecord(source) || !sameRecord(source, original))
+        throw new Error("V5 migration source does not match original record.");
+    }
+    const previous = original.integration ?? original.finalization;
+    const integration = next.integration;
+    if (previous && (!integration || integration.baseSha !== previous.baseSha ||
+        integration.taskSha !== previous.taskSha ||
+        integration.remoteTaskSha !== (original.integration?.remoteTaskSha === undefined
+          ? previous.taskSha : original.integration.remoteTaskSha)))
+      throw new Error("V5 migration cannot discard legacy task sources.");
+    if (((receipted || original.retry?.stage === "cleanup") && integration?.kind !== "legacy-completed") ||
+        (integration?.kind === "legacy-completed" &&
+          (previous?.resultSha ? integration.resultSha !== previous.resultSha : !receipted)) ||
+        (integration?.kind === "pr" && (integration.phase !== "prepared" ||
+          integration.prNumber !== undefined || integration.initialPreparedHeadSha !== integration.preparedHeadSha)))
+      throw new Error("Invalid v5 migration completion/preparation evidence.");
+    const guard = this.v5Guard(owner, () => {
+      assertSource();
+      if (this.hasCleanupReceipt(original.itemId) !== receipted)
+        throw new Error("Legacy receipt presence changed before v5 publication.");
+    });
+    guard();
+    this.save(next, expectedBytes, guard);
+    return next;
+  }
+
+  private writeV5(
+    expected: TicketExecutionRecordV5,
+    next: TicketExecutionRecordV5,
+    owner: OwnerLock,
+    assertCurrent: () => void,
+  ): TicketExecutionRecordV5 {
+    if (!isTicketExecutionRecordV5(expected) || !isTicketExecutionRecordV5(next) || !sameIdentity(expected, next))
+      throw new Error("Invalid v5 ticket execution update.");
+    const guard = this.v5Guard(owner, assertCurrent);
+    guard();
+    const loaded = this.loadStored(this.recordPath(expected.itemId));
+    if (!loaded || !sameRecord(loaded.record, expected))
+      throw new TicketStateChangedError("V5 ticket record changed before publication.");
+    this.save(next, loaded.bytes, guard);
+    return next;
+  }
+
+  /** Execution/retry updates cannot change integration evidence at all. An
+   * explicit suspended approval allows the original builder/review identity. */
+  updateV5(
+    expected: TicketExecutionRecordV5,
+    mutate: (record: TicketExecutionRecordV5) => TicketExecutionRecordV5,
+    owner: OwnerLock,
+    assertCurrent: () => void,
+  ): TicketExecutionRecordV5 {
+    const next = mutate(structuredClone(expected));
+    if (!isDeepStrictEqual(expected.integration, next.integration) ||
+        (expected.integration && !(expected.integration.kind === "pr" && expected.integration.phase === "suspended") &&
+          expected.reviewedTaskSha !== next.reviewedTaskSha))
+      throw new Error("Cannot replace v5 integration evidence through ordinary update.");
+    return this.writeV5(expected, next, owner, assertCurrent);
+  }
+
+  /** Only renewed closed-Done approval may replace suspended source preparation.
+   * Caller must check approval, same still-open PR (if known), and Git sources.
+   * The first prepared SHA and any known PR address survive every repair. */
+  preparePullRequest(
+    expected: TicketExecutionRecordV5,
+    preparation: TicketPullRequestPreparation,
+    owner: OwnerLock,
+    assertApprovedSources: () => void,
+  ): TicketExecutionRecordV5 {
+    const previous = expected.integration;
+    if (Object.keys(preparation).some((key) =>
+      !PR_SOURCE_FIELDS.some((field) => field !== "initialPreparedHeadSha" && field === key)))
+      throw new Error("Invalid PR preparation fields.");
+    if (expected.activeRunId || expected.launchingAt !== undefined ||
+        (expected.retry && expected.retry.stage !== "integrate") ||
+        (previous && (previous.kind !== "pr" || previous.phase !== "suspended")))
+      throw new Error("PR preparation requires idle new or suspended approval.");
+    if (previous && !isDeepStrictEqual(previous.scope, preparation.scope))
+      throw new Error("Cannot replace the managed PR repository or refs.");
+    let integration: TicketPullRequestIntegration = {
+      ...preparation,
+      kind: "pr",
+      phase: "prepared",
+      initialPreparedHeadSha: previous?.initialPreparedHeadSha ?? preparation.preparedHeadSha,
+    };
+    if (previous?.prNumber !== undefined)
+      integration = { ...integration, prNumber: previous.prNumber, prUrl: previous.prUrl };
+    return this.writeV5(expected, { ...expected, integration, retry: undefined }, owner, assertApprovedSources);
+  }
+
+  /** Persist authoritative PR observations. A failed/unknown observation must
+   * not call this API. Evidence is monotone; approval renewal is separate.
+   * retry is explicit so normal waiting needs no failure record. */
+  progressPullRequest(
+    expected: TicketExecutionRecordV5,
+    integration: TicketPullRequestIntegration,
+    retry: TicketRetryState | undefined,
+    owner: OwnerLock,
+    assertCurrent: () => void,
+  ): TicketExecutionRecordV5 {
+    const previous = expected.integration;
+    if (!previous || previous.kind !== "pr" || !isTicketIntegrationStateV5(integration) || integration.kind !== "pr" ||
+        PR_SOURCE_FIELDS.some((key) => !isDeepStrictEqual(previous[key], integration[key])) ||
+        (previous.prNumber !== undefined &&
+          (previous.prNumber !== integration.prNumber || previous.prUrl !== integration.prUrl)) ||
+        (previous.phase === "merged" && !isDeepStrictEqual(previous, integration)) ||
+        (previous.phase === "suspended" && ["prepared", "open"].includes(integration.phase)) ||
+        (previous.phase === "open" && integration.phase === "prepared"))
+      throw new Error("Cannot erase or replace managed PR sources, reference or merged evidence.");
+    return this.writeV5(expected, { ...expected, integration, retry }, owner, assertCurrent);
   }
 
   /** Idle historical records are retained; unreadable recovery is never absence. */
@@ -466,16 +822,16 @@ export class TicketWorktrees {
   }
 
   private save(
-    record: TicketExecutionRecord,
+    record: StoredTicketExecutionRecord,
     expectedBytes?: Buffer,
     beforePublish?: () => void,
   ): void {
-    if (!isTicketExecutionRecord(record))
+    if (!isStoredTicketExecutionRecord(record))
       throw new Error("Invalid ticket execution record.");
     const path = this.recordPath(record.itemId);
     const bytes = JSON.stringify(record, null, 2);
     try {
-      if (!isTicketExecutionRecord(JSON.parse(bytes)))
+      if (!isStoredTicketExecutionRecord(JSON.parse(bytes)))
         throw new Error("Invalid serialized ticket execution record.");
     } catch (cause) {
       throw new Error("Invalid serialized ticket execution record.", { cause });
@@ -692,7 +1048,7 @@ export class TicketWorktrees {
     );
   }
 
-  assertOwnedPath(record: TicketExecutionRecord): void {
+  assertOwnedPath(record: StoredTicketExecutionRecord): void {
     if (
       !this.isManagedPath(record.path) ||
       !samePath(record.path, this.pathFor(record.itemId, record.issueNumber))
@@ -701,7 +1057,7 @@ export class TicketWorktrees {
         `Refusing unmanaged or mismatched worktree path: ${record.path}`,
       );
     if (
-      this.list().some(
+      this.listStored().some(
         (other) =>
           other.itemId !== record.itemId &&
           (other.taskBranch === record.taskBranch ||
@@ -745,7 +1101,7 @@ export class TicketWorktrees {
       ?.path;
   }
 
-  check(record: TicketExecutionRecord, requireClean = true): WorktreeCheck {
+  check(record: StoredTicketExecutionRecord, requireClean = true): WorktreeCheck {
     try {
       this.assertOwnedPath(record);
     } catch (error) {
