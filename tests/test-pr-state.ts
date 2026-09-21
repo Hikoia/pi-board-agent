@@ -162,7 +162,7 @@ try {
 
   {
     const f = fixture();
-    let record = f.store.preparePullRequest(f.record, preparation, f.owner, noop);
+    let record = f.store.recordPullRequestPreparation(f.record, preparation, f.owner, noop);
     assert.deepEqual(record.integration, prepared);
     assert.equal(record.retry, undefined, "normal preparation/waiting is not a failure");
     const unchanged = (action: () => unknown) => expectUnchanged(f, action);
@@ -171,7 +171,7 @@ try {
       { ...prepared, preparedHeadSha: sha("d") }, { ...prepared, initialPreparedHeadSha: sha("d") }, open, merged, legacy,
     ]) unchanged(() => f.store.updateV5(record, (r) => ({ ...r, integration }), f.owner, noop));
     unchanged(() => f.store.updateV5(record, (r) => ({ ...r, reviewedTaskSha: sha("d") }), f.owner, noop));
-    unchanged(() => f.store.preparePullRequest(record, preparation, f.owner, noop));
+    unchanged(() => f.store.recordPullRequestPreparation(record, preparation, f.owner, noop));
     // A response lost after create is recovered into this same prepared execution.
     record = f.store.progressPullRequest(record, open, undefined, f.owner, noop);
     assert.deepEqual(new TicketWorktrees(f.repo).readV5(idle.itemId)?.integration, open);
@@ -187,15 +187,15 @@ try {
     unchanged(() => f.store.progressPullRequest(record, { ...prepared, ...reference }, undefined, f.owner, noop));
     // Open Ready retires approval but retains the one PR while the original run continues.
     record = f.store.updateV5(record, (r) => ({ ...r, launchingAt: 200, reviewedTaskSha: undefined }), f.owner, noop);
-    unchanged(() => f.store.preparePullRequest(record, preparation, f.owner, noop));
+    unchanged(() => f.store.recordPullRequestPreparation(record, preparation, f.owner, noop));
     record = f.store.updateV5(record, (r) => ({ ...r, launchingAt: undefined,
       activeRunId: "original-builder", activeRunStartedAt: 201 }), f.owner, noop);
     record = f.store.updateV5(record, (r) => ({ ...r, activeRunId: undefined, activeRunStartedAt: undefined,
       lastRunId: "original-builder", reviewedTaskSha: sha("d") }), f.owner, noop);
     const renewed = { ...preparation, baseSha: sha("d"), taskSha: sha("e"), remoteTaskSha: sha("e"), preparedHeadSha: sha("f") };
-    unchanged(() => f.store.preparePullRequest(record, renewed, f.owner, () => { throw new Error("approval withdrawn"); }));
-    unchanged(() => f.store.preparePullRequest(record, { ...renewed, scope: { ...renewed.scope, repo: "other" } }, f.owner, noop));
-    record = f.store.preparePullRequest(record, renewed, f.owner, noop);
+    unchanged(() => f.store.recordPullRequestPreparation(record, renewed, f.owner, () => { throw new Error("approval withdrawn"); }));
+    unchanged(() => f.store.recordPullRequestPreparation(record, { ...renewed, scope: { ...renewed.scope, repo: "other" } }, f.owner, noop));
+    record = f.store.recordPullRequestPreparation(record, renewed, f.owner, noop);
     assert.deepEqual(record.integration, { ...renewed, kind: "pr", phase: "prepared", ...reference,
       initialPreparedHeadSha: prepared.initialPreparedHeadSha });
     assert.equal(record.lastRunId, "original-builder");
@@ -205,7 +205,7 @@ try {
       mergedHeadSha: sha("a"), mergeCommitSha: sha("b") }, undefined, f.owner, noop);
     for (const replacement of [prepared, open, suspended, { ...record.integration, mergeCommitSha: sha("c") }])
       unchanged(() => f.store.progressPullRequest(record, replacement as TicketPullRequestIntegration, undefined, f.owner, noop));
-    unchanged(() => f.store.preparePullRequest(record, renewed, f.owner, noop));
+    unchanged(() => f.store.recordPullRequestPreparation(record, renewed, f.owner, noop));
     unchanged(() => f.store.updateV5(record, (r) => ({ ...r, integration: undefined }), f.owner, noop));
     record = f.store.updateV5(record, (r) => ({ ...r, retry: { stage: "cleanup", reason: "later uncovered work blocks cleanup" } }), f.owner, noop);
     assert.equal((record.integration as typeof merged).mergeCommitSha, sha("b"));
@@ -216,10 +216,10 @@ try {
   {
     const f = fixture();
     const current = f.store.updateV5(f.record, (r) => ({ ...r, lastRunId: "newer-run" }), f.owner, noop);
-    expectUnchanged(f, () => f.store.preparePullRequest(f.record, preparation, f.owner, noop), /changed before publication/);
+    expectUnchanged(f, () => f.store.recordPullRequestPreparation(f.record, preparation, f.owner, noop), /changed before publication/);
     assert.throws(() => f.store.updateV5(f.record, (r) => r, f.owner, noop), TicketStateChangedError);
     f.owner.release();
-    expectUnchanged(f, () => f.store.preparePullRequest(current, preparation, f.owner, noop), /owner.lock|owner was lost/);
+    expectUnchanged(f, () => f.store.recordPullRequestPreparation(current, preparation, f.owner, noop), /owner.lock|owner was lost/);
     const other = fixture();
     expectUnchanged(other, () => other.store.updateV5(other.record, (r) => r, f.owner, noop), /owner was lost/);
     console.log("PASS: stale snapshots and missing/wrong owners cannot publish v5 progress or reinterpret later work");

@@ -1,6 +1,6 @@
 // Public TicketWorktrees/loop seams, real disposable Git, filesystem/process faults only.
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import {
   mkdirSync,
   rmSync,
@@ -17,6 +17,7 @@ import {
   runProcessSync,
   type ProcessCommand,
   type ProcessOptions,
+  type ProcessResult,
 } from "../src/process-runner.js";
 
 export const root = process.env.TMP_DIR!;
@@ -28,6 +29,19 @@ export const git = (cwd: string, ...args: string[]) =>
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
 export const calls: string[][] = [];
+
+// Opt-in for large Git matrices: exercise the same real Git/filesystem and
+// asynchronous fault boundaries without recompiling the Windows Job Object
+// bridge for every read-only probe. Supervisor/tree-kill policy has its own tests.
+let nativeGit = false;
+export function useNativeGitFixture(): void {
+  assert.equal(process.env.GIT_ALLOW_PROTOCOL, "file");
+  assert.equal(process.env.PI_OFFLINE, "1");
+  nativeGit = true;
+}
+function nativeResult(error: any, stdout: string, stderr: string, status: number | null): ProcessResult {
+  return { ok: !error && status === 0, status, stdout, stderr, timedOut: error?.code === "ETIMEDOUT" || !!error?.killed };
+}
 
 export const faults: {
   beforeGit?: (args: string[], options: ProcessOptions) => void | Promise<void>;
@@ -70,10 +84,23 @@ globals.__cleanupGit = (
     ),
     "normal remove only",
   );
-  if (mode === "sync") return runProcessSync(command, args, options);
+  const direct = nativeGit && command === "git";
+  const nativeOptions = { cwd: options.cwd, env: { ...process.env, ...options.env },
+    input: options.input, encoding: "utf8" as const, timeout: options.timeoutMs ?? 120_000,
+    maxBuffer: 4 * 1024 * 1024, windowsHide: true };
+  if (mode === "sync") {
+    if (!direct) return runProcessSync(command, args, options);
+    const result = spawnSync("git", args, nativeOptions);
+    return nativeResult(result.error, result.stdout ?? "", result.stderr ?? "", result.status);
+  }
   return (async () => {
     await faults.beforeGit?.(args, options);
-    const result = await runProcess(command, args, options);
+    const result = direct ? await new Promise<ProcessResult>((resolve) => {
+      const child = execFile("git", args, nativeOptions, (error, stdout, stderr) =>
+        resolve(nativeResult(error, stdout, stderr, error ? (typeof error.code === "number" ? error.code : null) : 0)));
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(options.input);
+    }) : await runProcess(command, args, options);
     await faults.afterGit?.(args, options);
     return result;
   })();
@@ -243,6 +270,7 @@ export function legacy(
 }
 
 export function dispose() {
+  nativeGit = false;
   faults.beforeGit = faults.afterGit = faults.beforeFs = faults.afterFs = faults.beforeSyncFs = undefined;
   hooks.deregister();
   delete globals.__cleanupSyncFs;
