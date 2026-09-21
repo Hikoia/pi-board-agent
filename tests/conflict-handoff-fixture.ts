@@ -69,7 +69,7 @@ export async function fixture(conflict = true) {
     repoName: "repo",
   };
   const task = buildTasksForWave(cfg, "demo", [card])[0];
-  const store = new TicketWorktrees(repo),
+  const store = new TicketWorktrees(repo, testOwner(repo)),
     record = await store.ensure(task, "demo");
   writeFileSync(
     join(record.path, "value.json"),
@@ -147,12 +147,13 @@ export async function fixture(conflict = true) {
   let review: LoopDeps["review"] = async () => {
     throw new Error("Offline Review adapter not configured");
   };
+  const prs = fakePullRequests(repo, true);
   const make = () => {
     const executor = new ManagedTicketExecutor({
-      cwd: repo,
+      owner: testOwner(repo), pullRequests: prs.api, cwd: repo,
       cfg,
       board,
-      worktrees: new TicketWorktrees(repo),
+      worktrees: new TicketWorktrees(repo, testOwner(repo)),
       botLogin: "bot",
       repoOwner: "owner",
       repoName: "repo",
@@ -212,7 +213,7 @@ export async function fixture(conflict = true) {
       },
       state,
       executor,
-      new TicketWorktrees(repo),
+      new TicketWorktrees(repo, testOwner(repo)),
     );
     settledTicks(loop);
     return { loop, state, executor };
@@ -309,3 +310,5 @@ export async function repairResult(
     summary: `Resolved both sides; node test.cjs passed at ${sha}`,
   };
 }
+
+import { testOwner, noPullRequests, fakePullRequests } from "./pr-fixture.js";

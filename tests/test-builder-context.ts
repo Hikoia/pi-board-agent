@@ -1,3 +1,5 @@
+
+const { testOwner, noPullRequests } = await import("./pr-fixture.js");
 // Actual production factory, worktrees, WorkflowManager and generated prompt.
 // Only GitHub and the manager's documented agent runner are offline adapters;
 // context observation delegates to the real helpers (including their I/O).
@@ -16,7 +18,7 @@ import { _DEFAULTS } from "../src/config.js";
 import { generateContext, renderContext, type ContextOptions } from "../src/context.js";
 import type { Card } from "../src/gh.js";
 import type { ManagedTicketExecutor } from "../src/ticket-executor.js";
-import { TicketWorktrees, type TicketExecutionRecord } from "../src/ticket-worktree.js";
+import { TicketWorktrees, type TicketExecutionRecordV5 } from "../src/ticket-worktree.js";
 
 const root = process.env.TMP_DIR!;
 assert.ok(root && process.env.PI_CODING_AGENT_DIR, "Run via bash tests/run-offline.sh");
@@ -74,7 +76,7 @@ assert.notEqual(newBase, hostBefore.head);
 assert.equal(existsSync(join(repo, "src", "base-new.ts")), false);
 assert.equal(generateContext(hostOptions), cachedHost, "host HEAD cache is genuinely unchanged");
 
-const worktrees = new TicketWorktrees(repo);
+const worktrees = new TicketWorktrees(repo, testOwner(repo));
 const cards = new Map<string, Card>();
 const addCard = (number: number): Card => {
   const card: Card = {
@@ -148,7 +150,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 } });
 const { createProductionTicketExecutor } = await import("../src/ticket-executor.js");
 const makeExecutor = () => createProductionTicketExecutor({
-  cwd: repo, cfg, worktrees, botLogin: "bot", repoOwner: "owner", repoName: "repo",
+  owner: testOwner(repo), cwd: repo, cfg, worktrees, botLogin: "bot", repoOwner: "owner", repoName: "repo",
   meta: { projectId: "P", statusFieldId: "S", statusOptions: {} }, callback: (message) => notices.push(message),
 });
 async function until(condition: () => boolean) {
@@ -163,7 +165,7 @@ const digest = (prompt: string) => {
   assert.ok(match, "the actual builder must receive a context section");
   return match[1];
 };
-function clean(record: TicketExecutionRecord) {
+function clean(record: TicketExecutionRecordV5) {
   assert.deepEqual(worktrees.check(record, true), { ok: true, clean: true });
   // Ignored files must not conceal a generated digest from the dirty gate.
   assert.equal(git(record.path, "ls-files", "--others", "--ignored", "--exclude-standard"), "");

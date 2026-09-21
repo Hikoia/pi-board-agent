@@ -5,7 +5,6 @@ import { fixture, faults, dispose } from "./finalization-fixture.js";
 // owner-lock -> unsupported-state imports TicketWorktrees. Load it only after
 // the fixture has registered its filesystem hooks, otherwise ESM preloads the
 // unobserved store and silently bypasses the publication fault seam.
-const { acquireOwnerLock } = await import("../src/owner-lock.js");
 try {
   for (const cut of [
     "before-archive",
@@ -13,7 +12,7 @@ try {
     "before-publish",
   ] as const) {
     const f = await fixture(true);
-    f.store.update(f.task.itemId, (r) => ({
+    f.store.legacyUpdate(f.task.itemId, (r) => ({
       ...r,
       finalization: {
         targetBranch: "main",
@@ -27,7 +26,7 @@ try {
         ".pi/board-agent/legacy-v3",
         basename(f.recordFile),
       );
-    const owner = acquireOwnerLock(f.repo, "bot");
+    const owner = f.owner;
     let reached = false;
     const fail = () => {
       reached = true;
@@ -38,7 +37,7 @@ try {
         if (
           op === "renameSync" &&
           to === f.recordFile &&
-          JSON.parse(readFileSync(from, "utf8")).schemaVersion === 4
+          JSON.parse(readFileSync(from, "utf8")).schemaVersion === 5
         )
           fail();
       };
@@ -61,7 +60,7 @@ try {
       const next = f.make();
       assert.deepEqual((await next.migrateLegacy(owner)).failures, []);
       assert.deepEqual(readFileSync(archive), bytes);
-      assert.equal(f.recordNow().schemaVersion, 4);
+      assert.equal(f.recordNow().schemaVersion, 5);
       assert.equal((await next.finalizeClosed(f.card)).status, "finalized");
       assert.ok(existsSync(archive));
       assert.equal(f.starts(), 0);

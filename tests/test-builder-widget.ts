@@ -1,3 +1,5 @@
+
+const { testOwner, noPullRequests } = await import("./pr-fixture.js");
 // Actual entry-point widget + executor + WorkflowManager. Hold board I/O while
 // a real (offline) builder runs, pauses and resumes; no tick may finish first.
 import assert from "node:assert/strict";
@@ -13,7 +15,7 @@ import {
 } from "../src/ticket-executor.js";
 import {
   TicketWorktrees,
-  type TicketExecutionRecord,
+  type TicketExecutionRecordV5 as TicketExecutionRecord,
 } from "../src/ticket-worktree.js";
 
 const cwd = process.env.TMP_DIR!;
@@ -29,7 +31,7 @@ writeFileSync(
   join(cwd, ".pi", "board-agent.yml"),
   "project:\n  owner: owner\n  number: 1\nbot_identity: bot\nmax_workers: 2\nsafety:\n  require_clean_worktree: false\ncontext:\n  enabled: false\nwatchdog:\n  enabled: false\n",
 );
-const worktrees = new TicketWorktrees(cwd);
+const worktrees = new TicketWorktrees(cwd); // read-only fixture seeding; entry point acquires the real owner
 const deferred = () => {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => {
@@ -71,7 +73,7 @@ const runId = manager.start(
   { maxAgents: 1, concurrency: 1, agentRetries: 0 },
 );
 const record: TicketExecutionRecord = {
-  schemaVersion: 4,
+  schemaVersion: 5,
   itemId: "ITEM_1",
   issueNumber: 1,
   taskKey: "T001",
@@ -113,7 +115,7 @@ globals.__builderWidget = {
   createProductionTicketExecutor: (options: any) =>
     (executor = new ManagedTicketExecutor({
       ...options,
-      worktrees,
+      pullRequests: noPullRequests,
       createManager: () => manager,
       board: {
         getCard: async () => {

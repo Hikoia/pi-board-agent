@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fixture, git, calls, dispose } from "./finalization-fixture.js";
-import { acquireOwnerLock } from "../src/owner-lock.js";
 
 try {
   for (const kind of [
@@ -20,7 +19,7 @@ try {
         : kind === "rewritten-base"
           ? git(f.repo, "commit-tree", `${f.base}^{tree}`, "-m", "unrelated")
           : f.base;
-    f.store.update(f.task.itemId, (r) => ({
+    f.store.legacyUpdate(f.task.itemId, (r) => ({
       ...r,
       reviewedTaskSha: kind === "review-mismatch" ? f.base : f.taskSha,
       finalization: {
@@ -35,7 +34,7 @@ try {
       },
     }));
     const bytes = readFileSync(f.recordFile),
-      owner = acquireOwnerLock(f.repo, "bot");
+      owner = f.owner;
     try {
       calls.length = 0;
       const report = await f.executor.migrateLegacy(owner);
@@ -66,18 +65,18 @@ try {
     git(f.record.path, "commit", "-m", "task");
     git(f.record.path, "push", "origin", f.task.taskBranch);
     const taskSha = git(f.record.path, "rev-parse", "HEAD");
-    f.store.setReviewedTaskSha(f.task.itemId, taskSha);
+    f.store.legacySetReviewedTaskSha(f.task.itemId, taskSha);
     writeFileSync(join(f.repo, "base.txt"), "base side");
     git(f.repo, "add", "base.txt");
     git(f.repo, "commit", "-m", "base");
     git(f.repo, "push", "origin", "main");
     const baseSha = f.tip();
-    f.store.update(f.task.itemId, (r) => ({
+    f.store.legacyUpdate(f.task.itemId, (r) => ({
       ...r,
       finalization: { targetBranch: "main", baseSha, taskSha },
     }));
     const bytes = readFileSync(f.recordFile),
-      owner = acquireOwnerLock(f.repo, "bot");
+      owner = f.owner;
     try {
       assert.deepEqual((await f.executor.migrateLegacy(owner)).failures, []);
       assert.deepEqual(
@@ -94,7 +93,7 @@ try {
       assert.equal(f.starts(), 0);
       assert.equal(f.tip(), baseSha);
       console.log(
-        "PASS: valid pre-result v3 intent archives raw bytes before v4 conversion, then a real conflict reopens for original-branch build and renewed approval",
+        "PASS: valid pre-result v3 intent archives raw bytes before v5 conversion, then a real conflict reopens for original-branch build and renewed approval",
       );
     } finally {
       owner.release();

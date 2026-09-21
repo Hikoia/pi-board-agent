@@ -325,16 +325,13 @@ export class LegacyTickets {
   /** Re-observe an uncertain launch using strict on-disk journal reading. The
    * caller opens a manager only AFTER unique persisted matching; published v4
    * never needs a legacy ledger to authorize this observation. */
-  observeLaunch(
+  legacyObserveLaunch(
     record: TicketExecutionRecord,
   ): TicketExecutionRecord | undefined {
     const matches = this.launchMatches(record, this.runs(record));
     if (matches.length !== 1) return undefined;
-    return this.deps.worktrees.setActiveRun(
-      record.itemId,
-      matches[0].runId,
-      Date.parse(matches[0].startedAt),
-    );
+    return this.deps.worktrees.legacyUpdate(record.itemId, (r) => ({ ...r, launchingAt: undefined,
+      activeRunId: matches[0].runId, activeRunStartedAt: Date.parse(matches[0].startedAt) }));
   }
 
   /** Re-observe a published uncertain launch without replaying legacy ledgers. */
@@ -352,7 +349,7 @@ export class LegacyTickets {
   }
 
   /** Transitional v4 entry point. T05 switches the executor to migrateV5. */
-  async migrate(
+  async legacyMigrateV4(
     owner: OwnerLock,
     canMigrate: () => boolean = () => true,
     control?: OperationControl,

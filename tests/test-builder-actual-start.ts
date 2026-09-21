@@ -14,7 +14,7 @@ import {
 } from "../src/ticket-executor.js";
 import {
   TicketWorktrees,
-  type TicketExecutionRecord,
+  type TicketExecutionRecordV5,
 } from "../src/ticket-worktree.js";
 import {
   BOARD_AGENT_SOURCE,
@@ -45,7 +45,7 @@ cfg.safety.require_clean_worktree =
   cfg.context.enabled =
   cfg.telegram.enabled = false;
 
-const worktrees = new TicketWorktrees(repo);
+const worktrees = new TicketWorktrees(repo, testOwner(repo));
 const packageRoot = join(root, "package");
 mkdirSync(packageRoot);
 const packageGit = (...args: string[]) =>
@@ -98,7 +98,7 @@ async function check(change: string, patch?: Partial<Card>) {
     contextDone = false,
     lateReads = 0;
   let run: PersistedRunState | undefined;
-  let contextRecord: TicketExecutionRecord | undefined;
+  let contextRecord: TicketExecutionRecordV5 | undefined;
   const entered = deferred(),
     finish = deferred(),
     latched = deferred();
@@ -143,7 +143,7 @@ async function check(change: string, patch?: Partial<Card>) {
     },
   };
   const executor = new ManagedTicketExecutor({
-    cwd: repo,
+    owner: testOwner(repo), pullRequests: noPullRequests, cwd: repo,
     cfg,
     worktrees,
     board,
@@ -324,6 +324,14 @@ async function check(change: string, patch?: Partial<Card>) {
         0,
         "a later healthy revision cannot reopen the admission latch",
       );
+    } else if (change === "stop-during-read" || change === "stop-human") {
+      assert.deepEqual(writes, [], "stop forbids a late remote reset");
+      assert.deepEqual(releases, [], "stop retains the claim for recovery");
+      assert.deepEqual(card, before);
+      const retained = worktrees.read(original.itemId)!;
+      assert.equal(retained.launchingAt, record.launchingAt);
+      assert.equal(retained.activeRunId, undefined);
+      assert.ok(pendingTicketWrite(retained), "definitely unstarted reservation keeps durable reset intent");
     } else if (change === "read-error") {
       assert.match(
         error?.message ?? notices.join("\n"),
@@ -437,6 +445,7 @@ async function check(change: string, patch?: Partial<Card>) {
     await loop.stop();
     // Reuse only the disposable fixture's persistent worktree across scenarios.
     worktrees.clearExecution(original.itemId);
+    worktrees.update(original.itemId, r => ({ ...r, retry: undefined })); // isolate disposable scenarios
     writeFileSync(settingsPath, JSON.stringify({ packages: [`${BOARD_AGENT_SOURCE}@${packageSha}`] }));
     if (change.includes("async")) {
       packageGit("reset", "--hard", packageSha);
@@ -491,3 +500,5 @@ for (const [change, patch] of [
   }
 }
 if (failures.length) throw new AggregateError(failures);
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

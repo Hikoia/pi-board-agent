@@ -1,4 +1,4 @@
-// T14 safety port: ordinary v4 build retry, same-run dirty recovery and real disposable Git.
+// T14 safety port: ordinary v5 build retry, same-run dirty recovery and real disposable Git.
 // Retired request/test-history proof assertions are mapped in docs/test-v4-mapping.md.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -41,7 +41,7 @@ console.log('PASS: both original task and base behavior at ' + sha);
   cfg.context.enabled = cfg.telegram.enabled = cfg.safety.require_clean_worktree = false;
   const card: Card = { itemId: `REPAIR_${sequence}`, number: sequence, contentType: "Issue", type: "Task", title: "T014 preserve original work", body: "Original acceptance: retain task behavior and all prior edits.", plan: "demo", status: cfg.columns.ready, closed: false, assignees: [], repoOwner: "owner", repoName: "repo" };
   const task = buildTasksForWave(cfg, "demo", [card])[0];
-  const store = new TicketWorktrees(repo), record = await store.ensure(task, "demo");
+  const store = new TicketWorktrees(repo, testOwner(repo)), record = await store.ensure(task, "demo");
   writeFileSync(join(record.path, "value.json"), '{"task":true,"base":false}\n');
   writeFileSync(join(record.path, "task-only.txt"), "original task edit\n");
   git(record.path, "add", "."); git(record.path, "commit", "-m", "original issue implementation"); git(record.path, "push", "origin", task.taskBranch);
@@ -63,7 +63,7 @@ console.log('PASS: both original task and base behavior at ' + sha);
   let calls = 0;
   type Builder = NonNullable<WorkflowRunOptions["agent"]>["run"];
   let builder: Builder = async () => ({ taskKey: task.taskKey, itemId: task.itemId, branch: task.taskBranch, status: "success" });
-  const makeExecutor = (context?: TicketExecutorDeps["context"]) => new ManagedTicketExecutor({ cwd: repo, cfg, board, context, worktrees: new TicketWorktrees(repo), botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {},
+  const makeExecutor = (context?: TicketExecutorDeps["context"]) => new ManagedTicketExecutor({ owner: testOwner(repo), pullRequests: noPullRequests, cwd: repo, cfg, board, context, worktrees: new TicketWorktrees(repo, testOwner(repo)), botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {},
     createManager: (cwd) => createWorkflowManagerAdapter({ cwd, defaultAgentRetries: 0, callback: () => {}, agent: { async run(prompt: string, options: Parameters<Builder>[1]) { calls++; return builder(prompt, options); } } as NonNullable<WorkflowManagerOptions["agent"]> }),
   });
   const executor = makeExecutor();
@@ -123,7 +123,7 @@ function integrate(f: Awaited<ReturnType<typeof fixture>>) {
     assert.equal(run.status, "completed", JSON.stringify(run));
     assert.equal(Object.hasOwn(run.args!, "repair"), false, "ordinary run args, no repair protocol");
     assert.equal(run.maxAgents, 1); assert.equal(run.concurrency, 1);
-    assert.equal(f.store.read(f.card.itemId)?.schemaVersion, 4);
+    assert.equal(f.store.read(f.card.itemId)?.schemaVersion, 5);
     assert.equal(Object.hasOwn(f.store.read(f.card.itemId)!, "repair"), false);
     assert.equal(readFileSync(join(f.record.path, ".pi/tested"), "utf8"), resultSha + "\n", "existing tests actually executed at integrated commit");
     assert.equal(readFileSync(join(f.record.path, "task-only.txt"), "utf8"), "original task edit\n");
@@ -278,3 +278,5 @@ for (const mode of ["card-during-revision", "stop-during-final-read", "revision-
     console.log(`PASS: repair actual-start ${mode} preserves the two await orders, stop/revision latch and max_workers=1`);
   } finally { finish.resolve(); await launching; await executor.shutdown(); await f.executor.shutdown(); }
 }
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

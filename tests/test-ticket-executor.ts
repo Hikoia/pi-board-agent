@@ -29,7 +29,7 @@ import {
 } from "../src/ticket-executor.js";
 import {
   TicketWorktrees,
-  type TicketExecutionRecord,
+  type TicketExecutionRecordV5,
 } from "../src/ticket-worktree.js";
 import { buildTasksForWave } from "../src/workflow-prompt.js";
 import { settledTicks } from "./async-loop-fixture.js";
@@ -235,22 +235,22 @@ class FakeManager implements TicketWorkflowManager {
 }
 
 const board = new FakeBoard();
-const worktrees = new TicketWorktrees(repo);
+const worktrees = new TicketWorktrees(repo, testOwner(repo));
 const notices: string[] = [];
 const makeExecutor = (recover = false) =>
   new ManagedTicketExecutor({
-    cwd: repo,
+    owner: testOwner(repo), pullRequests: noPullRequests, cwd: repo,
     cfg,
     botLogin: "bot",
     repoOwner: "test",
     repoName: "repo",
     board,
     callback: (message) => notices.push(message),
-    worktrees: new TicketWorktrees(repo),
+    worktrees: new TicketWorktrees(repo, testOwner(repo)),
     createManager: (path) => new FakeManager(stateFor(path), recover),
   });
 const recordFor = (itemId: string) =>
-  worktrees.read(itemId) as TicketExecutionRecord;
+  worktrees.read(itemId) as TicketExecutionRecordV5;
 const runFor = (itemId: string) => {
   const record = recordFor(itemId);
   return stateFor(record.path).runs.get(record.activeRunId!)!;
@@ -1290,7 +1290,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   const slotRepo = join(root, "slot-repo");
   mkdirSync(slotRepo);
   git(slotRepo, "init", "-b", "main");
-  const slotWorktrees = new TicketWorktrees(slotRepo);
+  const slotWorktrees = new TicketWorktrees(slotRepo, testOwner(slotRepo));
   const slotCards = [board.add("PVTI_100", 100), board.add("PVTI_101", 101)];
   let slotLaunches = 0;
   const slotExecutor: TicketExecutor = {
@@ -1362,7 +1362,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     );
   else fail("FAIL: recovery-only admission gate");
 
-  const lock = acquireOwnerLock(slotRepo, "bot");
+  const lock = testOwner(slotRepo);
   let secondOwnerRejected = false;
   try {
     acquireOwnerLock(slotRepo, "bot");
@@ -1370,7 +1370,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
     secondOwnerRejected = true;
   }
   lock.release();
-  const replacement = acquireOwnerLock(slotRepo, "bot");
+  const replacement = testOwner(slotRepo);
   replacement.release();
   if (secondOwnerRejected)
     console.log(
@@ -1387,7 +1387,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
       startedAt: new Date(0).toISOString(),
     }),
   );
-  const reclaimed = acquireOwnerLock(slotRepo, "bot");
+  const reclaimed = testOwner(slotRepo);
   reclaimed.release();
   console.log("PASS: owner lock reclaims a dead same-host process");
   writeFileSync(
@@ -1450,7 +1450,7 @@ async function finalFixture(strategy: "merge" | "squash" = "merge") {
   );
   finalBoard.cards.get(card.itemId)!.closed = true;
   card.closed = true;
-  const store = new TicketWorktrees(checkout);
+  const store = new TicketWorktrees(checkout, testOwner(checkout));
   const record = await store.ensure(
     buildTasksForWave(finalCfg, "demo", [card])[0],
     "demo",
@@ -1468,14 +1468,15 @@ async function finalFixture(strategy: "merge" | "squash" = "merge") {
   }> = [];
   let managers = 0;
   let ensures = 0;
+  const prs = fakePullRequests(checkout, true);
   const make = () => {
-    const finalStore = new TicketWorktrees(checkout);
+    const finalStore = new TicketWorktrees(checkout, testOwner(checkout));
     finalStore.ensure = async () => {
       ensures++;
       throw new Error("finalization must never ensure/recreate a worktree");
     };
     return new ManagedTicketExecutor({
-      cwd: checkout,
+      owner: testOwner(checkout), pullRequests: prs.api, cwd: checkout,
       cfg: finalCfg,
       botLogin: "bot",
       repoOwner: "test",
@@ -1507,6 +1508,7 @@ async function finalFixture(strategy: "merge" | "squash" = "merge") {
   return {
     checkout,
     remote,
+    prs,
     finalCfg,
     finalBoard,
     card,
@@ -1627,7 +1629,9 @@ async function finalFixture(strategy: "merge" | "squash" = "merge") {
     f.finalBoard.cards.get(f.card.itemId)!.status,
     cfg.columns.done,
   );
-  assert.deepEqual(f.store.read(f.card.itemId), original, "unknown sources cannot manufacture recovery ownership");
+  const { retry, ...preserved } = f.store.read(f.card.itemId)!;
+  assert.equal(retry?.stage, "integrate");
+  assert.deepEqual(preserved, original, "unknown sources cannot manufacture recovery ownership");
   assert.equal(
     readFileSync(join(f.record.path, "leftover.txt"), "utf8"),
     "do not delete\n",
@@ -1673,7 +1677,7 @@ for (const strategy of ["squash", "merge"] as const) {
   );
   assert.equal(
     git(f.checkout, "show", "-s", "--format=%P", result),
-    `${f.baseSha} ${f.taskSha}`,
+    `${f.baseSha} ${f.prs.prs[0].headSha}`,
   );
   assert.equal(
     git(f.checkout, "show", "-s", "--format=%T", result),
@@ -1707,7 +1711,7 @@ for (const strategy of ["squash", "merge"] as const) {
       `--grep=Board-Agent-Item: ${f.card.itemId}`,
       "origin/main",
     ),
-    result,
+    f.prs.prs[0].headSha,
   );
   assert.deepEqual(f.notifications, [
     {
@@ -1820,28 +1824,18 @@ for (const strategy of ["squash", "merge"] as const) {
       "prepared result",
     ),
   };
-  f.store.update(f.card.itemId, (record) => ({
-    ...record,
-    integration: journal,
-  }));
-  const before = JSON.stringify(f.store.read(f.card.itemId));
+  f.store.recordPullRequestPreparation(f.store.read(f.card.itemId)!, { scope: { owner: "test", repo: "repo", base: "main", head: f.record.taskBranch },
+    baseSha: journal.baseSha, taskSha: journal.taskSha, remoteTaskSha: f.taskSha, preparedHeadSha: journal.resultSha }, testOwner(f.checkout), () => {});
+  const before = f.store.read(f.card.itemId)!;
   const openReady = { ...f.card, closed: false, status: cfg.columns.ready };
   f.finalBoard.cards.set(f.card.itemId, openReady);
   const actual = f.make();
-  const launch = await actual.launch(openReady, "demo");
-  assert.equal(launch.status, "skipped");
-  assert.match(
-    launch.status === "skipped" ? launch.reason : "",
-    /pending finalization/,
-  );
-  await actual.reconcile(f.finalBoard.all());
-  await actual.reconcile(f.finalBoard.all());
-  assert.equal(JSON.stringify(f.store.read(f.card.itemId)), before);
-  assert.equal(f.tip(), f.baseSha);
-  f.assertNoAdmissions();
-  console.log(
-    "PASS: reopened Ready tickets cannot erase or resume builders over pending finalization, including repeated reconciliation",
-  );
+  assert.equal((await actual.finalizeClosed(openReady)).status, "skipped");
+  await actual.reconcile(f.finalBoard.all()); await actual.reconcile(f.finalBoard.all());
+  const after = f.store.read(f.card.itemId)!;
+  assert.deepEqual(after, { ...before, integration: { ...before.integration, phase: "suspended" } });
+  assert.equal(f.tip(), f.baseSha); f.assertNoAdmissions();
+  console.log("PASS: reopened Ready suspends prepared approval without erasing sources or manufacturing a builder during observation/reconciliation");
 }
 
 {
@@ -1860,8 +1854,8 @@ for (const strategy of ["squash", "merge"] as const) {
   assert.notEqual(published, f.baseSha);
   assert.equal(f.store.localBranchSha(f.record.taskBranch), f.taskSha);
   assert.equal(existsSync(f.record.path), true);
-  assert.equal(f.tip(f.record.taskBranch), f.taskSha);
-  assert.equal(f.store.read(f.card.itemId)!.integration?.resultSha, published);
+  assert.equal(f.tip(f.record.taskBranch), f.prs.prs[0].headSha);
+  assert.equal((f.store.read(f.card.itemId)!.integration as Extract<import("../src/ticket-worktree.js").TicketPullRequestIntegration, {phase: "merged"}>).mergeCommitSha, published);
   assert.equal(f.store.read(f.card.itemId)!.retry?.stage, "cleanup");
   assert.deepEqual(f.notifications, []);
   rmSync(hook);
@@ -1961,3 +1955,5 @@ for (const strategy of ["squash", "merge"] as const) {
     "PASS: invalid mixed finalization/execution state stays read-only; no inferred builder ownership or automatic migration",
   );
 }
+
+import { testOwner, noPullRequests, fakePullRequests } from "./pr-fixture.js";

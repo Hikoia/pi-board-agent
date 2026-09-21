@@ -56,14 +56,14 @@ function harness(max: number, lanes: Lane[], builders = max + 1) {
   });
   const cards = Array.from({ length: builders }, (_, i) => card(i + 1));
   for (const lane of lanes) cards.push(card(103, { status: cfg.columns.review }));
-  const worktrees = new TicketWorktrees(cwd);
+  const worktrees = new TicketWorktrees(cwd, testOwner(cwd));
   if (lanes.includes("review")) {
     const dir = join(cwd, ".pi", "board-agent", "ticket-worktrees");
     mkdirSync(dir, { recursive: true });
     writeFileSync(
       join(dir, "item_103.json"),
       JSON.stringify({
-        schemaVersion: 4,
+        schemaVersion: 5,
         itemId: "ITEM_103",
         issueNumber: 103,
         taskKey: "T103",
@@ -325,3 +325,5 @@ for (const lane of ["review"] as const) {
     "PASS: reconcile/finalize run before the revision safety gate, without new builder/foreground admissions",
   );
 }
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

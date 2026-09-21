@@ -10,7 +10,7 @@ const { acquireOwnerLock, assertOwnerLock } = await import("../src/owner-lock.js
 try {
   const f = await fixture(true), receipt = await historicalReceipt(f, false, true);
   const bytes = readFileSync(f.receipt), manifest = join(receipt.backup!, "verified.json");
-  const backup = readFileSync(manifest), owner = acquireOwnerLock(f.repo, "bot");
+  const backup = readFileSync(manifest), owner = f.owner;
   const check = () => assertOwnerLock(owner, f.repo);
   try {
     assert.deepEqual((await f.executor.migrateLegacy(owner)).failures, []);

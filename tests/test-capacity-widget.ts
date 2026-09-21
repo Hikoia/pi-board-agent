@@ -1,3 +1,5 @@
+
+const { testOwner, noPullRequests } = await import("./pr-fixture.js");
 // Exercise the actual entry-point widget at a held foreground model boundary.
 import assert from "node:assert/strict";
 import { until } from "./async-loop-fixture.js";
@@ -17,9 +19,9 @@ execFileSync("git", ["-C", cwd, "remote", "add", "origin", "https://github.com/o
 mkdirSync(join(cwd, ".pi"), { recursive: true });
 writeFileSync(join(cwd, ".pi", "board-agent.yml"), `project:\n  owner: owner\n  number: 1\nbot_identity: bot\nmax_workers: 6\nsafety:\n  require_clean_worktree: false\ncontext:\n  enabled: false\nwatchdog:\n  enabled: false\n`);
 const card: Card = { itemId: "ITEM_1", number: 1, contentType: "Issue", type: "Task", status: "Review", plan: "demo", title: "Task", body: "Acceptance", closed: false, assignees: [], repoOwner: "owner", repoName: "repo" };
-const store = new TicketWorktrees(cwd);
+const store = new TicketWorktrees(cwd); // read-only fixture seeding; startup owns acquisition
 writeFileSync(store.recordPath(card.itemId), JSON.stringify({
-  schemaVersion: 4, itemId: card.itemId, issueNumber: 1, taskKey: "issue-1", plan: "demo",
+  schemaVersion: 5, itemId: card.itemId, issueNumber: 1, taskKey: "issue-1", plan: "demo",
   taskBranch: "task/issue-1", baseBranch: "main", path: join(cwd, ".pi", "worktrees", "item_1"), createdAt: 1,
 }));
 const globals = globalThis as any;

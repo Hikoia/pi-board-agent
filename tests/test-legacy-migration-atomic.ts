@@ -31,36 +31,36 @@ try {
   const raw = Buffer.from(JSON.stringify(t.record, null, "\t").replaceAll("\n", "\r\n") + "\r\n\r\n");
   fs.writeFileSync(t.file, raw);
   const backup = join(f.repo, ".pi", "board-agent", "legacy-v3", "atomic.json");
-  let owner = acquireOwnerLock(f.repo, "bot");
+  let owner = f.deps.owner;
   try {
     for (const operation of ["before backup", "after backup", "record flushed", "before publish", "after publish"]) {
       fs.writeFileSync(t.file, raw);
       if (fs.existsSync(backup)) fs.unlinkSync(backup); // fixture-owned reset, never production GC
       cut = (step) => { if (step === operation) throw new Error(`offline cut: ${step}`); };
-      const report = await new LegacyTickets(f.deps).migrate(owner);
+      const report = await new LegacyTickets(f.deps).legacyMigrateV4(owner);
       cut = () => {};
       assert.equal(report.failures.length, 1, JSON.stringify(report));
-      if (operation === "after publish") assert.equal(f.store.read(t.card.itemId)!.schemaVersion, 4);
+      if (operation === "after publish") assert.equal(f.store.legacyRead(t.card.itemId)!.schemaVersion, 4);
       else assert.deepEqual(fs.readFileSync(t.file), raw);
       if (operation === "before backup") assert.equal(fs.existsSync(backup), false);
       else assert.deepEqual(fs.readFileSync(backup), raw);
-      const restarted = await new LegacyTickets(f.deps).migrate(owner);
+      const restarted = await new LegacyTickets(f.deps).legacyMigrateV4(owner);
       assert.equal(restarted.failures.length, 0, JSON.stringify(restarted));
       assert.equal(restarted.converted.length, operation === "after publish" ? 0 : 1);
-      assert.equal(f.store.read(t.card.itemId)!.schemaVersion, 4);
+      assert.equal(f.store.legacyRead(t.card.itemId)!.schemaVersion, 4);
       assert.deepEqual(fs.readFileSync(backup), raw);
     }
     console.log("PASS: backup link, flush and atomic-rename cuts retain exactly v3 or whole v4; exact CRLF/raw create-only backup precedes publication and restart is reentrant");
 
     fs.writeFileSync(t.file, raw);
     fs.writeFileSync(backup, "unknown backup data");
-    const mismatch = await new LegacyTickets(f.deps).migrate(owner);
+    const mismatch = await new LegacyTickets(f.deps).legacyMigrateV4(owner);
     assert.match(mismatch.failures[0].reason, /backup differs/);
     assert.deepEqual(fs.readFileSync(t.file), raw);
     assert.equal(fs.readFileSync(backup, "utf8"), "unknown backup data");
     fs.writeFileSync(backup, raw);
     cut = (step) => { if (step === "record flushed") fs.writeFileSync(t.file, "{externally changed"); };
-    const changed = await new LegacyTickets(f.deps).migrate(owner);
+    const changed = await new LegacyTickets(f.deps).legacyMigrateV4(owner);
     cut = () => {};
     assert.match(changed.failures[0].reason, /atomic write boundary/);
     assert.equal(fs.readFileSync(t.file, "utf8"), "{externally changed");
@@ -72,7 +72,7 @@ try {
       let canMigrate = true;
       cut = (step) => { if (step === "record flushed") { if (stop === "owner lost") owner.release(); else canMigrate = false; } };
       await assert.rejects(
-        new LegacyTickets(f.deps).migrate(owner, () => canMigrate),
+        new LegacyTickets(f.deps).legacyMigrateV4(owner, () => canMigrate),
         /owner\.lock|owner was lost|cancelled/i,
         "owner loss/stop aborts the whole migration, not just one ticket",
       );
@@ -80,10 +80,10 @@ try {
       assert.deepEqual(fs.readFileSync(t.file), raw);
       if (stop === "owner lost") owner = acquireOwnerLock(f.repo, "bot");
     }
-    await new LegacyTickets(f.deps).migrate(owner);
+    await new LegacyTickets(f.deps).legacyMigrateV4(owner);
     const published = fs.readFileSync(t.file);
     fs.writeFileSync(backup, "old evidence unavailable after accepted conversion");
-    const again = await new LegacyTickets(f.deps).migrate(owner);
+    const again = await new LegacyTickets(f.deps).legacyMigrateV4(owner);
     assert.deepEqual(again.converted, []);
     assert.deepEqual(fs.readFileSync(t.file), published);
     console.log("PASS: owner loss and startup-stop races veto atomic conversion; already published v4 never replays a migration even if old backup later becomes unreadable");

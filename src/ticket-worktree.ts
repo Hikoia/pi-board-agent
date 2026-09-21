@@ -146,9 +146,9 @@ export type TicketExecutionRecordV5 = Omit<
   "schemaVersion" | "finalization" | "integration"
 > & { schemaVersion: 5; integration?: TicketIntegrationStateV5 };
 
-/** Explicit during the staged rollout: existing execution APIs remain v3/v4. */
+/** Known legacy sources remain readable, but runtime writes are v5 only. */
 export type StoredTicketExecutionRecord = TicketExecutionRecord | TicketExecutionRecordV5;
-export type TicketWorktreeRecord = TicketExecutionRecord;
+export type TicketWorktreeRecord = StoredTicketExecutionRecord;
 
 /** Existing, verified legacy snapshots only; never a native-remove fallback. */
 export type TicketResidualCleanup<R extends StoredTicketExecutionRecord> = (
@@ -496,7 +496,7 @@ export class TicketWorktrees {
   private readonly worktreesDir: string;
   private readonly cleanupDir: string;
 
-  constructor(cwd: string) {
+  constructor(cwd: string, readonly owner?: OwnerLock) {
     const root = git(
       [
         "rev-parse",
@@ -596,12 +596,12 @@ export class TicketWorktrees {
       });
   }
 
-  read(itemId: string): TicketExecutionRecord | undefined {
+  legacyRead(itemId: string): TicketExecutionRecord | undefined {
     const record = this.load(this.recordPath(itemId))?.record;
     return record?.itemId === itemId ? record : undefined;
   }
 
-  list(): TicketExecutionRecord[] {
+  legacyList(): TicketExecutionRecord[] {
     if (!existsSync(this.recordsDir)) return [];
     return readdirSync(this.recordsDir)
       .filter((name) => name.endsWith(".json"))
@@ -611,12 +611,20 @@ export class TicketWorktrees {
       });
   }
 
+  read(itemId: string): TicketExecutionRecordV5 | undefined {
+    return this.readV5(itemId);
+  }
+
+  list(): TicketExecutionRecordV5[] {
+    return this.listStored().filter((r): r is TicketExecutionRecordV5 => r.schemaVersion === 5);
+  }
+
   has(itemId: string): boolean {
     return !!lstatSync(this.recordPath(itemId), { throwIfNoEntry: false });
   }
 
   /** Publish a new v4 record only. Existing v3 files are never converted here. */
-  create(record: TicketExecutionRecordV4): TicketExecutionRecordV4 {
+  legacyCreate(record: TicketExecutionRecordV4): TicketExecutionRecordV4 {
     if (!isTicketExecutionRecord(record) || record.schemaVersion !== 4)
       throw new Error("Invalid v4 ticket execution record.");
     if (this.hasCleanupReceipt(record.itemId))
@@ -804,13 +812,13 @@ export class TicketWorktrees {
   hasPendingRecovery(itemId: string): boolean {
     if (this.hasCleanupReceipt(itemId)) return true;
     if (!this.has(itemId)) return false;
-    const record = this.read(itemId);
+    const record = this.readStored(itemId);
     if (!record)
       throw new Error("Corrupt or unsupported ticket execution record.");
     return !!(
       record.activeRunId ||
       record.launchingAt !== undefined ||
-      record.finalization ||
+      (record.schemaVersion === 3 && record.finalization) ||
       record.integration ||
       record.retry
     );
@@ -920,7 +928,7 @@ export class TicketWorktrees {
     this.save(next, expectedBytes, assertSource);
   }
 
-  update(
+  legacyUpdate(
     itemId: string,
     mutate: (record: TicketExecutionRecord) => TicketExecutionRecord,
   ): TicketExecutionRecord {
@@ -975,9 +983,10 @@ export class TicketWorktrees {
     return next;
   }
 
-  beginLaunch(itemId: string, launchingAt = Date.now()): TicketExecutionRecord {
-    return this.update(itemId, (record) => {
-      this.assertNoFinalization(record);
+  // Historical-format compatibility only; production admission uses v5 below.
+  legacyBeginLaunch(itemId: string, launchingAt = Date.now()): TicketExecutionRecord {
+    return this.legacyUpdate(itemId, (record) => {
+      this.legacyAssertNoFinalization(record);
       if (record.retry && record.retry.stage !== "build")
         throw new Error(
           `Pending ${record.retry.stage} retry cannot start a builder.`,
@@ -994,13 +1003,13 @@ export class TicketWorktrees {
     });
   }
 
-  setActiveRun(
+  legacySetActiveRun(
     itemId: string,
     runId: string,
     startedAt = Date.now(),
   ): TicketExecutionRecord {
-    return this.update(itemId, (record) => {
-      this.assertNoFinalization(record);
+    return this.legacyUpdate(itemId, (record) => {
+      this.legacyAssertNoFinalization(record);
       return {
         ...record,
         launchingAt: undefined,
@@ -1011,8 +1020,8 @@ export class TicketWorktrees {
   }
 
   /** Call only after drain/release. Retry writeback and integration survive. */
-  clearExecution(itemId: string, lastRunId?: string): TicketExecutionRecord {
-    return this.update(itemId, (record) => ({
+  legacyClearExecution(itemId: string, lastRunId?: string): TicketExecutionRecord {
+    return this.legacyUpdate(itemId, (record) => ({
       ...record,
       launchingAt: undefined,
       activeRunId: undefined,
@@ -1021,7 +1030,92 @@ export class TicketWorktrees {
     }));
   }
 
-  setReviewedTaskSha(itemId: string, taskSha: string): TicketExecutionRecord {
+  legacySetReviewedTaskSha(itemId: string, taskSha: string): TicketExecutionRecord {
+    if (!SHA.test(taskSha))
+      throw new Error(`Invalid reviewed task SHA: ${taskSha}`);
+    return this.legacyUpdate(itemId, (record) => {
+      this.legacyAssertNoFinalization(record);
+      if (record.activeRunId || record.launchingAt !== undefined)
+        throw new Error(
+          "Cannot record a review while builder execution is active.",
+        );
+      return { ...record, reviewedTaskSha: taskSha };
+    });
+  }
+
+  private legacyAssertNoFinalization(record: TicketExecutionRecord): void {
+    if (
+      record.finalization ||
+      record.integration ||
+      this.hasCleanupReceipt(record.itemId)
+    )
+      throw new Error(
+        "Ticket has a pending finalization; recover it before starting another builder or review.",
+      );
+  }
+
+  /** Runtime writes always require a live owner, including after atomic flush. */
+  update(
+    itemId: string,
+    mutate: (record: TicketExecutionRecordV5) => TicketExecutionRecordV5,
+    owner = this.owner,
+    assertCurrent: () => void = () => {},
+  ): TicketExecutionRecordV5 {
+    const record = this.read(itemId);
+    if (!record) throw new Error(`Ticket execution record is missing or unsupported: ${itemId}`);
+    if (!owner) throw new Error("V5 execution requires the exclusive owner.");
+    return this.updateV5(record, mutate, owner, assertCurrent);
+  }
+
+  beginLaunch(itemId: string, launchingAt = Date.now(), owner = this.owner, assertCurrent: () => void = () => {}): TicketExecutionRecordV5 {
+    return this.update(itemId, (record) => {
+      this.assertNoFinalization(record);
+      if (record.retry && record.retry.stage !== "build")
+        throw new Error(
+          `Pending ${record.retry.stage} retry cannot start a builder.`,
+        );
+      if (record.activeRunId || record.launchingAt !== undefined)
+        throw new Error("Ticket already has an active builder execution.");
+      return {
+        ...record,
+        launchingAt,
+        activeRunId: undefined,
+        activeRunStartedAt: undefined,
+        reviewedTaskSha: undefined,
+      };
+    }, owner, assertCurrent);
+  }
+
+  setActiveRun(
+    itemId: string,
+    runId: string,
+    startedAt = Date.now(),
+    owner = this.owner,
+    assertCurrent: () => void = () => {},
+  ): TicketExecutionRecordV5 {
+    return this.update(itemId, (record) => {
+      this.assertNoFinalization(record);
+      return {
+        ...record,
+        launchingAt: undefined,
+        activeRunId: runId,
+        activeRunStartedAt: startedAt,
+      };
+    }, owner, assertCurrent);
+  }
+
+  /** Call only after drain/release. Retry writeback and integration survive. */
+  clearExecution(itemId: string, lastRunId?: string, owner = this.owner, assertCurrent: () => void = () => {}): TicketExecutionRecordV5 {
+    return this.update(itemId, (record) => ({
+      ...record,
+      launchingAt: undefined,
+      activeRunId: undefined,
+      activeRunStartedAt: undefined,
+      lastRunId: lastRunId ?? record.lastRunId,
+    }), owner, assertCurrent);
+  }
+
+  setReviewedTaskSha(itemId: string, taskSha: string, owner = this.owner, assertCurrent: () => void = () => {}): TicketExecutionRecordV5 {
     if (!SHA.test(taskSha))
       throw new Error(`Invalid reviewed task SHA: ${taskSha}`);
     return this.update(itemId, (record) => {
@@ -1031,13 +1125,12 @@ export class TicketWorktrees {
           "Cannot record a review while builder execution is active.",
         );
       return { ...record, reviewedTaskSha: taskSha };
-    });
+    }, owner, assertCurrent);
   }
 
-  private assertNoFinalization(record: TicketExecutionRecord): void {
+  assertNoFinalization(record: TicketExecutionRecordV5): void {
     if (
-      record.finalization ||
-      record.integration ||
+      (record.integration && !(record.integration.kind === "pr" && record.integration.phase === "suspended")) ||
       this.hasCleanupReceipt(record.itemId)
     )
       throw new Error(
@@ -1216,7 +1309,14 @@ export class TicketWorktrees {
   async ensure(
     task: BuilderTask,
     plan?: string,
-  ): Promise<TicketExecutionRecord> {
+    owner = this.owner,
+    assertCurrent: () => Promise<void> = async () => {},
+    control?: OperationControl,
+  ): Promise<TicketExecutionRecordV5> {
+    if (!owner) throw new Error("V5 execution requires the exclusive owner.");
+    const localGuard = this.v5Guard(owner, () => checkOperation(control));
+    const guard = async () => { localGuard(); await assertCurrent(); localGuard(); };
+    await guard();
     if (this.hasCleanupReceipt(task.itemId))
       throw new Error(
         "Ticket has a pending cleanup receipt; recover finalization first.",
@@ -1243,7 +1343,7 @@ export class TicketWorktrees {
       return saved;
     }
 
-    const branchOwner = this.list().find(
+    const branchOwner = this.listStored().find(
       (record) => record.taskBranch === task.taskBranch,
     );
     if (branchOwner)
@@ -1255,6 +1355,7 @@ export class TicketWorktrees {
     if (task.baseBranch === task.taskBranch)
       throw new Error("Task branch must differ from the base branch.");
     await this.fetchRequired(task.baseBranch);
+    await guard();
     if (this.registeredPathForBranch(task.taskBranch))
       throw new Error(
         `${task.taskBranch} is already checked out without a ticket record.`,
@@ -1267,11 +1368,24 @@ export class TicketWorktrees {
         `${task.taskBranch} already exists without a ticket record.`,
       );
 
+    await guard();
     const path = this.pathFor(task.itemId, task.issueNumber);
     if (!this.isManagedPath(path))
       throw new Error(`Refusing unmanaged worktree path: ${path}`);
     if (existsSync(path))
       throw new Error(`Worktree path exists but is not registered: ${path}`);
+    const record: TicketExecutionRecordV5 = {
+      schemaVersion: 5, itemId: task.itemId, issueNumber: task.issueNumber,
+      taskKey: task.taskKey, plan, taskBranch: task.taskBranch,
+      baseBranch: task.baseBranch, path, createdAt: Date.now(),
+    };
+    await guard();
+    this.createV5(record, owner, localGuard);
+    await guard();
+    const created = this.read(task.itemId);
+    if (!created || !sameRecord(created, record)) throw new TicketStateChangedError("Execution changed before worktree creation.");
+    if (!this.isManagedPath(path) || existsSync(path)) throw new Error("Worktree path changed before creation; record retained.");
+    localGuard();
     mkdirSync(dirname(path), { recursive: true });
     await mustGitAsync(
       [
@@ -1285,18 +1399,9 @@ export class TicketWorktrees {
       this.repoRoot,
     );
 
-    const record: TicketExecutionRecord = {
-      schemaVersion: 4,
-      itemId: task.itemId,
-      issueNumber: task.issueNumber,
-      taskKey: task.taskKey,
-      plan,
-      taskBranch: task.taskBranch,
-      baseBranch: task.baseBranch,
-      path,
-      createdAt: Date.now(),
-    };
-    this.save(record);
+    await guard();
+    const ensured = this.read(task.itemId);
+    if (!ensured || !sameRecord(ensured, record)) throw new TicketStateChangedError("Execution changed during worktree creation.");
     return record;
   }
 
@@ -1488,13 +1593,32 @@ export class TicketWorktrees {
     return remote;
   }
 
+  /** Fetch an exact observed PR head even when a human deleted the branch. */
+  async verifyPullRequestSources(
+    record: TicketExecutionRecordV5,
+    observed: PullRequestInfo,
+    guard: () => Promise<void>,
+    includeCurrent = true,
+  ): Promise<void> {
+    const integration = record.integration;
+    if (integration?.kind !== "pr") throw new Error("Missing managed PR sources.");
+    await this.ensurePullRequestHead({ prNumber: observed.number, mergedHeadSha: observed.headSha }, guard);
+    const local = includeCurrent ? this.localBranchSha(record.taskBranch) : undefined;
+    const remote = includeCurrent ? await this.observeTaskTip(record.taskBranch, guard) : undefined;
+    await guard();
+    if (includeCurrent && this.localBranchSha(record.taskBranch) !== local)
+      throw new Error("Local task changed during PR observation; work retained.");
+    this.assertHeadCovers(observed.headSha, [integration.preparedHeadSha,
+      integration.taskSha, integration.remoteTaskSha, local, remote]);
+  }
+
   private async ensurePullRequestHead(
-    integration: TicketPullRequestIntegration & { phase: "merged" },
+    integration: { prNumber: number; mergedHeadSha: string },
     guard: () => Promise<void>,
   ): Promise<void> {
     const object = git(["cat-file", "-t", integration.mergedHeadSha], this.repoRoot);
     if (object.ok) {
-      if (object.stdout.trim() !== "commit") throw new Error("Merged PR head is not a commit.");
+      if (object.stdout.trim() !== "commit") throw new Error("PR head is not a commit.");
       return;
     }
     if (object.timedOut || object.status !== 128) throw processFailure("git", ["cat-file"], object);
@@ -1502,238 +1626,7 @@ export class TicketWorktrees {
     await mustGitAsync(["fetch", "--no-auto-maintenance", "--no-tags", "origin", `refs/pull/${integration.prNumber}/head`], this.repoRoot);
     await guard();
     if (mustGit(["rev-parse", "--verify", "FETCH_HEAD^{commit}"], this.repoRoot) !== integration.mergedHeadSha)
-      throw new Error("Fetched PR head differs from observed merged head; work retained.");
-  }
-
-  /** Keep the prepared result through every I/O failure. Its presence is never
-   * push evidence. Human closure approves both sources without a review marker.
-   * The caller confirms Backlog and deletes the record last. */
-  async finalizeAccepted(
-    task: BuilderTask,
-    _strategy: "merge" | "squash", // legacy config is merge-only here
-    assertCurrent: () => Promise<void> = async () => {},
-    legacyResidual?: TicketResidualCleanup<TicketExecutionRecord>,
-    _legacyApproval?: (record: TicketExecutionRecord) => string | undefined,
-    control?: OperationControl,
-  ): Promise<string | undefined> {
-    checkOperation(control);
-    control?.onProgress?.({ phase: "integrate" });
-    const current = assertCurrent;
-    assertCurrent = async () => { checkOperation(control); await current(); checkOperation(control); };
-    this.validateBranches(task.baseBranch, task.taskBranch);
-    if (task.baseBranch === task.taskBranch)
-      throw new Error("Task branch must differ from the base branch.");
-    let record = this.cleanupRecord(task, false);
-    let local = this.localBranchSha(task.taskBranch);
-    const remote = await this.remoteSha(task.taskBranch);
-    await assertCurrent();
-    if (!local && !remote && !record?.integration) {
-      if (this.hasPendingRecovery(task.itemId))
-        throw new Error("Pending recovery has no task refs; work retained.");
-      return undefined; // Historical completion must not touch leftover paths or idle records.
-    }
-    record = this.cleanupRecord(task);
-    if (!record?.integration) {
-      await this.fetchRequired(
-        task.baseBranch,
-        ...(remote ? [task.taskBranch] : []),
-      );
-      await assertCurrent();
-      if (
-        this.localBranchSha(task.taskBranch) !== local ||
-        (remote && this.fetchedSha(task.taskBranch) !== remote) ||
-        (await this.remoteSha(task.taskBranch)) !== remote
-      )
-        throw new Error("Task sources changed during fetch; work retained.");
-      if (!local && remote) {
-        await assertCurrent();
-        await mustGitAsync(
-          [
-            "update-ref",
-            "--no-deref",
-            `refs/heads/${task.taskBranch}`,
-            remote,
-            "0".repeat(40),
-          ],
-          this.repoRoot,
-        );
-        local = remote; // Restore only the missing ref, never a builder or worktree.
-      }
-    }
-    if (!record) {
-      await assertCurrent();
-      record = this.create({
-        schemaVersion: 4,
-        itemId: task.itemId,
-        issueNumber: task.issueNumber,
-        taskKey: task.taskKey,
-        taskBranch: task.taskBranch,
-        baseBranch: task.baseBranch,
-        path: this.pathFor(task.itemId, task.issueNumber),
-        createdAt: Date.now(),
-      });
-    }
-    if (record.schemaVersion !== 4)
-      throw new Error("Legacy conversion is required before finalization.");
-    if (this.hasCleanupReceipt(task.itemId) && !record.integration)
-      throw new Error(
-        "Legacy cleanup receipt requires validated conversion before integration.",
-      );
-    const sourceLocal = record.integration?.taskSha ?? local!;
-    const sourceRemote = record.integration
-      ? record.integration.remoteTaskSha === undefined
-        ? record.integration.taskSha
-        : record.integration.remoteTaskSha
-      : (remote ?? null);
-    if (record.retry?.stage === "build")
-      throw new Error(
-        "Build retry must finish before renewed manual close approval.",
-      );
-    const localGuard = () => {
-      checkOperation(control);
-      this.assertFinalizationRecord(task, record!);
-      checkOperation(control);
-    };
-    const guard = async () => {
-      await assertCurrent();
-      localGuard();
-    };
-    const observe = async () => {
-      await this.fetchRequired(task.baseBranch);
-      await guard();
-      return this.fetchedSha(task.baseBranch);
-    };
-    const save = (patch: Partial<TicketExecutionRecord>) => {
-      localGuard();
-      record = this.update(task.itemId, (r) => ({ ...r, ...patch }));
-    };
-    const taskPresent = async () => {
-      if (!sourceLocal || this.localBranchSha(task.taskBranch) !== sourceLocal)
-        throw new Error("Approved local task tip changed; work retained.");
-      if (((await this.remoteSha(task.taskBranch)) ?? null) !== sourceRemote)
-        throw new Error(
-          "Remote task SHA differs from the approved source; work retained.",
-        );
-      await guard();
-      if (this.localBranchSha(task.taskBranch) !== sourceLocal)
-        throw new Error("Approved local task tip changed; work retained.");
-      return sourceLocal;
-    };
-    const prepare = async (
-      baseSha: string,
-      taskSha: string,
-    ): Promise<TicketIntegrationState> => {
-      const integration = await this.prepareIntegration(task, baseSha, taskSha, sourceRemote, guard);
-      if ((await taskPresent()) !== taskSha)
-        throw new Error(
-          "Approved task changed during integration preparation.",
-        );
-      return integration;
-    };
-    const preparedRetry = {
-      stage: "integrate" as const,
-      reason: "Prepared result; observe origin/base before push or cleanup.",
-    };
-    let baseSha = await observe();
-    if (!record.integration) {
-      const taskSha = await taskPresent();
-      save({
-        integration: await prepare(baseSha, taskSha),
-        retry: preparedRetry,
-      });
-    }
-    let integration = record.integration!;
-    baseSha = await observe(); // also before retrying a recorded/ambiguous push
-    if (!this.isAncestor(integration.resultSha, baseSha)) {
-      if (
-        record.retry?.stage === "cleanup" ||
-        this.hasCleanupReceipt(task.itemId)
-      )
-        throw new Error(
-          "Previously confirmed/receipted result is absent from fresh origin/base; cleanup-only retry retained.",
-        );
-      await taskPresent();
-      if (baseSha !== integration.baseSha) {
-        if (!this.isAncestor(integration.baseSha, baseSha))
-          throw new Error(
-            "Remote base history was rewritten; prepared integration retained.",
-          );
-        // A rejected push retries Git, not the successful builder. Only this
-        // checked path may replace progress; ordinary update() stays immutable.
-        const supersede = async (patch: Partial<TicketExecutionRecord>) => {
-          await taskPresent();
-          if ((await observe()) !== baseSha)
-            throw new Error(
-              "Remote base changed during preparation; previous integration retained for observation.",
-            );
-          const previous = record!;
-          const check = () => {
-            this.assertFinalizationRecord(task, previous);
-            if (
-              previous.retry?.stage === "cleanup" ||
-              this.hasCleanupReceipt(task.itemId)
-            )
-              throw new Error(
-                "Confirmed/receipted cleanup cannot be superseded.",
-              );
-          };
-          check();
-          const loaded = this.load(this.recordPath(task.itemId))!;
-          const next = { ...previous, ...patch };
-          this.save(next, loaded.bytes, check);
-          record = next;
-        };
-        let replacement: TicketIntegrationState;
-        try {
-          replacement = await prepare(baseSha, integration.taskSha);
-        } catch (error) {
-          if (!(error instanceof MergeConflictError) || !error.repairable)
-            throw error;
-          const reason = `Merge conflict with base ${baseSha}: merge into original task ${integration.taskSha}, resolve, test, push, review, and obtain renewed manual close approval.\n\n${error.diagnostic}`;
-          await supersede({
-            integration: undefined,
-            reviewedTaskSha: undefined,
-            retry: { stage: "build", reason },
-          });
-          throw error;
-        }
-        await supersede({ integration: replacement, retry: preparedRetry });
-        integration = replacement;
-      }
-      await guard();
-      if (!this.isAncestor(integration.resultSha, baseSha))
-        await mustGitAsync(
-          [
-            "push",
-            "origin",
-            `${integration.resultSha}:refs/heads/${task.baseBranch}`,
-          ],
-          this.repoRoot,
-        );
-    }
-    baseSha = await observe();
-    if (!this.isAncestor(integration.resultSha, baseSha))
-      throw new Error(
-        `Pushed result ${integration.resultSha} is not on origin/${task.baseBranch}.`,
-      );
-    save({
-      retry: {
-        stage: "cleanup",
-        reason: "Result confirmed on fresh origin/base; cleanup only.",
-      },
-    });
-
-    control?.onProgress?.({ phase: "remove" });
-    const cleanupGuard = async () => {
-      const base = await observe();
-      if (!this.isAncestor(integration.resultSha, base))
-        throw new Error(
-          "Integrated result is no longer on fresh origin/base; cleanup retained.",
-        );
-    };
-    await this.removeTaskArtifacts(task, record, integration.taskSha, sourceRemote,
-      cleanupGuard, localGuard, legacyResidual, control);
-    return integration.resultSha;
+      throw new Error("Fetched PR head differs from observed head; work retained.");
   }
 
   /** Remote lease -> native worktree removal -> local compare/delete. Never

@@ -45,16 +45,16 @@ try {
       type: "Task",
       status: cfg.columns.review,
     };
-    const worktrees = new TicketWorktrees(cwd);
+    const worktrees = new TicketWorktrees(cwd, testOwner(cwd));
     if (mode === "review") {
       const dir = join(cwd, ".pi", "board-agent", "ticket-worktrees");
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, "pvti_3.json"), JSON.stringify({
-        schemaVersion: 4, itemId: card.itemId, issueNumber: 3, taskKey: "T003", plan: "demo",
+        schemaVersion: 5, itemId: card.itemId, issueNumber: 3, taskKey: "T003", plan: "demo",
         taskBranch: "task/issue-3", baseBranch: "main", path: join(cwd, ".pi", "worktrees", "pvti_3"), createdAt: 1,
       }));
     }
-    const owner = acquireOwnerLock(cwd, "bot");
+    const owner = testOwner(cwd);
     const entered = deferred(), cleanup = deferred(), finish = deferred();
     let received: AbortSignal | undefined;
     let cleanups = 0, calls = 0, releases = 0, mutations = 0, drains = 0;
@@ -133,3 +133,5 @@ try {
 } finally {
   WorkflowAgent.prototype.run = original;
 }
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

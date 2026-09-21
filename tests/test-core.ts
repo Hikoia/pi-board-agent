@@ -673,7 +673,7 @@ const live = [
   card(42, { status: "Review" }),
   card(43, { status: "Review" }),
 ];
-const worktrees = new TicketWorktrees(repo);
+const worktrees = new TicketWorktrees(repo, testOwner(repo));
 for (const c of live.slice(3))
   await worktrees.ensure(
     buildTasksForWave(cfg, "001-auth", [c])[0],
@@ -815,3 +815,5 @@ check(
   "persistent widget separates occupied slots from running models and includes every foreground lane",
 );
 assert.equal(process.exitCode ?? 0, 0, "core regressions failed");
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

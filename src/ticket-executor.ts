@@ -12,7 +12,7 @@ import {
   isRepairRequest,
   type LegacyMigrationReport,
 } from "./legacy-tickets.js";
-import type { OwnerLock } from "./owner-lock.js";
+import { assertOwnerLock, type OwnerLock } from "./owner-lock.js";
 import { checkOperation, type OperationControl } from "./operation.js";
 import type { Config } from "./config.js";
 import { planSlug } from "./config.js";
@@ -31,6 +31,11 @@ import {
 } from "./ticket-retry.js";
 import {
   createComment,
+  findPullRequests,
+  createPullRequest,
+  getPullRequest,
+  type PullRequestInfo,
+  type PullRequestScope,
   getCard,
   isTargetIssue,
   listIssueComments,
@@ -47,7 +52,10 @@ import {
   MergeConflictError,
   TicketStateChangedError,
   TicketWorktrees,
-  type TicketExecutionRecord,
+  type TicketExecutionRecordV5 as TicketExecutionRecord,
+  type StoredTicketExecutionRecord,
+  type TicketPullRequestIntegration,
+  isTicketIntegrationStateV5,
   type TicketWorktreeRecord,
 } from "./ticket-worktree.js";
 import { buildTasksForWave, renderWorkflowSource } from "./workflow-prompt.js";
@@ -82,6 +90,7 @@ export type LaunchResult =
 export type FinalizeOutcome =
   | { status: "finalized"; resultSha: string }
   | { status: "backlogged" }
+  | { status: "waiting"; prNumber: number; prUrl: string; reason: string }
   | { status: "conflict"; baseSha: string; taskSha: string; reason: string }
   | { status: "skipped" | "blocked"; reason: string };
 
@@ -175,6 +184,12 @@ export interface TicketExecutorDeps {
   board: TicketBoardAdapter;
   callback: ExecutorStatusCallback;
   worktrees: TicketWorktrees;
+  owner: OwnerLock;
+  pullRequests: {
+    findPullRequests: typeof findPullRequests;
+    createPullRequest: typeof createPullRequest;
+    getPullRequest: typeof getPullRequest;
+  };
   createManager(worktree: string): TicketWorkflowManager;
   context?(record: TicketExecutionRecord): Promise<string | undefined>;
 }
@@ -367,16 +382,39 @@ export class ManagedTicketExecutor implements TicketExecutor {
   };
 
   private readonly conflicts: LegacyTickets;
+  private readonly busy = new Set<string>();
   constructor(private readonly deps: TicketExecutorDeps) {
+    if (!deps.owner) throw new Error("Explicit owner injection is required.");
+    if (!["findPullRequests", "createPullRequest", "getPullRequest"].every(
+      (key) => typeof deps.pullRequests?.[key as keyof TicketExecutorDeps["pullRequests"]] === "function"))
+      throw new Error("Explicit pullRequests injection is required; no implicit GitHub fallback.");
     this.conflicts = new LegacyTickets(deps);
   }
 
   migrateLegacy(owner: OwnerLock, canMigrate?: () => boolean, control?: OperationControl) {
-    return this.conflicts.migrate(owner, canMigrate, control);
+    return this.conflicts.migrateV5(owner, canMigrate, control);
   }
 
   legacyBlocked(itemId: string): string | undefined {
     return this.conflicts.blockedReason(itemId);
+  }
+
+  private assertWritable = () => {
+    if (this.stopping) throw new FinalizationWithdrawn("Executor stopping; work retained.");
+    assertOwnerLock(this.deps.owner, this.deps.worktrees.repoRoot);
+  };
+
+  private queue(record: TicketExecutionRecord, stage: Parameters<typeof queueTicketWrite>[2], write: Parameters<typeof queueTicketWrite>[3]) {
+    return queueTicketWrite(this.deps.worktrees, record, stage, write, this.deps.owner, this.assertWritable);
+  }
+
+  private update(record: TicketExecutionRecord, mutate: (r: TicketExecutionRecord) => TicketExecutionRecord) {
+    return this.deps.worktrees.updateV5(record, mutate, this.deps.owner, this.assertWritable);
+  }
+
+  private clear(record: TicketExecutionRecord, lastRunId = record.lastRunId) {
+    return this.update(record, (r) => ({ ...r, activeRunId: undefined,
+      activeRunStartedAt: undefined, launchingAt: undefined, lastRunId }));
   }
 
   private manager(path: string): TicketWorkflowManager {
@@ -397,7 +435,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
   ): Promise<(() => boolean) | undefined> {
     try {
       const revision = this.resumeRevision;
-      const record = this.deps.worktrees
+      let record = this.deps.worktrees
         .list()
         .find((r) => r.path === path && r.activeRunId === runId);
       if (
@@ -407,6 +445,9 @@ export class ManagedTicketExecutor implements TicketExecutor {
         !(await this.canResume())
       )
         return undefined;
+      record = await this.observeWithdrawn(record);
+      if (record.integration?.kind === "pr" && record.integration.phase === "merged") return undefined;
+      this.assertWritable();
       const card = await this.deps.board.getCard(record.itemId);
       if (
         !card ||
@@ -417,6 +458,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
       const canNow = () => {
         try {
           return (
+            (this.assertWritable(), true) &&
+            !this.busy.has(record!.itemId) &&
             !this.stopping &&
             revision === this.resumeRevision &&
             this.canResumeNow() &&
@@ -477,6 +520,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         "Original workflow is missing/mismatched; retained before drain.",
       );
     await manager.stopAndWait(run.runId);
+    this.assertWritable();
     if (
       JSON.stringify(this.deps.worktrees.read(record.itemId)) !==
       JSON.stringify(record)
@@ -497,8 +541,10 @@ export class ManagedTicketExecutor implements TicketExecutor {
       },
       { ...control, check: () => {
         checkOperation(control);
+        assertOwnerLock(this.deps.owner, this.deps.worktrees.repoRoot);
         if (this.stopping && !releaseOnly) throw new Error("Executor stopping; pending writeback retained.");
       } },
+      this.deps.owner,
     );
   }
 
@@ -523,8 +569,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
           ]
             .filter(Boolean)
             .join("\n\n");
-    record = queueTicketWrite(
-      this.deps.worktrees,
+    record = this.queue(
       record,
       success ? "review" : "build",
       {
@@ -554,6 +599,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     await this.stopActiveRun(record);
     // Drain yields: release only a freshly matching Issue, never a replacement.
     const fresh = await this.deps.board.getCard(record.itemId);
+    this.assertWritable();
     if (
       JSON.stringify(this.deps.worktrees.read(record.itemId)) !==
       JSON.stringify(record)
@@ -574,7 +620,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
       JSON.stringify(record)
     )
       throw new Error("Execution record changed while releasing.");
-    this.deps.worktrees.clearExecution(record.itemId, record.activeRunId);
+    this.clear(record, record.activeRunId);
     this.deps.callback(
       `Stopped stale execution ${record.itemId}; preserved manual status ${card.status ?? "unknown"}.`,
       "warn",
@@ -586,6 +632,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
     card: Card,
     summary: ReconcileSummary,
   ): Promise<void> {
+    record = await this.observeWithdrawn(record);
+    if (record.integration?.kind === "pr" && record.integration.phase === "merged") return;
     const manager = this.manager(record.path);
     if (
       !this.ownsExecutionCard(record, card) ||
@@ -667,7 +715,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     summary: ReconcileSummary,
   ): Promise<void> {
     if (!record.activeRunId) {
-      const observed = this.conflicts.observeLaunch(record);
+      const observed = this.conflicts.observeLaunchV5(record, this.deps.owner, this.assertWritable);
       if (!observed) {
         this.deps.callback(
           `Retained uncertain launch for withdrawn ticket ${record.itemId}; re-observing.`,
@@ -679,7 +727,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
       summary.adopted++;
     }
     await this.stopActiveRun(record);
-    this.deps.worktrees.clearExecution(record.itemId, record.activeRunId);
+    this.clear(record, record.activeRunId);
     summary.orphans++;
     this.deps.callback(
       `Stopped orphaned ticket run ${record.activeRunId ?? record.itemId}; its Project item is gone or no longer matches the ticket and worktree was preserved.`,
@@ -729,7 +777,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
 
     for (const original of records) {
       if (this.stopping) break;
-      if (original.itemId === excludedItemId || this.legacyBlocked(original.itemId)) continue;
+      if (original.itemId === excludedItemId || this.busy.has(original.itemId) || this.legacyBlocked(original.itemId)) continue;
       const snapshot = cardsById.get(original.itemId);
       try {
         // Pure maintenance owns its fresh reads/writeback in the finalizer, not
@@ -737,7 +785,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         const pending = pendingTicketWrite(original);
         const maintenance = pending
           ? pending.card.closed && ["integrate", "cleanup"].includes(original.retry!.stage)
-          : original.finalization || original.integration ||
+          : original.integration && !(original.integration.kind === "pr" && original.integration.phase === "suspended") ||
             (snapshot?.closed && statusIs(snapshot, this.deps.cfg.columns.done)) ||
             ["integrate", "cleanup"].includes(original.retry?.stage ?? "") ||
             this.deps.worktrees.hasCleanupReceipt(original.itemId);
@@ -800,8 +848,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         // Mixed execution/finalization files are unsupported, never migrated here.
         if (
           !pendingTicketWrite(original) &&
-          (original.finalization ||
-            original.integration ||
+          ((original.integration && !(original.integration.kind === "pr" && original.integration.phase === "suspended")) ||
             this.deps.worktrees.hasCleanupReceipt(original.itemId))
         )
           continue;
@@ -815,7 +862,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
           await this.reconcileActive(record, card, summary);
         else if (record.launchingAt !== undefined) {
           // Strict persisted matching: absence/ambiguity cannot authorize a new builder.
-          record = this.conflicts.observeLaunch(record);
+          record = this.conflicts.observeLaunchV5(record, this.deps.owner, this.assertWritable);
           if (record) {
             summary.adopted++;
             await this.reconcileActive(record, card, summary);
@@ -919,8 +966,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     if (record && pendingTicketWrite(record))
       return "ticket writeback is pending";
     if (
-      record?.finalization ||
-      record?.integration ||
+      (record?.integration && !(record.integration.kind === "pr" && record.integration.phase === "suspended")) ||
       (record?.retry && record.retry.stage !== "build") ||
       this.deps.worktrees.hasCleanupReceipt(card.itemId)
     )
@@ -946,13 +992,24 @@ export class ManagedTicketExecutor implements TicketExecutor {
       // This checkpoint is before start(), so its failure is an I/O settlement,
       // not an uncertain invocation. Persist that fact before yielding control.
       if (record && !record.activeRunId)
-        queueTicketWrite(this.deps.worktrees, record, "build", {
+        this.queue(record, "build", {
           card: expected,
           status: this.deps.cfg.columns.ready,
           retry: true,
           reason: `Launch observation failed: ${String(error)}`,
         });
       throw error;
+    }
+    assertOwnerLock(this.deps.owner, this.deps.worktrees.repoRoot);
+    if (this.stopping) {
+      // Before start() there is no uncertain invocation. Retain only local
+      // settlement intent; stop forbids the remote reset/release until recovery.
+      if (record && !record.activeRunId)
+        queueTicketWrite(this.deps.worktrees, record, "build", {
+          card: expected, status: this.deps.cfg.columns.ready, retry: true,
+          reason: record.retry?.reason ?? "builder admissions stopped",
+        }, this.deps.owner, () => assertOwnerLock(this.deps.owner, this.deps.worktrees.repoRoot));
+      throw new FinalizationWithdrawn("Executor stopping; unstarted work retained.");
     }
     // Never settle a replaced/unreadable local association from the old record.
     // JSON persistence omits optional undefined fields on both sides.
@@ -990,7 +1047,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
         await this.deps.board.release(card);
       } catch (error) {
         if (record && !record.activeRunId)
-          queueTicketWrite(this.deps.worktrees, record, "build", {
+          this.queue(record, "build", {
             card: expected,
             status: this.deps.cfg.columns.ready,
             retry: true,
@@ -1001,7 +1058,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     }
     // Failed ensure may have left partial/unreadable recovery artifacts. It
     // supplied no verified record, so even confirmed staleness cannot clear it.
-    if (record) this.deps.worktrees.clearExecution(record.itemId);
+    if (record) this.clear(record);
     this.deps.callback(
       `Skipped stale launch for #${issueNumber}; preserved card status and worktree.` +
         (sameTarget
@@ -1026,7 +1083,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
       return { status: "skipped", reason: "card changed before builder start" };
     // Only before start() is invoked. Admission withdrawal is not a failure.
     if (reason === "builder admissions stopped") {
-      const pending = queueTicketWrite(this.deps.worktrees, record, "build", {
+      const pending = this.queue(record, "build", {
         card,
         status: this.deps.cfg.columns.ready,
         retry: true,
@@ -1044,7 +1101,19 @@ export class ManagedTicketExecutor implements TicketExecutor {
     return { status: "skipped", reason };
   }
 
-  async launch(
+  async launch(snapshot: Card, expectedPlan: string | undefined,
+    canStartWork: () => boolean | Promise<boolean> = () => true,
+    canStartWorkNow: () => boolean = () => true): Promise<LaunchResult> {
+    if (this.busy.has(snapshot.itemId)) return { status: "skipped", reason: "Ticket operation already active." };
+    this.busy.add(snapshot.itemId);
+    try { return await this.launchTicket(snapshot, expectedPlan, canStartWork, canStartWorkNow); }
+    catch (error) {
+      if (error instanceof FinalizationWithdrawn) return { status: "skipped", reason: error.message };
+      throw error;
+    } finally { this.busy.delete(snapshot.itemId); }
+  }
+
+  private async launchTicket(
     snapshot: Card,
     expectedPlan: string | undefined,
     canStartWork: () => boolean | Promise<boolean> = () => true,
@@ -1094,12 +1163,31 @@ export class ManagedTicketExecutor implements TicketExecutor {
         return { status: "skipped", reason: "ticket contract changed" };
       card = fresh;
     }
+    this.assertWritable();
+    if (card.closed || !statusIs(card, this.deps.cfg.columns.ready))
+      return { status: "skipped", reason: "builder requires open Ready" };
+    let retained = this.deps.worktrees.read(card.itemId);
+    if (retained?.integration?.kind === "pr" && retained.integration.phase !== "merged") {
+      if (retained.integration.phase !== "suspended") {
+        // Reopening suspends approval before any builder admission. No sources are replaced.
+        retained = this.rememberPr(retained, undefined, true);
+      }
+      await this.observeWithdrawn(retained);
+      const fresh = await this.deps.board.getCard(card.itemId);
+      this.assertWritable();
+      if (!fresh || !sameTicketContract(fresh, card) || fresh.closed !== card.closed || fresh.status !== card.status)
+        return { status: "skipped", reason: "approval changed before builder claim" };
+      card = fresh;
+    }
     const preClaim = this.eligible(card, expectedPlan);
     if (preClaim) return { status: "skipped", reason: preClaim };
 
+    this.assertWritable();
     if (!(await this.deps.board.claim(card)))
       return { status: "skipped", reason: "claim lost" };
+    this.assertWritable();
     card = await this.deps.board.getCard(snapshot.itemId);
+    this.assertWritable();
     if (
       !card ||
       !isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task") ||
@@ -1125,8 +1213,15 @@ export class ManagedTicketExecutor implements TicketExecutor {
 
     let record: TicketExecutionRecord;
     try {
-      record = await this.deps.worktrees.ensure(task, expectedPlan);
-      if (record.schemaVersion !== 4)
+      record = await this.deps.worktrees.ensure(task, expectedPlan, this.deps.owner, async () => {
+        this.assertWritable();
+        const fresh = await this.deps.board.getCard(card!.itemId);
+        this.assertWritable();
+        if (!fresh || !sameTicketContract(fresh, card!) || fresh.closed || fresh.status !== card!.status ||
+            fresh.assignees.length !== 1 || fresh.assignees[0] !== this.deps.botLogin)
+          throw new FinalizationWithdrawn("Approval changed during preparation.");
+      }, { check: this.assertWritable });
+      if (record.schemaVersion !== 5)
         throw new Error("Migrate legacy ticket before launching new work.");
     } catch (error: any) {
       // ensure may have left partial ownership artifacts. Never guess a record.
@@ -1163,7 +1258,18 @@ export class ManagedTicketExecutor implements TicketExecutor {
       });
       return { status: "skipped", reason: check.reason ?? "worktree unsafe" };
     }
-    record = this.deps.worktrees.beginLaunch(record.itemId);
+    record = await this.observeWithdrawn(record);
+    if (record.integration?.kind === "pr" && record.integration.phase === "merged")
+      return { status: "skipped", reason: "PR merged before builder reservation; work retained." };
+    this.deps.worktrees.assertNoFinalization(record);
+    const beforeReservation = await this.currentLaunchCard(record, card, this.deps.cfg.columns.ready);
+    if (!beforeReservation) return { status: "skipped", reason: "approval changed before builder reservation" };
+    card = beforeReservation;
+    record = this.deps.worktrees.beginLaunch(record.itemId, undefined, this.deps.owner, () => {
+      this.assertWritable();
+      if (JSON.stringify(this.deps.worktrees.read(record.itemId)) !== JSON.stringify(record))
+        throw new TicketStateChangedError("Execution changed before builder reservation.");
+    });
     this.activeCount();
     try {
       await this.deps.board.setStatus(
@@ -1223,6 +1329,10 @@ export class ManagedTicketExecutor implements TicketExecutor {
     if (!beforeRevision)
       return { status: "skipped", reason: "card changed before builder start" };
     const admission = await canStartWork();
+    record = await this.observeWithdrawn(record, true);
+    if (record.integration?.kind === "pr" && record.integration.phase === "merged")
+      return { status: "skipped", reason: "PR merged before builder invocation; cleanup-only proof and work retained." };
+    this.deps.worktrees.assertNoFinalization(record);
     const current = await this.currentLaunchCard(record, beforeRevision);
     if (!current)
       return { status: "skipped", reason: "card changed before builder start" };
@@ -1251,6 +1361,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
     }
     let runId: string;
     try {
+      this.assertWritable();
       runId = manager.start(
         script,
         {
@@ -1279,7 +1390,11 @@ export class ManagedTicketExecutor implements TicketExecutor {
     }
 
     try {
-      this.deps.worktrees.setActiveRun(record.itemId, runId);
+      this.deps.worktrees.setActiveRun(record.itemId, runId, undefined, this.deps.owner, () => {
+        this.assertWritable();
+        if (JSON.stringify(this.deps.worktrees.read(record.itemId)) !== JSON.stringify(record))
+          throw new TicketStateChangedError("Execution changed before binding the original builder.");
+      });
     } catch (error: any) {
       this.deps.callback(
         `Run ${runId} persisted but its ticket record was not updated: ${error.message}`,
@@ -1300,309 +1415,382 @@ export class ManagedTicketExecutor implements TicketExecutor {
     );
   }
 
+  /** Marker addresses recovery only. Scope and source ancestry still authorize adoption. */
+  private marker(record: TicketExecutionRecord): string {
+    const pr = record.integration;
+    if (pr?.kind !== "pr") throw new Error("Missing prepared PR identity.");
+    return `<!-- board-agent-pr:${JSON.stringify([record.itemId, record.createdAt, pr.initialPreparedHeadSha])} -->`;
+  }
+
+  private scope(record: Pick<TicketExecutionRecord, "taskBranch" | "baseBranch">): PullRequestScope {
+    return { owner: this.deps.repoOwner, repo: this.deps.repoName, base: record.baseBranch, head: record.taskBranch };
+  }
+
+  private validatePr(record: TicketExecutionRecord, pr: PullRequestInfo, recovering = false): void {
+    const saved = record.integration;
+    if (saved?.kind !== "pr" || !pr || JSON.stringify(pr.scope) !== JSON.stringify(saved.scope) ||
+        JSON.stringify(saved.scope) !== JSON.stringify(this.scope(record)) ||
+        typeof pr.body !== "string" || !["open", "closed"].includes(pr.state) ||
+        typeof pr.merged !== "boolean" || (pr.merged && pr.state !== "closed") ||
+        typeof pr.headSha !== "string" || !/^[0-9a-f]{40}$/i.test(pr.headSha) ||
+        !(pr.mergeCommitSha === null || typeof pr.mergeCommitSha === "string" && /^[0-9a-f]{40}$/i.test(pr.mergeCommitSha)) ||
+        (pr.merged && !pr.mergeCommitSha) ||
+        (saved.prNumber !== undefined && (saved.prNumber !== pr.number || saved.prUrl !== pr.url)) ||
+        !isTicketIntegrationStateV5({ kind: "pr", phase: "open", scope: saved.scope,
+          baseSha: saved.baseSha, taskSha: saved.taskSha, remoteTaskSha: saved.remoteTaskSha,
+          preparedHeadSha: saved.preparedHeadSha, initialPreparedHeadSha: saved.initialPreparedHeadSha,
+          prNumber: pr.number, prUrl: pr.url }))
+      throw new Error("Managed PR scope, number, URL or state mismatch; work retained.");
+    if (saved.phase === "merged" && (!pr.merged || pr.state !== "closed" ||
+        pr.headSha !== saved.mergedHeadSha || pr.mergeCommitSha !== saved.mergeCommitSha))
+      throw new Error("Merged PR evidence cannot be downgraded or replaced; work retained.");
+    if (recovering && !pr.body.split(String.fromCharCode(10)).map((line) => line.trim()).includes(this.marker(record)))
+      throw new Error("PR marker does not identify this execution; no adoption or duplicate creation.");
+  }
+
+  private async observePr(record: TicketExecutionRecord, guard: () => Promise<void>): Promise<PullRequestInfo | undefined> {
+    const saved = record.integration;
+    if (saved?.kind !== "pr") throw new Error("Missing prepared PR identity.");
+    await guard();
+    let pr: PullRequestInfo | undefined;
+    if (saved.prNumber !== undefined) {
+      pr = await this.deps.pullRequests.getPullRequest(saved.scope, saved.prNumber);
+      await guard();
+      this.validatePr(record, pr);
+    } else {
+      const candidates = await this.deps.pullRequests.findPullRequests(saved.scope);
+      await guard();
+      if (!Array.isArray(candidates) || candidates.length > 1)
+        throw new Error("Ambiguous managed PR candidates; no adoption or duplicate creation.");
+      pr = candidates[0];
+      if (pr) this.validatePr(record, pr, true);
+    }
+    // A known PR's explicit merge is irreversible even if a rewrite or later
+    // local work prevents cleanup. Unknown marker adoption still needs ancestry.
+    if (pr && (!pr.merged || saved.prNumber === undefined))
+      await this.deps.worktrees.verifyPullRequestSources(record, pr, guard, false);
+    return pr;
+  }
+
+  /** Withdrawal is reversible; merge evidence is not. Never change a human PR body. */
+  private rememberPr(record: TicketExecutionRecord, pr: PullRequestInfo | undefined, suspended: boolean,
+    check: () => void = this.assertWritable): TicketExecutionRecord {
+    const saved = record.integration;
+    if (saved?.kind !== "pr") throw new Error("Missing prepared PR identity.");
+    let integration: TicketPullRequestIntegration = saved;
+    if (pr?.merged) integration = { ...saved, phase: "merged", prNumber: pr.number, prUrl: pr.url,
+      mergedHeadSha: pr.headSha, mergeCommitSha: pr.mergeCommitSha! };
+    else if (saved.phase !== "merged") {
+      if (pr) integration = { ...saved, phase: "open", prNumber: pr.number, prUrl: pr.url };
+      if (suspended || saved.phase === "suspended") integration = { ...integration, phase: "suspended" };
+    }
+    const retry = integration.phase === "merged"
+      ? { stage: "cleanup" as const, reason: "Human PR merge confirmed; cleanup only. Uncovered later work requires a new submission/PR." }
+      : record.retry?.stage === "integrate" ? undefined : record.retry;
+    if (JSON.stringify({ integration, retry }) === JSON.stringify({ integration: saved, retry: record.retry })) return record;
+    return this.deps.worktrees.progressPullRequest(record, integration, retry, this.deps.owner, check);
+  }
+
+  /** Before builder admission/resume, observe the retained PR. A merge while
+   * withdrawn drains the original run and persists cleanup-only proof, never deletes. */
+  private async observeWithdrawn(record: TicketExecutionRecord, unstarted = false): Promise<TicketExecutionRecord> {
+    if (record.integration?.kind !== "pr" || record.integration.phase !== "suspended") return record;
+    const guard = async () => {
+      this.assertWritable();
+      if (JSON.stringify(this.deps.worktrees.read(record.itemId)) !== JSON.stringify(record))
+        throw new TicketStateChangedError("Execution changed during withdrawn PR observation.");
+    };
+    const pr = await this.observePr(record, guard);
+    if (pr?.merged && (record.activeRunId || record.launchingAt !== undefined)) {
+      if (!record.activeRunId && !unstarted) {
+        const observed = this.conflicts.observeLaunchV5(record, this.deps.owner, this.assertWritable);
+        if (!observed) throw new Error("Merged PR has an uncertain builder; retain work until the original run is observed and drained.");
+        record = observed;
+      }
+      if (record.activeRunId) await this.stopActiveRun(record);
+      await guard();
+      record = this.clear(record, record.activeRunId);
+    }
+    return this.rememberPr(record, pr, true);
+  }
+
   async finalizeClosed(
     snapshot: Card,
     canStartWork: () => boolean | Promise<boolean> = () => true,
     canStartWorkNow: () => boolean = () => true,
     control?: OperationControl,
   ): Promise<FinalizeOutcome> {
-    const externalControl = control;
-    control = { ...control, check: () => {
-      checkOperation(externalControl);
-      if (this.stopping || !canStartWorkNow()) throw new FinalizationWithdrawn("Finalization stopped or ownership lost; work retained.");
+    if (this.busy.has(snapshot.itemId)) return { status: "skipped", reason: "Ticket operation already active." };
+    this.busy.add(snapshot.itemId);
+    try { return await this.finalize(snapshot, canStartWork, canStartWorkNow, control); }
+    finally { this.busy.delete(snapshot.itemId); }
+  }
+
+  private async finalize(
+    snapshot: Card,
+    canStartWork: () => boolean | Promise<boolean>,
+    canStartWorkNow: () => boolean,
+    external?: OperationControl,
+  ): Promise<FinalizeOutcome> {
+    const control: OperationControl = { ...external, check: () => {
+      checkOperation(external);
+      this.assertWritable();
+      if (!canStartWorkNow()) throw new FinalizationWithdrawn("Finalization stopped or ownership lost; work retained.");
     } };
-    if (this.stopping || control.signal?.aborted || !canStartWorkNow())
-      return {
-        status: "skipped",
-        reason: "executor stopping or ownership lost",
-      };
-    const blocked = this.legacyBlocked(snapshot.itemId);
-    if (blocked) return { status: "blocked", reason: blocked };
-    let card: Card | undefined;
-    let original: TicketExecutionRecord | undefined;
-    const sameOwner = (record: TicketExecutionRecord | undefined) =>
-      !!original &&
-      !!record &&
-      record.createdAt === original.createdAt &&
-      record.path === original.path &&
-      record.taskBranch === original.taskBranch &&
-      record.baseBranch === original.baseBranch &&
-      record.issueNumber === original.issueNumber &&
-      record.taskKey === original.taskKey &&
-      record.plan === original.plan &&
-      !record.activeRunId &&
-      record.launchingAt === undefined;
+    const { worktrees, board, cfg, owner } = this.deps;
+    let card: Card | undefined, record: TicketExecutionRecord | undefined;
+    let original: StoredTicketExecutionRecord | undefined;
+    const sameExecution = (r: StoredTicketExecutionRecord | undefined) =>
+      original === undefined ? r === undefined : !!r &&
+      ["itemId", "issueNumber", "createdAt", "path", "taskBranch", "baseBranch", "taskKey", "plan"].every(
+        (key) => r[key as keyof StoredTicketExecutionRecord] === original![key as keyof StoredTicketExecutionRecord]) &&
+      !r.activeRunId && r.launchingAt === undefined;
+    const assertLocal = () => {
+      checkOperation(control);
+      if (!sameExecution(worktrees.readStored(snapshot.itemId)))
+        throw new TicketStateChangedError("Finalization execution changed; work retained.");
+    };
+    const assertCard = async (backlog = false) => {
+      assertLocal();
+      const fresh = await board.getCard(snapshot.itemId);
+      assertLocal();
+      if (!fresh || !card || !sameTicketContract(fresh, card) || fresh.closed !== card.closed ||
+          (backlog ? !statusIs(fresh, cfg.columns.backlog) : fresh.status !== card.status) ||
+          JSON.stringify([...fresh.assignees].map((a) => a.toLowerCase()).sort()) !==
+            JSON.stringify([...card.assignees].map((a) => a.toLowerCase()).sort()))
+        throw new FinalizationWithdrawn("Fresh ticket approval or claim changed; work retained.");
+    };
+    const guard = async (backlog = false) => {
+      await assertCard(backlog);
+      if (JSON.stringify(worktrees.readStored(snapshot.itemId)) !== JSON.stringify(record ?? original))
+        throw new TicketStateChangedError("PR execution changed during observation.");
+    };
     try {
       checkOperation(control);
-      original = this.deps.worktrees.read(snapshot.itemId);
-      card = await this.deps.board.getCard(snapshot.itemId);
+      const blocked = this.legacyBlocked(snapshot.itemId);
+      if (blocked) return { status: "blocked", reason: blocked };
+      original = worktrees.readStored(snapshot.itemId);
+      if (!original && worktrees.has(snapshot.itemId)) throw new Error("Corrupt or unsupported ticket record; work retained.");
+      card = await board.getCard(snapshot.itemId);
       checkOperation(control);
-      if (
-        !card ||
-        !sameTicketContract(card, snapshot) ||
-        card.status !== snapshot.status ||
-        card.closed !== snapshot.closed ||
-        !isTargetIssue(card, this.deps.repoOwner, this.deps.repoName)
-      )
-        return {
-          status: "skipped",
-          reason: "ticket identity or approval changed",
-        };
-      const record = this.deps.worktrees.read(card.itemId);
-      if (JSON.stringify(record) !== JSON.stringify(original))
-        return {
-          status: "skipped",
-          reason: "execution record changed during fresh approval read",
-        };
-      // Retire historical technical Ready writes even after manual withdrawal;
-      // settleTicketWrite rechecks the original contract and only releases our claim.
-      if (record && !record.activeRunId && record.launchingAt === undefined &&
-          ["integrate", "cleanup"].includes(record.retry?.stage ?? "") &&
-          pendingTicketWrite(record)) {
+      if (!card || !sameTicketContract(card, snapshot) || card.closed !== snapshot.closed || card.status !== snapshot.status ||
+          !isTargetIssue(card, this.deps.repoOwner, this.deps.repoName))
+        return { status: "skipped", reason: "ticket identity or approval changed" };
+      if (original?.activeRunId || original?.launchingAt !== undefined)
+        return { status: "blocked", reason: "Builder execution is still active." };
+      assertLocal();
+      record = original?.schemaVersion === 5 ? original : undefined;
+      if (record && pendingTicketWrite(record)) {
         await this.settle(record, control);
-        return { status: "skipped", reason: "historical technical writeback retired" };
+        return { status: "skipped", reason: "pending writeback settled or retired" };
       }
-      const retrying =
-        record?.retry &&
-        ["build", "integrate", "cleanup"].includes(record.retry.stage);
-      if (record?.activeRunId || record?.launchingAt !== undefined)
-        return {
-          status: "blocked",
-          reason: "Builder execution is still active.",
-        };
-      if (
-        !card.closed ||
-        !(
-          statusIs(card, this.deps.cfg.columns.done) ||
-          (retrying && statusIs(card, this.deps.cfg.columns.ready)) ||
-          (record?.integration && statusIs(card, this.deps.cfg.columns.backlog))
-        ) ||
-        (record && pendingTicketWrite(record)) ||
-        card.assignees.some(
-          (a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase(),
-        )
-      )
-        return {
-          status: "skipped",
-          reason: "approval, claim or execution changed",
-        };
-      const task = {
-        ...buildTasksForWave(this.deps.cfg, "", [card])[0],
-        ...(record ? { taskKey: record.taskKey } : {}),
-      };
-      const legacyComplete =
-        !record && (await this.conflicts.completedReceipt(task, card, control));
-      if (record?.retry?.stage === "build")
-        throw new Error(record.retry.reason); // unsettled reopen/claim: never integrate again
-      if (this.stopping || !canStartWorkNow())
-        return {
-          status: "skipped",
-          reason: "finalization stopped or ownership lost",
-        };
-      const expected = card;
-      const assertCurrent = async (done = false) => {
-        checkOperation(control);
-        const fresh = await this.deps.board.getCard(expected.itemId);
-        checkOperation(control);
-        if (
-          this.stopping ||
-          !canStartWorkNow() ||
-          !fresh ||
-          !sameTicketContract(fresh, expected) ||
-          !fresh.closed ||
-          !(done
-            ? statusIs(fresh, this.deps.cfg.columns.backlog)
-            : fresh.status === expected.status) ||
-          JSON.stringify(fresh.assignees.map((a) => a.toLowerCase()).sort()) !==
-            JSON.stringify(
-              expected.assignees.map((a) => a.toLowerCase()).sort(),
-            ) ||
-          (original && !sameOwner(this.deps.worktrees.read(expected.itemId)))
-        )
-          throw new FinalizationWithdrawn(
-            "Fresh approval, claim, execution or admission changed; work retained.",
-          );
-      };
-      const resultSha = legacyComplete
-        ? undefined
-        : await this.deps.worktrees.finalizeAccepted(
-            task,
-            this.deps.cfg.task_merge_strategy,
-            assertCurrent,
-            (r, operation) => this.conflicts.cleanupResidual(r, operation),
-            undefined,
-            control,
-          );
+      const task = { ...buildTasksForWave(cfg, "", [card])[0], ...(original ? { taskKey: original.taskKey } : {}) };
+      const completed = record?.integration?.kind === "legacy-completed" ||
+        (record?.integration?.kind === "pr" && record.integration.phase === "merged");
+      const approved = card.closed && (statusIs(card, cfg.columns.done) || (completed && statusIs(card, cfg.columns.backlog))) &&
+        card.assignees.every((a) => a.toLowerCase() === this.deps.botLogin.toLowerCase());
+      if (!approved && record?.integration?.kind !== "pr")
+        return { status: "skipped", reason: "approval, claim or execution changed" };
+      if (record?.retry?.stage === "build" && approved) throw new Error(record.retry.reason);
+      let pr: PullRequestInfo | undefined;
+      if (record?.integration?.kind === "pr") {
+        control.onProgress?.({ phase: "observe-pr" });
+        pr = await this.observePr(record, guard); // known number always wins, even on restart/withdrawal
+        await guard();
+        record = this.rememberPr(record, pr, !approved, assertLocal);
+        if (!approved) return pr ? { status: "waiting", prNumber: pr.number, prUrl: pr.url,
+          reason: pr.merged ? "PR merged while approval was withdrawn. Proof and work retained; renewed closed Done is required for safe cleanup."
+            : "Approval withdrawn; PR and sources retained. Open Ready permits the original builder; review and closed Done renew submission." }
+          : { status: "skipped", reason: "Approval suspended; sources retained." };
+      }
+      if (!approved) return { status: "skipped", reason: "approval withdrawn" };
+      let resultSha: string | undefined;
+      if (record?.integration?.kind === "legacy-completed") {
+        resultSha = await worktrees.cleanupLegacyCompleted(task, owner, assertCard,
+          (r, operation) => this.conflicts.cleanupResidual(r, operation), control);
+      } else {
+        if (!record?.integration) {
+          const local = worktrees.localBranchSha(task.taskBranch), remote = await worktrees.remoteSha(task.taskBranch);
+          await assertCard();
+          const historical = !local && !remote && !this.hasPendingRecovery(task.itemId);
+          const receipt = !original && await this.conflicts.completedReceipt(task, card, control);
+          if (!historical && !receipt) {
+            if (original && !record) throw new Error("Owner-held v5 migration is required.");
+            if (!record) {
+              worktrees.cleanupRecordV5(task); // never adopt an unknown worktree/path
+              await assertCard();
+              record = worktrees.createV5({ schemaVersion: 5, itemId: task.itemId, issueNumber: task.issueNumber,
+                taskKey: task.taskKey, taskBranch: task.taskBranch, baseBranch: task.baseBranch,
+                path: worktrees.pathFor(task.itemId, task.issueNumber), createdAt: Date.now() }, owner, assertLocal);
+              original = record;
+            }
+            if (record.retry?.stage === "review") record = worktrees.updateV5(record, (r) => ({ ...r, retry: undefined }), owner, assertLocal);
+            const candidates = await this.deps.pullRequests.findPullRequests(this.scope(record));
+            await guard();
+            if (!Array.isArray(candidates) || candidates.length)
+              throw new Error("Existing PR without this execution's preparation; no adoption or duplicate creation.");
+          }
+        }
+        if (record && (record.integration?.kind === "pr" || worktrees.localBranchSha(task.taskBranch) || await worktrees.remoteSha(task.taskBranch))) {
+          let saved = record.integration;
+          if (!saved || (saved.kind === "pr" && ["prepared", "suspended"].includes(saved.phase) && !pr?.merged)) {
+            if (pr && pr.state !== "open") return { status: "waiting", prNumber: pr.number, prUrl: pr.url,
+              reason: "Managed PR is closed without merge. Work retained; a human must resolve it. No automatic reopen or replacement PR." };
+            // The Git module renews owner/card/source guards and saves preparation before its normal task push.
+            const previous = record;
+            const prepareGuard = async () => {
+              await assertCard();
+              if (previous.integration?.kind === "pr" && previous.integration.prNumber !== undefined) {
+                const current = await this.deps.pullRequests.getPullRequest(this.scope(previous), previous.integration.prNumber);
+                await assertCard();
+                this.validatePr(previous, current);
+                if (current.merged || current.state !== "open")
+                  throw new FinalizationWithdrawn("Managed PR changed during preparation; re-observe before any publication.");
+                await worktrees.verifyPullRequestSources(previous, current, assertCard, false);
+                const remote = await worktrees.remoteSha(task.taskBranch);
+                await assertCard();
+                if (!remote) throw new Error("Open PR task head is missing; restore its sources before renewing approval.");
+                const renewed = worktrees.read(task.itemId)?.integration;
+                if (renewed?.kind === "pr" && renewed.phase === "prepared" &&
+                    !worktrees.isAncestor(previous.integration.preparedHeadSha, renewed.preparedHeadSha))
+                  throw new Error("Renewed preparation lost the original PR sources; publication withheld.");
+              }
+            };
+            record = await worktrees.preparePullRequest(task, this.scope(record), owner, prepareGuard, control);
+            await guard();
+            pr = await this.observePr(record, guard);
+            if (!pr) {
+              const saved = record.integration;
+              if (saved?.kind !== "pr") throw new Error("Missing preparation before PR creation.");
+              const remote = await worktrees.remoteSha(task.taskBranch);
+              await guard();
+              await worktrees.fetchRequired(task.taskBranch);
+              await guard();
+              const local = worktrees.localBranchSha(task.taskBranch);
+              if (!remote || worktrees.fetchedSha(task.taskBranch) !== remote ||
+                  !worktrees.isAncestor(saved.preparedHeadSha, remote) || !local || !worktrees.isAncestor(local, remote))
+                throw new Error("Prepared PR no longer covers current sources; work retained.");
+              worktrees.cleanupRecordV5(task);
+              if (worktrees.worktreeEntries().some((e) => e.branch === task.taskBranch) && !worktrees.check(record, true).ok)
+                throw new Error("Unsafe worktree before PR creation.");
+              await guard();
+              control.onProgress?.({ phase: "create-pr" });
+              pr = await this.deps.pullRequests.createPullRequest(this.scope(record), card.title,
+                `${this.marker(record)}\n\nRefs #${card.number}\n\nPrepared for human review and manual merge (Squash and merge recommended).`);
+              await guard();
+              this.validatePr(record, pr, true);
+              await worktrees.verifyPullRequestSources(record, pr, guard);
+            }
+            await guard();
+            record = this.rememberPr(record, pr, false, assertLocal);
+            saved = record.integration;
+          }
+          if (!pr) throw new Error("Managed PR observation is unavailable; sources retained.");
+          if (!pr.merged) return { status: "waiting", prNumber: pr.number, prUrl: pr.url,
+            reason: pr.state === "closed" ? "Managed PR is closed without merge. Work retained; a human must resolve it. No automatic reopen or replacement PR."
+              : "Awaiting human PR merge. Worktree and refs retained; CI/review remain under human control." };
+          const mergedGuard = async (backlog = false) => {
+            await guard(backlog);
+            const observed = await this.deps.pullRequests.getPullRequest(this.scope(record!), pr!.number);
+            await guard(backlog);
+            this.validatePr(record!, observed);
+          };
+          resultSha = await worktrees.cleanupMergedPullRequest(task, pr, owner, mergedGuard, control);
+        }
+      }
       const assertAbsent = async () => {
-        if (await this.deps.worktrees.remoteSha(task.taskBranch))
-          throw new Error(
-            "Remote task branch reappeared before Backlog write.",
-          );
-        await assertCurrent(statusIs(expected, this.deps.cfg.columns.backlog));
-        if (
-          this.deps.worktrees.localBranchSha(task.taskBranch) ||
-          (!resultSha &&
-            !legacyComplete &&
-            this.hasPendingRecovery(task.itemId))
-        )
-          throw new Error(
-            "Task ref or pending recovery remains before Backlog write.",
-          );
+        if (await worktrees.remoteSha(task.taskBranch)) throw new Error("Remote task branch reappeared before Backlog write.");
+        await guard(statusIs(card!, cfg.columns.backlog));
+        if (worktrees.localBranchSha(task.taskBranch) || (!resultSha && this.hasPendingRecovery(task.itemId) &&
+            !(await this.conflicts.completedReceipt(task, card!, control))))
+          throw new Error("Task ref or pending recovery remains before Backlog write.");
       };
       control.onProgress?.({ phase: "writeback" });
       await assertAbsent();
-      if (!statusIs(expected, this.deps.cfg.columns.backlog))
-        await this.deps.board.setStatus(
-          expected.itemId,
-          this.deps.cfg.columns.backlog,
-        );
-      await assertCurrent(true);
-      if (resultSha)
-        await this.deps.worktrees.completeFinalization(task, resultSha, () =>
-          assertCurrent(true), control,
-        );
-      snapshot.status = this.deps.cfg.columns.backlog;
+      if (!statusIs(card, cfg.columns.backlog)) await board.setStatus(card.itemId, cfg.columns.backlog);
+      await guard(true);
+      if (resultSha) await worktrees.completeFinalization(task, resultSha, async () => {
+        await guard(true);
+        if (record?.integration?.kind === "pr") {
+          const observed = await this.deps.pullRequests.getPullRequest(this.scope(record), record.integration.prNumber!);
+          await guard(true);
+          this.validatePr(record, observed);
+        }
+      }, control, owner);
+      snapshot.status = cfg.columns.backlog;
       snapshot.closed = true;
-      this.deps.callback(
-        resultSha
-          ? `Finalized #${card.number} "${card.title}" at ${resultSha} in ${task.baseBranch}. Deleted local/remote branch ${task.taskBranch} and removed its worktree → ${this.deps.cfg.columns.backlog}.`
-          : `Backlogged #${card.number} "${card.title}" → ${this.deps.cfg.columns.backlog} (closed; no task branches).`,
-      );
-      return resultSha
-        ? { status: "finalized", resultSha }
-        : { status: "backlogged" };
+      this.deps.callback(resultSha
+        ? `Finalized #${card.number} "${card.title}" at ${resultSha} in ${task.baseBranch}. Deleted local/remote branch ${task.taskBranch} and removed its worktree → ${cfg.columns.backlog}.`
+        : `Backlogged #${card.number} "${card.title}" → ${cfg.columns.backlog} (closed; no task branches).`);
+      return resultSha ? { status: "finalized", resultSha } : { status: "backlogged" };
     } catch (error) {
-      if (
-        error instanceof FinalizationWithdrawn ||
-        error instanceof TicketStateChangedError
-      )
-        return { status: "skipped", reason: error.message };
-      if (this.stopping || control.signal?.aborted || !canStartWorkNow())
-        return {
-          status: "skipped",
-          reason: "finalization stopped or ownership lost",
-        };
-      const diagnostic = error instanceof Error ? error.message : String(error);
-      const reason = card
-        ? diagnostic
-        : `fresh card read failed: ${diagnostic}`;
-      try {
-        checkOperation(control);
-        control.onProgress?.({ phase: "writeback" });
-        let record = this.deps.worktrees.read(snapshot.itemId);
-        if (
-          !record ||
-          record.schemaVersion !== 4 ||
-          !sameOwner(record) ||
-          pendingTicketWrite(record)
-        )
-          return { status: "blocked", reason };
-        const conflict = error instanceof MergeConflictError;
-        if (!record.integration && !record.retry && !conflict)
-          return { status: "blocked", reason }; // Unknown sources must not manufacture a recovery handoff.
-        if (
-          conflict &&
-          (!error.repairable ||
-            !card ||
-            !isTargetIssue(
-              card,
-              this.deps.repoOwner,
-              this.deps.repoName,
-              "Task",
-            ) ||
-            !this.deps.worktrees.check(record, true).ok)
-        )
-          return {
-            status: "conflict",
-            baseSha: error.baseSha,
-            taskSha: error.taskSha,
-            reason,
-          };
-        const buildRetry = conflict || record.retry?.stage === "build";
-        if (buildRetry && record.integration)
-          return {
-            status: "blocked",
-            reason:
-              "Prepared integration must be observed on fresh origin/base before a build retry.",
-          };
-        const stage = buildRetry
-          ? "build"
-          : record.retry?.stage === "cleanup"
-            ? "cleanup"
-            : "integrate";
-        const detail = conflict
-          ? `Merge conflict: merge base ${error.baseSha} into the original task branch (original task ${error.taskSha}). Inspect status, diff and MERGE_HEAD; continue interrupted work. Preserve both sides, resolve, run relevant tests, commit and push. Review and Done require renewed manual close approval.\n\n${reason}`
-          : buildRetry
-            ? (record.retry?.reason ?? reason)
-            : reason;
-        // Even a failing fresh read/claim must leave local I/O retry progress.
-        record = this.deps.worktrees.update(record.itemId, (r) => ({
-          ...r,
-          retry: { stage, reason: detail },
-        }));
-        // Project Status describes work, not a failed Git/network operation.
-        // Only an actual build retry may claim/comment/reopen/write Ready.
-        if (!buildRetry || !card) return { status: "blocked", reason: detail };
-        if (
-          buildRetry &&
-          (this.stopping || !(await canStartWork()) || !canStartWorkNow())
-        )
-          return { status: "blocked", reason };
-        const fresh = await this.deps.board.getCard(card.itemId);
-        checkOperation(control);
-        if (
-          !fresh ||
-          !sameTicketContract(fresh, card) ||
-          fresh.closed !== card.closed ||
-          fresh.status !== card.status ||
-          fresh.assignees.some(
-            (a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase(),
-          )
-        )
-          return { status: "skipped", reason: "human approval changed" };
-        if (!(await this.deps.board.claim(fresh)))
-          return { status: "skipped", reason: "claim lost" };
-        const current = await this.deps.board.getCard(card.itemId);
-        checkOperation(control);
-        if (
-          !current ||
-          !sameTicketContract(current, fresh) ||
-          current.closed !== fresh.closed ||
-          current.status !== fresh.status ||
-          current.assignees.length !== 1 ||
-          current.assignees[0].toLowerCase() !==
-            this.deps.botLogin.toLowerCase()
-        )
-          return { status: "skipped", reason: "approval changed after claim" };
-        const pending = queueTicketWrite(this.deps.worktrees, record, stage, {
-          card: current,
-          status: this.deps.cfg.columns.ready,
-          reason: detail,
-          retry: true,
-          ...(buildRetry ? { reopen: true as const } : {}),
-          comment: `## ${buildRetry ? "Merge conflict — build retry" : `${stage} retry`}\n\n${detail}`,
-        });
-        await this.settle(pending, control);
-        return { status: "blocked", reason: detail };
-      } catch (writeError) {
-        if (this.stopping || control.signal?.aborted || !canStartWorkNow())
-          return { status: "skipped", reason: "finalization stopped or ownership lost" };
-        this.deps.callback(
-          `Finalization writeback pending: ${String(writeError)}`,
-          "warn",
-        );
-        return {
-          status: "blocked",
-          reason: `${reason}; writeback: ${String(writeError)}`,
-        };
-      }
+      return this.finalizationFailure(error, snapshot, card, original, control, canStartWork, canStartWorkNow);
+    }
+  }
+  private async finalizationFailure(
+    error: unknown, snapshot: Card, card: Card | undefined, original: StoredTicketExecutionRecord | undefined,
+    control: OperationControl, canStartWork: () => boolean | Promise<boolean>, canStartWorkNow: () => boolean,
+  ): Promise<FinalizeOutcome> {
+    if (error instanceof FinalizationWithdrawn || error instanceof TicketStateChangedError)
+      return { status: "skipped", reason: error.message };
+    try { checkOperation(control); }
+    catch { return { status: "skipped", reason: "finalization stopped or ownership lost" }; }
+    const diagnostic = error instanceof Error ? error.message : String(error);
+    const reason = card ? diagnostic : `fresh card read failed: ${diagnostic}`;
+    try {
+      let record = this.deps.worktrees.read(snapshot.itemId);
+      if (!record || !original || record.createdAt !== original.createdAt || record.path !== original.path ||
+          record.taskBranch !== original.taskBranch || record.taskKey !== original.taskKey ||
+          record.activeRunId || record.launchingAt !== undefined || pendingTicketWrite(record))
+        return { status: "blocked", reason };
+      const conflict = error instanceof MergeConflictError;
+      if (conflict && (!error.repairable || !card ||
+          !isTargetIssue(card, this.deps.repoOwner, this.deps.repoName, "Task") ||
+          !this.deps.worktrees.check(record, true).ok))
+        return { status: "conflict", baseSha: error.baseSha, taskSha: error.taskSha, reason };
+      const buildRetry = conflict || record.retry?.stage === "build";
+      if (buildRetry && record.integration && !(record.integration.kind === "pr" && record.integration.phase === "suspended"))
+        return { status: "blocked", reason: "Prepared/merged PR must be observed before any build retry; sources retained." };
+      const stage = buildRetry ? "build" : record.integration?.kind === "legacy-completed" ||
+        (record.integration?.kind === "pr" && record.integration.phase === "merged") ? "cleanup" : "integrate";
+      const detail = conflict
+        ? `Merge conflict: merge base ${error.baseSha} into the original task branch (original task ${error.taskSha}). Inspect status, diff and MERGE_HEAD; continue interrupted work. Preserve both sides, resolve, run relevant tests, commit and push. Review and Done require renewed manual close approval.\n\n${reason}`
+        : buildRetry ? record.retry!.reason : reason;
+      record = this.deps.worktrees.updateV5(record, (r) => ({ ...r, retry: { stage, reason: detail } }),
+        this.deps.owner, () => checkOperation(control));
+      if (!buildRetry || !card) return { status: "blocked", reason: detail };
+      if (!(await canStartWork()) || !canStartWorkNow()) return { status: "blocked", reason: detail };
+      const fresh = await this.deps.board.getCard(card.itemId);
+      checkOperation(control);
+      if (!fresh || !sameTicketContract(fresh, card) || fresh.closed !== card.closed || fresh.status !== card.status ||
+          fresh.assignees.some((a) => a.toLowerCase() !== this.deps.botLogin.toLowerCase()))
+        return { status: "skipped", reason: "human approval changed" };
+      this.deps.worktrees.cleanupRecordV5({ ...record, title: fresh.title, body: fresh.body });
+      if (JSON.stringify(this.deps.worktrees.read(record.itemId)) !== JSON.stringify(record))
+        throw new TicketStateChangedError("Conflict execution changed before claim.");
+      if (!(await this.deps.board.claim(fresh))) return { status: "skipped", reason: "claim lost" };
+      const current = await this.deps.board.getCard(card.itemId);
+      checkOperation(control);
+      if (!current || !sameTicketContract(current, fresh) || current.closed !== fresh.closed || current.status !== fresh.status ||
+          current.assignees.length !== 1 || current.assignees[0].toLowerCase() !== this.deps.botLogin.toLowerCase())
+        return { status: "skipped", reason: "approval changed after claim" };
+      record = queueTicketWrite(this.deps.worktrees, record, "build", {
+        card: current, status: this.deps.cfg.columns.ready, reason: detail, retry: true, reopen: true,
+        comment: `## Merge conflict — build retry\n\n${detail}`,
+      }, this.deps.owner, () => checkOperation(control));
+      await this.settle(record, control);
+      return { status: "blocked", reason: detail };
+    } catch (writeError) {
+      try { checkOperation(control); }
+      catch { return { status: "skipped", reason: "finalization stopped or ownership lost" }; }
+      return { status: "blocked", reason: `${reason}; writeback: ${String(writeError)}` };
     }
   }
 
   activeCount(): number {
     let count = 0;
     const active: ActiveTicketRun[] = [];
-    for (const record of this.deps.worktrees.list()) {
+    for (const record of this.deps.worktrees.listStored()) {
       let status: string;
       if (record.launchingAt !== undefined && !record.activeRunId) {
         status = "launching";
@@ -1672,6 +1860,7 @@ export class ManagedTicketExecutor implements TicketExecutor {
 export function createProductionTicketExecutor(options: {
   cwd: string;
   worktrees?: TicketWorktrees;
+  owner: OwnerLock;
   cfg: Config;
   meta: ProjectMetadata;
   botLogin: string;
@@ -1722,7 +1911,7 @@ export function createProductionTicketExecutor(options: {
       await createComment(issueId, body);
     },
   };
-  const worktrees = options.worktrees ?? new TicketWorktrees(options.cwd);
+  const worktrees = options.worktrees ?? new TicketWorktrees(options.cwd, options.owner);
   return new ManagedTicketExecutor({
     cwd: options.cwd,
     cfg: options.cfg,
@@ -1730,6 +1919,8 @@ export function createProductionTicketExecutor(options: {
     repoOwner: options.repoOwner,
     repoName: options.repoName,
     board,
+    owner: options.owner,
+    pullRequests: { findPullRequests, createPullRequest, getPullRequest },
     callback: options.callback,
     worktrees,
     createManager: (cwd) =>
@@ -1766,7 +1957,7 @@ export function inspectTicketExecutions(
   orphans: number;
   needsHuman: number;
 } {
-  const records = worktrees.list();
+  const records = worktrees.listStored();
   const active = records.flatMap((record): ActiveTicketRun[] => {
     if (!record.activeRunId) return [];
     let status = "missing";

@@ -15,8 +15,7 @@ import {
   faults,
   dispose,
 } from "./finalization-fixture.js";
-const basePush = (a: string[]) =>
-  a[0] === "push" && a.some((s) => s.endsWith(":refs/heads/main"));
+const taskPush = (a: string[]) => a[0] === "push" && !a.at(-1)!.startsWith(":");
 const remoteDelete = (a: string[]) =>
   a[0] === "push" && a.some((s) => s.startsWith(":refs/heads/task/"));
 const remove = (a: string[]) => a[0] === "worktree" && a[1] === "remove";
@@ -30,12 +29,12 @@ try {
       index = readFileSync(join(f.repo, ".git", "index"));
     calls.length = 0;
     faults.beforeGit = (args) => {
-      if (basePush(args)) {
-        const state = f.recordNow().integration!;
+      if (taskPush(args)) {
+        const state = f.prNow();
         assert.ok(state, "integration is atomically durable BEFORE push");
-        assert.ok(args.includes(`${state.resultSha}:refs/heads/main`));
+        assert.ok(args.includes(`${state.preparedHeadSha}:refs/heads/${f.task.taskBranch}`));
         assert.equal(
-          git(f.repo, "show", "-s", "--format=%P", state.resultSha),
+          git(f.repo, "show", "-s", "--format=%P", state.preparedHeadSha),
           `${f.base} ${f.taskSha}`,
         );
       }
@@ -82,14 +81,14 @@ try {
     const f = await fixture();
     calls.length = 0;
     faults.afterGit = (args) => {
-      if (basePush(args)) {
+      if (taskPush(args)) {
         faults.afterGit = undefined;
         throw new Error("offline accepted push with lost response");
       }
     };
     await f.loop.tickNow();
-    const result = f.recordNow().integration!.resultSha;
-    assert.equal(f.tip(), result);
+    const result = f.prNow().preparedHeadSha;
+    assert.equal(f.tip(), f.base);
     assert.equal(f.card.status, f.cfg.columns.done);
     assert.equal(f.card.closed, true);
     assert.equal(existsSync(f.record.path), true);
@@ -97,7 +96,7 @@ try {
     await f.loop.tickNow();
     assert.equal(f.store.has(f.task.itemId), false);
     assert.equal(f.card.status, f.cfg.columns.backlog);
-    assert.equal(calls.filter(basePush).length, 1);
+    assert.equal(calls.filter(taskPush).length, 1);
     assert.equal(calls.filter((a) => a[0] === "commit-tree").length, 1);
     assert.equal(f.starts(), 0);
     assert.equal(f.reviews(), 0);
@@ -114,51 +113,28 @@ try {
     git(f.repo, "add", "concurrent.txt");
     git(f.repo, "commit", "-m", "concurrent base advance");
     const advanced = git(f.repo, "rev-parse", "HEAD");
-    faults.beforeGit = (args) => {
-      if (basePush(args)) {
-        faults.beforeGit = undefined;
+    faults.afterGit = (args) => {
+      if (taskPush(args)) {
+        faults.afterGit = undefined;
         git(f.repo, "push", "origin", `${advanced}:refs/heads/main`);
+        throw new Error("lost prepared task push response");
       }
     };
     await f.finish();
-    const prepared = f.recordNow().integration!;
+    const prepared = f.prNow();
     assert.equal(f.tip(), advanced);
-    assert.equal(f.card.closed, true);
     assert.equal(f.recordNow().retry?.stage, "integrate");
-    faults.beforeGit = (args) => {
-      if (args[0] === "fetch") throw new Error("offline cannot observe base");
-    };
-    await f.finish();
-    assert.deepEqual(f.recordNow().integration, prepared);
-    assert.equal(existsSync(f.record.path), true);
-    faults.beforeGit = (args) => {
-      if (!basePush(args)) return;
-      assert.equal(f.recordNow().reviewedTaskSha, f.taskSha);
-      assert.deepEqual(f.recordNow().integration, {
-        baseSha: advanced,
-        taskSha: f.taskSha,
-        remoteTaskSha: f.taskSha,
-        resultSha: args
-          .find((s) => s.endsWith(":refs/heads/main"))!
-          .split(":")[0],
-      });
-    };
+    faults.beforeGit = (args) => { if (args[0] === "fetch") throw new Error("offline cannot observe base"); };
+    await f.finish(); assert.deepEqual(f.recordNow().integration, prepared); assert.ok(existsSync(f.record.path));
+    faults.beforeGit = undefined;
     const accepted = await f.finish();
     assert.equal(accepted.status, "finalized", JSON.stringify(accepted));
-    assert.equal(
-      git(f.repo, "show", "-s", "--format=%P", f.tip()),
-      `${advanced} ${f.taskSha}`,
-    );
-    assert.equal(f.card.closed, true);
+    assert.equal(git(f.repo, "show", "-s", "--format=%P", f.tip()), `${advanced} ${prepared.preparedHeadSha}`);
     assert.equal(f.events.includes("reopen"), false);
-    assert.equal(calls.filter((a) => a[0] === "commit-tree").length, 2);
-    assert.equal(calls.filter(basePush).length, 2);
-    assert.equal(f.starts(), 0);
-    assert.equal(f.reviews(), 0);
-    f.noNewEvidence();
-    console.log(
-      "PASS: nonconflicting rejected push retains prepared result while observation fails, then atomically prepares/pushes an ordinary merge with unchanged approval and no builder/review/reopen",
-    );
+    assert.equal(calls.filter((a) => a[0] === "commit-tree").length, 1);
+    assert.equal(calls.filter(taskPush).length, 1);
+    assert.equal(f.starts(), 0); assert.equal(f.reviews(), 0); f.noNewEvidence();
+    console.log("PASS: base advance/observation failure retains the identical prepared task head; only a simulated human merges against the fresh base");
   }
   {
     const f = await fixture();
@@ -203,63 +179,29 @@ try {
     git(f.repo, "commit", "-m", "concurrent conflict");
     const advanced = git(f.repo, "rev-parse", "HEAD");
     calls.length = 0;
-    faults.beforeGit = (args) => {
-      if (basePush(args)) {
-        faults.beforeGit = undefined;
-        git(f.repo, "push", "origin", `${advanced}:refs/heads/main`);
-      }
+    faults.afterGit = (args) => {
+      if (taskPush(args)) { faults.afterGit = undefined; git(f.repo, "push", "origin", `${advanced}:refs/heads/main`); }
     };
-    await f.finish();
-    assert.ok(f.recordNow().integration);
-    assert.equal(f.recordNow().retry?.stage, "integrate");
-    f.failClaim(true);
-    await f.finish();
-    assert.equal(f.recordNow().integration, undefined);
-    assert.equal(f.recordNow().retry?.stage, "build");
-    assert.equal(f.recordNow().reviewedTaskSha, undefined);
-    assert.equal(f.card.closed, true);
-    f.failClaim(false);
-    await f.finish();
-    assert.equal(f.card.closed, false);
-    assert.equal(f.card.status, f.cfg.columns.ready);
-    assert.equal(f.store.localBranchSha(f.task.taskBranch), taskSha);
-    assert.equal(f.recordNow().path, f.record.path);
-    assert.equal(calls.filter((a) => a[0] === "commit-tree").length, 1);
+    assert.equal((await f.finish()).status, "blocked", "simulated human merge cannot resolve a conflict automatically");
+    assert.equal((await f.finish()).status, "waiting");
+    const pr = f.prNow();
+    assert.equal(f.card.closed, true); assert.equal(f.comments.length, 0);
     assert.equal(calls.filter(remoteDelete).length, 0);
-    assert.match(f.comments.join("\n"), /renewed manual close/);
-    f.card.status = f.cfg.columns.done;
-    f.card.closed = true;
-    assert.notEqual(
-      (await f.finish()).status,
-      "finalized",
-      "closing again cannot bypass the required build/review",
-    );
-    // Emulate conflict resolution in the original branch, then renewed review.
+    f.card.closed = false; f.card.status = f.cfg.columns.ready;
+    await f.finish(); assert.equal(f.prNow().phase, "suspended");
+    git(f.record.path, "merge", "--ff-only", pr.preparedHeadSha);
     assert.throws(() => git(f.record.path, "merge", "--no-edit", advanced));
     writeFileSync(join(f.record.path, "base.txt"), "task and base resolved\n");
-    git(f.record.path, "add", "base.txt");
-    git(f.record.path, "commit", "-m", "resolve conflict");
+    git(f.record.path, "add", "base.txt"); git(f.record.path, "commit", "-m", "resolve conflict");
     git(f.record.path, "push", "origin", f.task.taskBranch);
-    const renewed = git(f.record.path, "rev-parse", "HEAD");
-    f.store.setReviewedTaskSha(f.task.itemId, renewed);
-    f.store.update(f.task.itemId, (r) => ({ ...r, retry: undefined }));
-    f.card.status = f.cfg.columns.done;
-    f.card.closed = false;
-    await f.loop.tickNow();
-    assert.equal(f.tip(), advanced);
-    assert.ok(f.store.has(f.task.itemId));
-    f.card.closed = true;
-    const accepted = await f.finish();
-    assert.equal(accepted.status, "finalized", JSON.stringify(accepted));
-    assert.equal(
-      git(f.repo, "show", "-s", "--format=%P", f.tip()),
-      `${advanced} ${renewed}`,
-    );
-    await f.loop.stop();
-    f.noNewEvidence();
-    console.log(
-      "PASS: only an actual new conflict after rejection clears prepared progress for original build/renewed review/manual close; failed claim retains the reopen handoff",
-    );
+    f.store.setReviewedTaskSha(f.task.itemId, git(f.record.path, "rev-parse", "HEAD"));
+    f.card.status = f.cfg.columns.done; f.card.closed = false;
+    await f.loop.tickNow(); assert.equal(f.tip(), advanced); assert.ok(f.store.has(f.task.itemId));
+    f.card.closed = true; assert.equal((await f.finish()).status, "waiting");
+    assert.equal(f.prNow().prNumber, pr.prNumber);
+    f.prs.merge(); assert.equal((await f.finish()).status, "finalized");
+    await f.loop.stop(); f.noNewEvidence();
+    console.log("PASS: published PR conflicts wait without a builder; explicit withdrawal/repair/review/reclose reuse the same PR before human merge");
   }
   for (const step of [
     "remote",
@@ -271,7 +213,7 @@ try {
     const f = await fixture();
     calls.length = 0;
     if (step === "done" || step === "lost-done") {
-      f.card.status = f.cfg.columns.ready;
+      f.card.status = f.cfg.columns.done;
       f.store.update(f.card.itemId, (r) => ({
         ...r,
         retry: { stage: "integrate", reason: "prior Git retry" },
@@ -313,7 +255,7 @@ try {
     assert.equal(f.store.has(f.task.itemId), false);
     assert.equal(f.card.status, f.cfg.columns.backlog);
     assert.equal(calls.filter((a) => a[0] === "commit-tree").length, 1);
-    assert.equal(calls.filter(basePush).length, 1);
+    assert.equal(calls.filter(taskPush).length, 1);
     assert.equal(f.starts(), 0);
     assert.equal(f.reviews(), 0);
     f.noNewEvidence();
@@ -377,12 +319,12 @@ try {
     if (kind === "active")
       f.store.setActiveRun(f.task.itemId, "original-active");
     if (kind === "other-owner")
-      f.store.create({
+      f.store.createV5({
         ...f.recordNow(),
-        schemaVersion: 4,
+        schemaVersion: 5,
         itemId: "OTHER",
         issueNumber: 2000,
-      });
+      }, f.owner, () => {});
     if (kind === "unregistered") f.vanish();
     const result = await f.finish();
     assert.notEqual(result.status, "finalized");
@@ -414,10 +356,11 @@ try {
       "-m",
       "concurrent work",
     );
+    const commitRemote = () => git(f.repo, "commit-tree", `${newer}^{tree}`, "-p", f.prNow().preparedHeadSha, "-m", "concurrent remote work");
     let allowed = true;
-    faults.afterGit = (args) => {
-      if (!basePush(args)) return;
-      faults.afterGit = undefined;
+    f.prs.hooks.after = (op) => {
+      if (op !== "create") return;
+      f.prs.hooks.after = undefined;
       if (kind === "local")
         git(
           f.repo,
@@ -431,7 +374,7 @@ try {
           f.repo,
           "push",
           "origin",
-          `${newer}:refs/heads/${f.task.taskBranch}`,
+          `${commitRemote()}:refs/heads/${f.task.taskBranch}`,
         );
       if (kind === "withdraw") f.card.closed = false;
       if (kind === "retype") f.card.type = "Story";
@@ -439,7 +382,7 @@ try {
       if (kind === "record")
         f.store.update(f.task.itemId, (r) => ({
           ...r,
-          retry: { stage: "cleanup", reason: "concurrent replacement" },
+          retry: { stage: "integrate", reason: "concurrent replacement" },
         }));
       if (kind === "stop") allowed = false;
     };

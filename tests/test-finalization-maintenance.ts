@@ -7,7 +7,7 @@ import { BoardLoop, createLoopState, type LoopDeps } from "../src/loop.js";
 import { acquireOwnerLock, ownerLockIsHeld } from "../src/owner-lock.js";
 import { ManagedTicketExecutor, type TicketBoardAdapter } from "../src/ticket-executor.js";
 import { pendingTicketWrite, queueTicketWrite } from "../src/ticket-retry.js";
-import { type TicketExecutionRecord, TicketWorktrees } from "../src/ticket-worktree.js";
+import { type TicketExecutionRecordV5, TicketWorktrees } from "../src/ticket-worktree.js";
 
 const cwd = process.env.TMP_DIR!;
 assert.ok(cwd);
@@ -18,13 +18,15 @@ function fixture(status = "Done", stage: "integrate" | "cleanup" = "cleanup") {
   const cfg = structuredClone(_DEFAULTS);
   cfg.max_workers = 2; cfg.safety.require_clean_worktree = false;
   const card: Card = { itemId: "A", number: 1, title: "T001 task", body: "approved", type: "Task", contentType: "Issue", repoOwner: "owner", repoName: "repo", status, closed: true, assignees: [] };
-  let record: TicketExecutionRecord | undefined = { schemaVersion: 4, itemId: "A", issueNumber: 1, taskKey: "T001", taskBranch: "task/issue-1", baseBranch: "main", path: cwd, createdAt: 1, integration: { baseSha: "a".repeat(40), taskSha: "b".repeat(40), resultSha: "c".repeat(40) }, retry: { stage, reason: "prior failure" } };
+  let record: TicketExecutionRecordV5 | undefined = { schemaVersion: 5, itemId: "A", issueNumber: 1, taskKey: "T001", taskBranch: "task/issue-1", baseBranch: "main", path: cwd, createdAt: 1, integration: { kind: "legacy-completed", scope: { owner: "owner", repo: "repo", base: "main", head: "task/issue-1" }, remoteTaskSha: null, baseSha: "a".repeat(40), taskSha: "b".repeat(40), resultSha: "c".repeat(40) }, retry: { stage, reason: "prior failure" } };
   const writes: string[] = [], reads: string[] = [], models: string[] = [];
-  const store = new TicketWorktrees(cwd);
+  const store = new TicketWorktrees(cwd, testOwner(cwd));
   store.read = (id) => id === "A" ? structuredClone(record) : undefined;
   store.list = () => record ? [structuredClone(record)] : [];
+  store.readStored = store.read; store.listStored = store.list;
   store.update = (_id, mutate) => record = mutate(structuredClone(record!));
-  store.finalizeAccepted = async () => { throw new Error("offline Git failure"); };
+  store.updateV5 = (r, mutate) => store.update(r.itemId, mutate);
+  store.cleanupLegacyCompleted = async () => { throw new Error("offline Git failure"); };
   store.localBranchSha = () => undefined;
   store.remoteSha = async () => undefined;
   store.completeFinalization = async () => { record = undefined; };
@@ -36,10 +38,10 @@ function fixture(status = "Done", stage: "integrate" | "cleanup" = "cleanup") {
     reopen: async () => { writes.push("reopen"); card.closed = false; },
     comment: async () => { writes.push("comment"); }, listComments: async () => [],
   };
-  const executor = new ManagedTicketExecutor({ cwd, cfg, board, worktrees: store, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback() {}, createManager() { throw new Error("no maintenance model"); } });
+  const executor = new ManagedTicketExecutor({ owner: testOwner(cwd), pullRequests: noPullRequests, cwd, cfg, board, worktrees: store, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback() {}, createManager() { throw new Error("no maintenance model"); } });
   executor.launch = async (c) => { models.push(c.itemId); return { status: "launched", runId: c.itemId, worktree: cwd }; };
   const state = createLoopState();
-  const owner = acquireOwnerLock(cwd, "bot");
+  const owner = testOwner(cwd);
   const ready = { ...card, itemId: "B", number: 2, status: cfg.columns.ready, closed: false };
   const cards = [card, ready];
   const deps: LoopDeps = { cwd, cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo", meta: { projectId: "P", statusFieldId: "S", statusOptions: {} }, callback() {}, listCards: async () => structuredClone(cards) };
@@ -51,11 +53,12 @@ function fixture(status = "Done", stage: "integrate" | "cleanup" = "cleanup") {
 for (const stage of ["integrate", "cleanup"] as const) for (const lane of ["Done", "Backlog", "Ready"]) {
   const f = fixture(lane, stage);
   try {
-    assert.equal((await f.executor.finalizeClosed(structuredClone(f.card))).status, "blocked");
+    assert.equal((await f.executor.finalizeClosed(structuredClone(f.card))).status, lane === "Ready" ? "skipped" : "blocked");
     assert.equal(f.card.status, lane, "technical failure must never regress Project Status");
     assert.deepEqual(f.writes, [], "no claim/comment/reopen for technical retry");
-    assert.equal(f.record().retry?.stage, stage);
-    f.store.finalizeAccepted = async () => "c".repeat(40);
+    assert.equal(f.record().retry?.stage, lane === "Ready" ? stage : "cleanup");
+    if (lane === "Ready") f.card.status = "Done";
+    f.store.cleanupLegacyCompleted = async () => "c".repeat(40);
     assert.equal((await f.executor.finalizeClosed(structuredClone(f.card))).status, "finalized");
     assert.equal(f.card.status, "Backlog"); assert.equal(f.record(), undefined);
     assert.deepEqual(f.models, []);
@@ -145,7 +148,7 @@ for (const capacity of [1, 2]) {
   const f = fixture(), held = deferred(), entered = deferred(), reviewHeld = deferred(), reviewing = deferred();
   f.cfg.max_workers = capacity;
   const c: Card = { ...f.card, itemId: "C", number: 3, title: "T003 review", status: "Review", closed: false };
-  let reviewRecord: TicketExecutionRecord = { schemaVersion: 4, itemId: "C", issueNumber: 3, taskKey: "T003", taskBranch: "task/issue-3", baseBranch: "main", path: cwd, createdAt: 2 };
+  let reviewRecord: TicketExecutionRecordV5 = { schemaVersion: 5, itemId: "C", issueNumber: 3, taskKey: "T003", taskBranch: "task/issue-3", baseBranch: "main", path: cwd, createdAt: 2 };
   const read = f.store.read.bind(f.store), update = f.store.update.bind(f.store);
   f.store.read = (id) => id === "C" ? structuredClone(reviewRecord) : read(id);
   f.store.update = (id, fn) => id === "C" ? reviewRecord = fn(structuredClone(reviewRecord)) : update(id, fn);
@@ -199,3 +202,5 @@ console.log("PASS: stopping also vetoes pending model writeback after awaited I/
   } finally { await f.loop.stop(); }
 }
 console.log("PASS: failed model reconciliation excludes that ticket from a second same-tick finalization attempt");
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

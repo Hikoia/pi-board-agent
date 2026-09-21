@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { isTicketExecutionRecord } from "../src/ticket-worktree.js";
+import { isTicketExecutionRecordV5 } from "../src/ticket-worktree.js";
 import { pendingTicketWrite } from "../src/ticket-retry.js";
 import { fixture, git } from "./conflict-handoff-fixture.js";
 
@@ -13,7 +13,7 @@ for (const target of ["comment", "reopen", "ready"] as const) {
     taskBranch: owner === "branch" ? f.record.taskBranch : "task/issue-999",
     path: owner === "path" ? f.record.path : join(f.repo, ".pi/worktrees/ticket-issue-999-other"),
   };
-  assert.ok(isTicketExecutionRecord(duplicate));
+  assert.ok(isTicketExecutionRecordV5(duplicate));
   const duplicateFile = f.store.recordPath(duplicate.itemId), refs = git(f.origin, "show-ref");
   let injected = false, beforeEvents: string[] = [], beforeRecord = Buffer.alloc(0);
   f.setHook((event) => {

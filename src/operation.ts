@@ -5,6 +5,8 @@ export type OperationPhase =
   | "verify-backup"
   | "verify-source"
   | "integrate"
+  | "observe-pr"
+  | "create-pr"
   | "remove"
   | "writeback";
 export interface OperationProgress {
@@ -47,6 +49,7 @@ export interface OperationActivity extends OperationProgress {
 export interface OperationObservation {
   activity?: OperationActivity;
   lastBlocker?: string;
+  waiting?: { itemId: string; prNumber: number; prUrl: string; reason: string };
 }
 
 /** Display only. Neither throttling nor a stale observation grants authority. */
@@ -88,7 +91,8 @@ export function observeOperation(
 
 export function activityLines(state: OperationObservation, tickSeconds: number, now = Date.now()): string[] {
   const a = state.activity;
-  if (!a) return state.lastBlocker ? [`Maintenance blocked: ${state.lastBlocker}`] : [];
+  if (!a) return state.lastBlocker ? [`Maintenance blocked: ${state.lastBlocker}`] :
+    state.waiting ? [`PR #${state.waiting.prNumber} · ${state.waiting.prUrl}`, state.waiting.reason] : [];
   const count = (n: number) => a.unit === "bytes" ? (n / 1024 / 1024).toFixed(1) : String(n);
   const progress = a.completed === undefined ? "" :
     ` · ${count(a.completed)}${a.total === undefined ? "" : ` / ${count(a.total)}`} ${a.unit === "bytes" ? "MiB" : "items"}`;

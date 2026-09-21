@@ -25,7 +25,7 @@ import {
 import type { TicketExecutor } from "./ticket-executor.js";
 import {
   TicketWorktrees,
-  type TicketExecutionRecord,
+  type TicketExecutionRecordV5 as TicketExecutionRecord,
 } from "./ticket-worktree.js";
 import { buildTasksForWave } from "./workflow-prompt.js";
 import { ownerLockIsHeld, type OwnerLock } from "./owner-lock.js";
@@ -419,7 +419,7 @@ export class BoardLoop {
           isTargetIssue(card, repoOwner, repoName, "Task") &&
           (card.status?.toLowerCase() === cfg.columns.review.toLowerCase() ||
             (card.status?.toLowerCase() === cfg.columns.ready.toLowerCase() &&
-              this.ticketWorktrees.read(card.itemId)?.retry?.stage ===
+              this.ticketWorktrees.readStored(card.itemId)?.retry?.stage ===
                 "review")),
       );
       const readyCandidates = cards.filter(
@@ -427,8 +427,8 @@ export class BoardLoop {
           isTargetIssue(card, repoOwner, repoName, "Task") &&
           card.status?.toLowerCase() === cfg.columns.ready.toLowerCase() &&
           card.closed === false &&
-          (!this.ticketWorktrees.read(card.itemId)?.retry ||
-            this.ticketWorktrees.read(card.itemId)?.retry?.stage === "build"),
+          (!this.ticketWorktrees.readStored(card.itemId)?.retry ||
+            this.ticketWorktrees.readStored(card.itemId)?.retry?.stage === "build"),
       );
       const launchReady = async (
         limit: number,
@@ -542,19 +542,18 @@ export class BoardLoop {
         record = this.ticketWorktrees.read(card.itemId);
         if (
           !record ||
-          record.schemaVersion !== 4 ||
+          record.schemaVersion !== 5 ||
           record.issueNumber !== fresh.number ||
           record.plan !== (card.plan ? planSlug(card.plan) : undefined) ||
           record.taskBranch !== task.taskBranch ||
           record.activeRunId ||
           record.launchingAt !== undefined ||
-          record.finalization ||
-          record.integration ||
+          (record.integration && !(record.integration.kind === "pr" && record.integration.phase === "suspended")) ||
           pendingTicketWrite(record) ||
           this.ticketWorktrees.hasCleanupReceipt(card.itemId)
         )
           throw new StaleCardError(
-            "Missing matching idle v4 ticket before review.",
+            "Missing matching idle v5 ticket before review.",
           );
         const assertRecord = () => {
           if (
@@ -590,6 +589,8 @@ export class BoardLoop {
                 record = this.ticketWorktrees.setReviewedTaskSha(
                   card.itemId,
                   sha,
+                  this.ownerLock ?? this.ticketWorktrees.owner,
+                  () => { assertRecord(); if (!this.admissionStillAllowed()) throw new StaleCardError("Review stopped."); },
                 );
               },
               signal: this.foreground.signal,
@@ -609,6 +610,8 @@ export class BoardLoop {
         record = this.ticketWorktrees.setReviewedTaskSha(
           latest.itemId,
           review.taskSha,
+          this.ownerLock ?? this.ticketWorktrees.owner,
+          () => { assertRecord(); if (!this.admissionStillAllowed()) throw new StaleCardError("Review stopped."); },
         );
         const decision =
           parsed.verdict === "needs_decision"
@@ -640,6 +643,8 @@ export class BoardLoop {
                     : renderReviewComment(parsed),
                 }),
           },
+          this.ownerLock ?? this.ticketWorktrees.owner,
+          () => { assertRecord(); if (!this.admissionStillAllowed()) throw new StaleCardError("Review stopped."); },
         );
         await settleTicketWrite(
           this.ticketWorktrees,
@@ -648,11 +653,12 @@ export class BoardLoop {
           botLogin,
           undefined,
           { signal: this.foreground.signal },
+          this.ownerLock ?? this.ticketWorktrees.owner,
         );
         claimed = false;
         callback(
           pass
-            ? `AI review passed for "${latest.title}" at ${review.taskSha} → ${cfg.columns.done}. Validate ${record.path}, then close issue #${latest.number} to merge.`
+            ? `AI review passed for "${latest.title}" at ${review.taskSha} → ${cfg.columns.done}. Validate ${record.path}, then close issue #${latest.number} to submit a PR for manual merge.`
             : `AI review ${parsed.verdict} for "${latest.title}" at ${review.taskSha}.`,
         );
       } catch (error) {
@@ -685,6 +691,7 @@ export class BoardLoop {
               botLogin,
               undefined,
               { signal: this.foreground.signal },
+              this.ownerLock ?? this.ticketWorktrees.owner,
             );
             claimed = false;
           } catch (writeError) {
@@ -715,12 +722,14 @@ export class BoardLoop {
                     record.retry?.reason ??
                     "Review admission deferred; release the stopped invocation's claim.",
                 },
+                this.ownerLock ?? this.ticketWorktrees.owner,
               );
               await settleTicketWrite(
                 this.ticketWorktrees,
                 record,
                 writeBoard,
                 botLogin,
+                undefined, undefined, this.ownerLock ?? this.ticketWorktrees.owner,
               );
             } else {
               const fresh = await board.refresh(card);
@@ -751,11 +760,16 @@ export class BoardLoop {
     const { cfg, repoOwner, repoName } = this.deps;
     const candidates = cards.filter((card) => {
       if (attemptedItemIds.has(card.itemId) || !isTargetIssue(card, repoOwner, repoName)) return false;
-      const record = this.ticketWorktrees.read(card.itemId);
+      const record = this.ticketWorktrees.readStored(card.itemId);
       if (record?.activeRunId || record?.launchingAt !== undefined) return false;
       const stage = record?.retry?.stage;
       // Retire historical closed technical writes even after a manual lane change.
       if (record && (stage === "integrate" || stage === "cleanup") && pendingTicketWrite(record)?.card.closed) return true;
+      if (record?.schemaVersion === 5 && record.integration?.kind === "pr") {
+        // Open Ready with suspended approval belongs to ordinary builder admission.
+        if (!card.closed && card.status?.toLowerCase() === cfg.columns.ready.toLowerCase() && record.integration.phase === "suspended") return false;
+        return true;
+      }
       if (!card.closed) return false;
       const status = card.status?.toLowerCase();
       return status === cfg.columns.done.toLowerCase() ||
@@ -788,8 +802,20 @@ export class BoardLoop {
         (!this.ownerLock || ownerLockIsHeld(this.ownerLock)),
       { signal: controller.signal, onProgress: observer.onProgress },
     )).then((outcome) => {
-      if (outcome.status === "finalized" || outcome.status === "backlogged")
+      if (outcome.status === "finalized" || outcome.status === "backlogged") {
         this.finalizationBlockers.delete(card.itemId);
+        if (this.state.waiting?.itemId === card.itemId) this.state.waiting = undefined;
+      }
+      if (outcome.status === "waiting") {
+        this.state.lastBlocker = undefined;
+        this.state.waiting = { itemId: card.itemId, prNumber: outcome.prNumber, prUrl: outcome.prUrl, reason: outcome.reason };
+        const fingerprint = JSON.stringify(outcome);
+        if (this.finalizationBlockers.get(card.itemId) !== fingerprint) {
+          this.finalizationBlockers.set(card.itemId, fingerprint);
+          this.deps.callback(`PR #${outcome.prNumber}: ${outcome.prUrl} — ${outcome.reason}`, "info");
+        }
+        return;
+      }
       if (outcome.status !== "conflict" && outcome.status !== "blocked") return;
       blocker = `#${card.number}: ${outcome.reason}`;
       warn(JSON.stringify(outcome), outcome.status === "conflict"

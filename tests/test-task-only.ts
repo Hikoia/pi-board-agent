@@ -162,7 +162,7 @@ excluded.push({
 });
 const cards = [card, ...excluded],
   untouched = structuredClone(excluded);
-const store = new TicketWorktrees(repo);
+const store = new TicketWorktrees(repo, testOwner(repo));
 const legacyFiles = [
   "refine-state.json",
   "refine-state-unblocked.json",
@@ -212,8 +212,9 @@ const board: TicketBoardAdapter = {
 let builds = 0,
   reviews = 0,
   taskSha = "";
+const prs = fakePullRequests(repo, true);
 const executor = new ManagedTicketExecutor({
-  cwd: repo,
+  owner: testOwner(repo), pullRequests: prs.api, cwd: repo,
   cfg,
   board,
   worktrees: store,
@@ -340,7 +341,7 @@ try {
   const result = git(origin, "rev-parse", "main");
   assert.deepEqual(
     git(origin, "show", "-s", "--format=%P", result).split(" "),
-    [base, taskSha],
+    [base, prs.prs[0].headSha],
   );
   assert.equal(git(repo, "rev-parse", "HEAD"), base);
   assert.equal(readFileSync(join(repo, "value.txt"), "utf8"), "before\n");
@@ -391,7 +392,7 @@ for (const patch of [
   };
   let claims = 0;
   const guarded = new ManagedTicketExecutor({
-    cwd: repo,
+    owner: testOwner(repo), pullRequests: noPullRequests, cwd: repo,
     cfg,
     worktrees: store,
     botLogin: "bot",
@@ -427,3 +428,5 @@ for (const patch of [
 console.log(
   "PASS: post-claim PR/Draft/foreign/non-Task/item/number replacement blocks all further mutation, including assignee release",
 );
+
+import { testOwner, noPullRequests, fakePullRequests } from "./pr-fixture.js";

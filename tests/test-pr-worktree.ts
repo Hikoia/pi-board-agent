@@ -20,7 +20,7 @@ const remove = (a: string[]) => a[0] === "worktree" && a[1] === "remove";
 const localDelete = (a: string[]) => a[0] === "update-ref" && a.includes("-d");
 
 async function make() {
-  const f = await fixture(false, true);
+  const f = await fixture(false, 4);
   const owner = acquireOwnerLock(f.repo, "offline-bot");
   owners.push(owner);
   unlinkSync(f.recordFile);
@@ -282,7 +282,7 @@ try {
       kept(f, remote);
       console.log(`PASS: ${kind} blocks PR cleanup without deleting work/refs/evidence`);
     }
-    await assert.rejects(f.store.finalizeAccepted(f.task, "merge"), /PR executor|direct integration/);
+    assert.equal("finalizeAccepted" in f.store, false, "direct integration engine is absent");
     await assert.rejects(f.store.cleanupLegacyCompleted(f.task, f.owner, f.current), /legacy completion/);
     assert.equal(await f.clean(good), good.mergeCommitSha);
     await f.complete(good.mergeCommitSha!);

@@ -21,11 +21,11 @@ const unhandled: unknown[] = [], messages: string[] = [];
 const onUnhandled = (error: unknown) => { unhandled.push(error); };
 process.on("unhandledRejection", onUnhandled);
 const state = createLoopState();
-const owner = acquireOwnerLock(cwd, "bot");
+const owner = testOwner(cwd);
 let mutations = 0, released = false;
-const worktrees = new TicketWorktrees(cwd);
+const worktrees = new TicketWorktrees(cwd, testOwner(cwd));
 writeFileSync(worktrees.recordPath(card.itemId), JSON.stringify({
-  schemaVersion: 4, itemId: card.itemId, issueNumber: 1, taskKey: "issue-1", plan: "demo",
+  schemaVersion: 5, itemId: card.itemId, issueNumber: 1, taskKey: "issue-1", plan: "demo",
   taskBranch: "task/issue-1", baseBranch: "main", path: join(cwd, ".pi", "worktrees", "item"), createdAt: 1,
 }));
 const loop = new BoardLoop({
@@ -45,7 +45,7 @@ const loop = new BoardLoop({
   reconcile: async () => ({ active: [], resumed: 0, adopted: 0, needsHuman: 0, orphans: 0, errors: 0 }),
   activeCount: () => 0, shutdown: async () => {},
   launch: async () => { throw new Error("unexpected launch"); }, finalizeClosed: async () => { throw new Error("unexpected finalize"); },
-}, new TicketWorktrees(cwd), owner);
+}, new TicketWorktrees(cwd, testOwner(cwd)), owner);
 const tick = loop.tickNow();
 let stopped: Promise<void> | undefined;
 try {
@@ -67,3 +67,5 @@ assert.equal(state.foreground, null);
 assert.equal(existsSync(owner.path), false);
 assert.match(messages.join("\n"), /early model failure/);
 console.log("PASS: async foreground observation handles early rejection without unhandled promises, drains before releasing claim/slot/owner, and reports the model error");
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

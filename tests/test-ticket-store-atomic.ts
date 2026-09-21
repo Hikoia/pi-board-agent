@@ -59,14 +59,14 @@ try {
     cut = (operation) => {
       if (operation === process.argv[4]) process.exit(73);
     };
-    store.update(itemId, (r) => ({ ...r, ...progress }));
+    store.legacyUpdate(itemId, (r) => ({ ...r, ...progress }));
     throw new Error("Crash cut did not execute");
   }
 
   if (process.argv[2] === "crash-v5") {
     const store = new TicketWorktrees(process.argv[3]);
     const owner = acquireOwnerLock(store.repoRoot, "offline-bot");
-    const original = store.read(itemId)!;
+    const original = store.legacyRead(itemId)!;
     const source = fs.readFileSync(store.recordPath(itemId));
     const next: TicketExecutionRecordV5 = { ...original, schemaVersion: 5, integration: pr };
     cut = (operation) => { if (operation === process.argv[4]) process.exit(73); };
@@ -87,7 +87,7 @@ try {
       path: join(repo, ".pi", "worktrees", "unused"), createdAt: 1,
     };
     if (seed) {
-      if (version === 4) store.create(record);
+      if (version === 4) store.legacyCreate(record);
       else fs.writeFileSync(file, JSON.stringify({ ...record, schemaVersion: 3, plan: "demo" }, null, 2));
     }
     return { repo, store, dir, file, record };
@@ -98,11 +98,11 @@ try {
       const f = fixture(version);
       const before = fs.readFileSync(f.file);
       cut = (step) => { if (step === operation) throw new Error(`offline ${step} interruption`); };
-      assert.throws(() => f.store.update(itemId, (r) => ({ ...r,
+      assert.throws(() => f.store.legacyUpdate(itemId, (r) => ({ ...r,
         ...(version === 4 ? progress : { reviewedTaskSha: integration.taskSha }),
       })), /offline .* interruption/);
       cut = () => {};
-      const reopened = new TicketWorktrees(f.repo).read(itemId)!;
+      const reopened = new TicketWorktrees(f.repo).legacyRead(itemId)!;
       assert.equal(reopened.schemaVersion, version);
       if (operation === "renamed") {
         if (version === 4) {
@@ -118,13 +118,13 @@ try {
   for (const operation of ["write", "flush", "rename", "renamed"]) {
     const f = fixture(4, false);
     cut = (step) => { if (step === operation) throw new Error(`offline ${step} interruption`); };
-    assert.throws(() => f.store.create(f.record), /offline .* interruption/);
+    assert.throws(() => f.store.legacyCreate(f.record), /offline .* interruption/);
     cut = () => {};
     const reopened = new TicketWorktrees(f.repo);
-    if (operation === "renamed") assert.deepEqual(reopened.read(itemId), f.record);
+    if (operation === "renamed") assert.deepEqual(reopened.legacyRead(itemId), f.record);
     else {
       assert.equal(reopened.has(itemId), false);
-      assert.equal(reopened.read(itemId), undefined);
+      assert.equal(reopened.legacyRead(itemId), undefined);
       assert.throws(() => reopened.clearExecution(itemId), /missing or unsupported/);
     }
     assert.equal(fs.readdirSync(f.dir).some((name) => name.endsWith(".tmp")), false);
@@ -142,24 +142,24 @@ try {
     if (operation === "flushed") {
       assert.deepEqual(fs.readFileSync(f.file), before);
       assert.equal(fs.readdirSync(f.dir).filter((name) => name.endsWith(".tmp")).length, 1);
-      assert.equal(store.read(itemId)?.integration, undefined, "unpublished temporary is not adopted");
+      assert.equal(store.legacyRead(itemId)?.integration, undefined, "unpublished temporary is not adopted");
     } else {
-      assert.deepEqual(store.read(itemId)?.integration, integration);
-      assert.deepEqual(store.read(itemId)?.retry, progress.retry);
+      assert.deepEqual(store.legacyRead(itemId)?.integration, integration);
+      assert.deepEqual(store.legacyRead(itemId)?.retry, progress.retry);
     }
-    assert.equal(store.list().length, 1);
+    assert.equal(store.legacyList().length, 1);
     console.log(`PASS: abrupt child exit 73 after ${operation} retains whole authoritative state and never adopts an orphan temporary`);
   }
 
   for (const change of ["missing", "corrupt", "newer"]) {
     const f = fixture();
-    const newer = JSON.stringify({ ...f.store.read(itemId), lastRunId: "external-update" });
+    const newer = JSON.stringify({ ...f.store.legacyRead(itemId), lastRunId: "external-update" });
     cut = (operation) => {
       if (operation !== "flushed") return;
       if (change === "missing") fs.unlinkSync(f.file);
       else fs.writeFileSync(f.file, change === "corrupt" ? "{bad" : newer);
     };
-    assert.throws(() => f.store.update(itemId, (r) => ({ ...r, ...progress })), /atomic write boundary/);
+    assert.throws(() => f.store.legacyUpdate(itemId, (r) => ({ ...r, ...progress })), /atomic write boundary/);
     cut = () => {};
     if (change === "missing") assert.equal(fs.existsSync(f.file), false);
     else assert.equal(fs.readFileSync(f.file, "utf8"), change === "corrupt" ? "{bad" : newer);
@@ -171,7 +171,7 @@ try {
     for (const operation of ["write", "flush", "rename", "renamed"]) {
       const f = fixture(version), owner = acquireOwnerLock(f.repo, "offline-bot");
       try {
-        const original = f.store.read(itemId)!;
+        const original = f.store.legacyRead(itemId)!;
         const raw = Buffer.from(JSON.stringify(original, null, "\t").replaceAll("\n", "\r\n") + "\r\n\r\n");
         fs.writeFileSync(f.file, raw);
         const next: TicketExecutionRecordV5 = { ...original, schemaVersion: 5, integration: pr };
@@ -182,7 +182,7 @@ try {
         if (operation === "renamed") assert.deepEqual(reopened.readV5(itemId), next);
         else {
           assert.deepEqual(fs.readFileSync(f.file), raw, "prepublication failure preserves exact readable legacy bytes");
-          assert.deepEqual(reopened.read(itemId), original);
+          assert.deepEqual(reopened.legacyRead(itemId), original);
         }
         assert.deepEqual(fs.readdirSync(f.dir), ["pvti_atomic.json"]);
       } finally { cut = () => {}; owner.release(); }
@@ -237,7 +237,7 @@ try {
     const reopened = new TicketWorktrees(f.repo);
     if (operation === "flushed") {
       assert.deepEqual(fs.readFileSync(f.file), before);
-      assert.equal(reopened.read(itemId)?.schemaVersion, 4);
+      assert.equal(reopened.legacyRead(itemId)?.schemaVersion, 4);
       assert.equal(fs.readdirSync(f.dir).filter((name) => name.endsWith(".tmp")).length, 1);
     } else assert.deepEqual(reopened.readV5(itemId)?.integration, pr);
     assert.equal(reopened.listStored().length, 1);
@@ -248,7 +248,7 @@ try {
     for (const change of ["missing", "corrupt", "newer", "format", "owner-lost", "stopped", "task-moved", "owner-lost-in-guard"]) {
       const f = fixture(), owner = acquireOwnerLock(f.repo, "offline-bot");
       try {
-        const original = f.store.read(itemId)!;
+        const original = f.store.legacyRead(itemId)!;
         const next: TicketExecutionRecordV5 = { ...original, schemaVersion: 5, integration: pr };
         if (api === "progress") fs.writeFileSync(f.file, JSON.stringify(next));
         const raw = fs.readFileSync(f.file);
@@ -288,9 +288,9 @@ try {
     const outside = `${f.dir}-preserved`;
     fs.renameSync(f.dir, outside);
     fs.symlinkSync(outside, f.dir, process.platform === "win32" ? "junction" : "dir");
-    assert.equal(f.store.read(itemId), undefined);
+    assert.equal(f.store.legacyRead(itemId), undefined);
     assert.throws(() => f.store.clearExecution(itemId), /missing or unsupported/);
-    assert.throws(() => f.store.create({ ...JSON.parse(bytes.toString()), itemId: "NEW" }), /Symlinked ticket state/);
+    assert.throws(() => f.store.legacyCreate({ ...JSON.parse(bytes.toString()), itemId: "NEW" }), /Symlinked ticket state/);
     assert.deepEqual(fs.readFileSync(join(outside, "pvti_atomic.json")), bytes);
     assert.deepEqual(fs.readdirSync(outside), ["pvti_atomic.json"]);
   }

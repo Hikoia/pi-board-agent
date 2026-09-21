@@ -79,7 +79,7 @@ try {
       false,
     );
     assert.ok(existsSync(f.record.path));
-    assert.equal(f.store.read(f.task.itemId)?.schemaVersion, 3);
+    assert.equal(f.store.readStored(f.task.itemId)?.schemaVersion, 3);
   }
   writeFileSync(f.receipt, "{corrupt");
   git(f.repo, "update-ref", "-d", `refs/heads/${f.task.taskBranch}`, f.taskSha);

@@ -24,7 +24,7 @@ const deferred = () => { let resolve!: () => void; const promise = new Promise<v
 let sequence = 0;
 for (const mode of ["recovery", "reset"]) for (const committed of [false, true]) {
   for (const change of ["review", "done", "contract", "claim-transfer", "claim-lost", "read-error", "release-error", "dirty", "record-change", "unchanged", "commit-during-read"]) {
-    const number = ++sequence, cfg = structuredClone(_DEFAULTS), store = new TicketWorktrees(repo);
+    const number = ++sequence, cfg = structuredClone(_DEFAULTS), store = new TicketWorktrees(repo, testOwner(repo));
     cfg.context.enabled = false;
     const card: Card = { itemId: `RECOVERY_${number}`, number, contentType: "Issue", type: "Task", title: `T${number} task`, body: "approved", plan: "demo", repoOwner: "owner", repoName: "repo", status: cfg.columns.ready, closed: false, assignees: [] };
     const record = await store.ensure(buildTasksForWave(cfg, "demo", [card])[0], "demo");
@@ -32,7 +32,7 @@ for (const mode of ["recovery", "reset"]) for (const committed of [false, true])
     const entered = deferred(), finish = deferred();
     let held = false, readError = false, releaseError = false, starts = 0;
     const writes: string[] = [];
-    const executor = new ManagedTicketExecutor({ cwd: repo, cfg, worktrees: store, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {}, board: {
+    const executor = new ManagedTicketExecutor({ owner: testOwner(repo), pullRequests: noPullRequests, cwd: repo, cfg, worktrees: store, botLogin: "bot", repoOwner: "owner", repoName: "repo", callback: () => {}, board: {
       getCard: async (id) => {
         if (id !== card.itemId) return undefined;
         if (!held && (mode === "recovery" || pendingTicketWrite(store.read(card.itemId)!))) {
@@ -94,3 +94,5 @@ for (const mode of ["recovery", "reset"]) for (const committed of [false, true])
     } finally { finish.resolve(); await handled; await executor.shutdown(); store.clearExecution(card.itemId); }
   }
 }
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";

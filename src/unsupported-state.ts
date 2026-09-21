@@ -1,7 +1,7 @@
 import { lstatSync, readFileSync, readdirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { runProcessSync } from "./process-runner.js";
-import { isTicketExecutionRecord } from "./ticket-worktree.js";
+import { isStoredTicketExecutionRecord } from "./ticket-worktree.js";
 
 export function resolveStateRepoRoot(cwd: string): string {
   const result = runProcessSync("git", ["rev-parse", "--show-toplevel"], {
@@ -58,7 +58,7 @@ export function findUnsupportedState(
         if (!stat.isFile() || stat.isSymbolicLink())
           throw new Error("Not a regular state file");
         const value: unknown = JSON.parse(readFileSync(path, "utf8"));
-        if (!isTicketExecutionRecord(value)) unsupported.push(path);
+        if (!isStoredTicketExecutionRecord(value)) unsupported.push(path);
       } catch {
         unsupported.push(path);
       }

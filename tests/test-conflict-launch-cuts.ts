@@ -6,11 +6,18 @@ let fault: (from: string, to: string, edge: string) => void = () => {};
 const globals = globalThis as any;
 globals.__handoffRename = (from: string, to: string) => { fault(from, to, "before"); renameSync(from, to); fault(from, to, "after"); };
 const urls = [new URL("../src/ticket-worktree.ts", import.meta.url).href];
+const runner = new URL("../src/process-runner.ts", import.meta.url).href;
 const hooks = registerHooks({ resolve(specifier, context, next) {
+  if (urls.includes(context.parentURL!) && specifier === "./process-runner.js") return { url: `data:text/javascript,${encodeURIComponent(`export * from ${JSON.stringify(runner)};
+    export const runProcess = (...args) => globalThis.__handoffGit('async', ...args);
+    export const runProcessSync = (...args) => globalThis.__handoffGit('sync', ...args);`)}`, shortCircuit: true };
   if (urls.includes(context.parentURL!) && specifier === "node:fs") return { url: `data:text/javascript,${encodeURIComponent(`export * from 'node:fs'; export const renameSync = (...args) => globalThis.__handoffRename(...args);`)}`, shortCircuit: true };
   return next(specifier, context);
 } });
 const { fixture, settle } = await import("./conflict-handoff-fixture.js");
+// Load transport after our observed store; keep rename cuts live on Windows.
+const { fixtureProcess, dispose: disposeTransport } = await import("./cleanup-fixture.js");
+globals.__handoffGit = fixtureProcess;
 try {
   for (const target of ["begin-launch", "manager-start", "active-record"]) for (const edge of ["before", "after"] as const) {
     const f = await fixture(); let cut = false;
@@ -66,4 +73,4 @@ try {
       console.log("PASS: a persistent run with a different ticket identity cannot be adopted/resumed or released");
     } finally { await next.loop.stop(); }
   } finally { await f.loop.stop(); }
-} finally { hooks.deregister(); delete globals.__handoffRename; }
+} finally { hooks.deregister(); disposeTransport(); delete globals.__handoffRename; delete globals.__handoffGit; }

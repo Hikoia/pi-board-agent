@@ -103,13 +103,12 @@ function hasRecoveryState(cwd: string, root: string): boolean {
   return (
     store.hasCleanupReceipts() ||
     store
-      .list()
+      .listStored()
       .some(
         (record) =>
-          record.schemaVersion === 3 ||
+          record.schemaVersion !== 5 ||
           record.activeRunId !== undefined ||
           record.launchingAt !== undefined ||
-          record.finalization !== undefined ||
           record.integration !== undefined ||
           record.retry !== undefined,
       )
@@ -157,6 +156,7 @@ function saveRuntime(
     startedAt: runtimeStartedAt,
     activity: loopState.activity,
     lastBlocker: loopState.lastBlocker,
+    waiting: loopState.waiting,
   });
 }
 
@@ -279,7 +279,7 @@ async function performStart(
       return;
     }
     ownerLock = acquireOwnerLock(cwd, botLogin, root);
-    const worktrees = new TicketWorktrees(cwd);
+    const worktrees = new TicketWorktrees(cwd, ownerLock);
     loopWorktrees = { cwd: resolve(cwd), store: worktrees, cfg };
     loopState = createLoopState();
 
@@ -342,6 +342,7 @@ async function performStart(
     const executor = createProductionTicketExecutor({
       cwd,
       worktrees,
+      owner: ownerLock,
       cfg,
       meta,
       botLogin,

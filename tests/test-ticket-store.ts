@@ -39,10 +39,10 @@ let sequence = 0;
 function fixture(record: TicketExecutionRecord = v4) {
   const repo = join(root, `store-${++sequence}`);
   mkdirSync(repo);
-  const store = new TicketWorktrees(repo);
+  const store = new TicketWorktrees(repo, testOwner(repo));
   const dir = join(repo, ".pi", "board-agent", "ticket-worktrees");
   const file = join(dir, "pvti_1.json");
-  if (record.schemaVersion === 4) store.create(record as TicketExecutionRecordV4);
+  if (record.schemaVersion === 4) store.legacyCreate(record as TicketExecutionRecordV4);
   else writeFileSync(file, JSON.stringify(record, null, 2)); // exact old fixture, no conversion
   return { repo, store, dir, file };
 }
@@ -68,9 +68,9 @@ function fixture(record: TicketExecutionRecord = v4) {
     assert.ok(isTicketExecutionRecord(value), JSON.stringify(value));
     const f = fixture(value);
     const before = readFileSync(f.file);
-    const reopened = new TicketWorktrees(f.repo);
-    assert.deepEqual(reopened.read(value.itemId), JSON.parse(before.toString()));
-    assert.deepEqual(reopened.list(), [reopened.read(value.itemId)]);
+    const reopened = new TicketWorktrees(f.repo, testOwner(f.repo));
+    assert.deepEqual(reopened.legacyRead(value.itemId), JSON.parse(before.toString()));
+    assert.deepEqual(reopened.legacyList(), [reopened.legacyRead(value.itemId)]);
     assert.deepEqual(findUnsupportedState(f.repo), []);
     assert.deepEqual(readFileSync(f.file), before, "read/startup inspection is read-only");
   }
@@ -113,8 +113,8 @@ function fixture(record: TicketExecutionRecord = v4) {
   const before = readFileSync(f.file);
   for (const value of invalid) {
     assert.equal(isTicketExecutionRecord(value), false, JSON.stringify(value));
-    assert.throws(() => f.store.create(value as TicketExecutionRecordV4));
-    assert.throws(() => f.store.update(v4.itemId, () => value as TicketExecutionRecord));
+    assert.throws(() => f.store.legacyCreate(value as TicketExecutionRecordV4));
+    assert.throws(() => f.store.legacyUpdate(v4.itemId, () => value as TicketExecutionRecord));
     assert.deepEqual(readFileSync(f.file), before);
   }
   assert.deepEqual(readdirSync(f.dir), ["pvti_1.json"]);
@@ -124,55 +124,55 @@ function fixture(record: TicketExecutionRecord = v4) {
 {
   const retry: TicketRetryState = { stage: "build", reason: "failed tests; status/release still pending" };
   const f = fixture({ ...v4, retry });
-  f.store.beginLaunch(v4.itemId, 10);
-  f.store.setActiveRun(v4.itemId, "original-run", 11);
-  assert.throws(() => f.store.beginLaunch(v4.itemId), /active builder/);
-  assert.deepEqual(f.store.read(v4.itemId)?.retry, retry);
-  f.store.clearExecution(v4.itemId, "original-run");
-  const reopened = new TicketWorktrees(f.repo);
-  assert.deepEqual(reopened.read(v4.itemId)?.retry, retry);
-  assert.equal(reopened.read(v4.itemId)?.lastRunId, "original-run");
-  assert.equal(reopened.read(v4.itemId)?.activeRunId, undefined);
+  f.store.legacyBeginLaunch(v4.itemId, 10);
+  f.store.legacySetActiveRun(v4.itemId, "original-run", 11);
+  assert.throws(() => f.store.legacyBeginLaunch(v4.itemId), /active builder/);
+  assert.deepEqual(f.store.legacyRead(v4.itemId)?.retry, retry);
+  f.store.legacyClearExecution(v4.itemId, "original-run");
+  const reopened = new TicketWorktrees(f.repo, testOwner(f.repo));
+  assert.deepEqual(reopened.legacyRead(v4.itemId)?.retry, retry);
+  assert.equal(reopened.legacyRead(v4.itemId)?.lastRunId, "original-run");
+  assert.equal(reopened.legacyRead(v4.itemId)?.activeRunId, undefined);
   for (const stage of ["review", "integrate", "cleanup"] as const) {
-    reopened.update(v4.itemId, (r) => ({ ...r, retry: { ...retry, stage } }));
-    assert.throws(() => reopened.beginLaunch(v4.itemId), /retry cannot start a builder/);
+    reopened.legacyUpdate(v4.itemId, (r) => ({ ...r, retry: { ...retry, stage } }));
+    assert.throws(() => reopened.legacyBeginLaunch(v4.itemId), /retry cannot start a builder/);
   }
   // Only explicit successful settlement consumes retry; execution release alone never does.
-  reopened.update(v4.itemId, (r) => ({ ...r, retry: undefined }));
-  reopened.setReviewedTaskSha(v4.itemId, integration.taskSha);
-  reopened.update(v4.itemId, (r) => ({ ...r, integration, retry: { stage: "cleanup", reason: "Done write failed" } }));
-  reopened.clearExecution(v4.itemId);
+  reopened.legacyUpdate(v4.itemId, (r) => ({ ...r, retry: undefined }));
+  reopened.legacySetReviewedTaskSha(v4.itemId, integration.taskSha);
+  reopened.legacyUpdate(v4.itemId, (r) => ({ ...r, integration, retry: { stage: "cleanup", reason: "Done write failed" } }));
+  reopened.legacyClearExecution(v4.itemId);
   const before = readFileSync(f.file);
   for (const progress of [undefined,
     { ...integration, baseSha: "d".repeat(40) },
     { ...integration, taskSha: "d".repeat(40) },
     { ...integration, resultSha: "d".repeat(40) },
-  ]) assert.throws(() => reopened.update(v4.itemId, (r) => ({ ...r, integration: progress })), /pending integration/);
-  assert.throws(() => reopened.update(v4.itemId, (r) => ({ ...r, reviewedTaskSha: undefined })), /pending integration/);
-  assert.throws(() => reopened.beginLaunch(v4.itemId), /pending finalization/);
-  assert.throws(() => reopened.setActiveRun(v4.itemId, "second-run"), /pending finalization/);
-  assert.throws(() => reopened.setReviewedTaskSha(v4.itemId, "d".repeat(40)), /pending finalization/);
+  ]) assert.throws(() => reopened.legacyUpdate(v4.itemId, (r) => ({ ...r, integration: progress })), /pending integration/);
+  assert.throws(() => reopened.legacyUpdate(v4.itemId, (r) => ({ ...r, reviewedTaskSha: undefined })), /pending integration/);
+  assert.throws(() => reopened.legacyBeginLaunch(v4.itemId), /pending finalization/);
+  assert.throws(() => reopened.legacySetActiveRun(v4.itemId, "second-run"), /pending finalization/);
+  assert.throws(() => reopened.legacySetReviewedTaskSha(v4.itemId, "d".repeat(40)), /pending finalization/);
   // A prepared result cannot authorize cleanup without fresh Git proof, even with no task ref.
-  await assert.rejects(() => reopened.finalizeAccepted({ ...v4, title: "test", body: "test" }, "squash"));
+  assert.equal("finalizeAccepted" in reopened, false, "old direct integration engine is deleted");
   assert.deepEqual(readFileSync(f.file), before);
-  assert.deepEqual(new TicketWorktrees(f.repo).read(v4.itemId)?.integration, integration);
-  assert.equal(new TicketWorktrees(f.repo).read(v4.itemId)?.retry?.stage, "cleanup");
+  assert.deepEqual(new TicketWorktrees(f.repo, testOwner(f.repo)).legacyRead(v4.itemId)?.integration, integration);
+  assert.equal(new TicketWorktrees(f.repo, testOwner(f.repo)).legacyRead(v4.itemId)?.retry?.stage, "cleanup");
   console.log("PASS: execution release retains unsettled retry and immutable integration; prepared results never imply success or authorize old cleanup");
 }
 
 {
   const f = fixture(v3);
-  f.store.beginLaunch(v3.itemId, 10);
-  f.store.setActiveRun(v3.itemId, "v3-run", 11);
-  f.store.clearExecution(v3.itemId, "v3-run");
-  f.store.setReviewedTaskSha(v3.itemId, integration.taskSha);
-  f.store.update(v3.itemId, (r) => ({ ...r, finalization }));
+  f.store.legacyBeginLaunch(v3.itemId, 10);
+  f.store.legacySetActiveRun(v3.itemId, "v3-run", 11);
+  f.store.legacyClearExecution(v3.itemId, "v3-run");
+  f.store.legacySetReviewedTaskSha(v3.itemId, integration.taskSha);
+  f.store.legacyUpdate(v3.itemId, (r) => ({ ...r, finalization }));
   const before = readFileSync(f.file);
-  assert.throws(() => f.store.update(v3.itemId, (r) => ({ ...r, finalization: undefined })), /pending finalization/);
-  assert.throws(() => f.store.update(v3.itemId, (r) => ({ ...r, schemaVersion: 4, finalization: undefined })), /Invalid ticket execution update/);
+  assert.throws(() => f.store.legacyUpdate(v3.itemId, (r) => ({ ...r, finalization: undefined })), /pending finalization/);
+  assert.throws(() => f.store.legacyUpdate(v3.itemId, (r) => ({ ...r, schemaVersion: 4, finalization: undefined })), /Invalid ticket execution update/);
   assert.deepEqual(readFileSync(f.file), before);
-  assert.equal(f.store.read(v3.itemId)?.schemaVersion, 3);
-  assert.equal(f.store.read(v3.itemId)?.lastRunId, "v3-run");
+  assert.equal(f.store.legacyRead(v3.itemId)?.schemaVersion, 3);
+  assert.equal(f.store.legacyRead(v3.itemId)?.lastRunId, "v3-run");
   console.log("PASS: v3 execution updates and protected finalization journals retain their version; ordinary writes cannot migrate");
 }
 
@@ -180,26 +180,28 @@ function fixture(record: TicketExecutionRecord = v4) {
   const f = fixture();
   for (const bytes of ["{broken", JSON.stringify({ ...v3, schemaVersion: 2 }), JSON.stringify({ ...v4, integration: {} })]) {
     writeFileSync(f.file, bytes);
-    assert.equal(f.store.read(v4.itemId), undefined);
+    assert.equal(f.store.legacyRead(v4.itemId), undefined);
     assert.equal(f.store.has(v4.itemId), true, "invalid is not absent");
-    assert.deepEqual(f.store.list(), []);
+    assert.deepEqual(f.store.legacyList(), []);
     assert.equal(findUnsupportedState(f.repo).length, 1);
-    assert.throws(() => f.store.create(v4), /already exists/);
-    assert.throws(() => f.store.clearExecution(v4.itemId), /missing or unsupported/);
-    assert.throws(() => f.store.setReviewedTaskSha(v4.itemId, integration.taskSha), /missing or unsupported/);
+    assert.throws(() => f.store.legacyCreate(v4), /already exists/);
+    assert.throws(() => f.store.legacyClearExecution(v4.itemId), /missing or unsupported/);
+    assert.throws(() => f.store.legacySetReviewedTaskSha(v4.itemId, integration.taskSha), /missing or unsupported/);
     assert.equal(readFileSync(f.file, "utf8"), bytes);
   }
   rmSync(f.file);
-  assert.equal(f.store.read(v4.itemId), undefined);
+  assert.equal(f.store.legacyRead(v4.itemId), undefined);
   assert.equal(f.store.has(v4.itemId), false);
-  assert.throws(() => f.store.clearExecution(v4.itemId), /missing or unsupported/);
-  assert.throws(() => f.store.setReviewedTaskSha(v4.itemId, integration.taskSha), /missing or unsupported/);
+  assert.throws(() => f.store.legacyClearExecution(v4.itemId), /missing or unsupported/);
+  assert.throws(() => f.store.legacySetReviewedTaskSha(v4.itemId, integration.taskSha), /missing or unsupported/);
   assert.equal(existsSync(f.file), false, "missing state is not recreated by completion");
-  f.store.create(v4);
+  f.store.legacyCreate(v4);
   const before = readFileSync(f.file);
-  assert.throws(() => f.store.create({ ...v4, itemId: "pvti_1" }), /already exists/);
-  assert.equal(f.store.read("pvti_1"), undefined);
-  assert.throws(() => f.store.update(v4.itemId, (r) => ({ ...r, path: "other-worktree" })), /Invalid ticket execution update/);
+  assert.throws(() => f.store.legacyCreate({ ...v4, itemId: "pvti_1" }), /already exists/);
+  assert.equal(f.store.legacyRead("pvti_1"), undefined);
+  assert.throws(() => f.store.legacyUpdate(v4.itemId, (r) => ({ ...r, path: "other-worktree" })), /Invalid ticket execution update/);
   assert.deepEqual(readFileSync(f.file), before);
   console.log("PASS: corrupt, unsupported, missing and colliding records cannot be overwritten or completed as success");
 }
+
+import { testOwner, noPullRequests } from "./pr-fixture.js";
