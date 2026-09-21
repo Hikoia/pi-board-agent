@@ -42,6 +42,7 @@ import { legacyNeedsDesignColumn, type Config } from "./config.js";
 import { isTargetIssue, type Card, type IssueComment } from "./gh.js";
 import {
   isTicketExecutionRecord,
+  isTicketExecutionRecordV5,
   TicketStateChangedError,
   mustGit,
   samePath,
@@ -49,6 +50,8 @@ import {
   type TicketFinalizationState,
   type TicketExecutionRecord,
   type TicketExecutionRecordV4,
+  type TicketExecutionRecordV5,
+  type StoredTicketExecutionRecord,
   type TicketWorktrees,
 } from "./ticket-worktree.js";
 
@@ -150,7 +153,7 @@ export interface LegacyMigrationReport {
   failures: Array<{ source: string; reason: string }>;
 }
 
-/** The only v3 interpreter. Conversion never starts a manager, rewrites a run,
+/** The only v3/v4 interpreter. Conversion never starts a manager, rewrites a run,
  * changes Git/worktree contents, or writes/collects old repair/cleanup evidence.
  * Legacy repair ledgers and workflow journals are read-only. */
 export class LegacyTickets {
@@ -158,6 +161,7 @@ export class LegacyTickets {
   private owner?: OwnerLock;
   private canMigrate: () => boolean = () => true;
   private migrationStarted = false;
+  private migrationTarget: 4 | 5 = 4;
   private control?: OperationControl;
   private readonly pendingFiles = new Set<string>();
   readonly pendingDesign = new Set<string>();
@@ -182,7 +186,7 @@ export class LegacyTickets {
   /** A failed conversion may not fall back to the mutating v3 executor. */
   blockedReason(itemId: string): string | undefined {
     const { worktrees } = this.deps;
-    const record = worktrees.read(itemId);
+    const record = worktrees.readStored(itemId);
     return (
       this.failures.get(itemId) ??
       (this.pendingDesign.has(itemId)
@@ -191,7 +195,7 @@ export class LegacyTickets {
       (this.migrationStarted &&
       ((!record && worktrees.has(itemId)) ||
         (this.pendingFiles.has(worktrees.recordPath(itemId)) &&
-          record?.schemaVersion !== 4))
+          record?.schemaVersion !== this.migrationTarget))
         ? "Legacy ticket conversion is pending or unsupported; sources preserved."
         : undefined)
     );
@@ -238,7 +242,7 @@ export class LegacyTickets {
    * must not disappear from a launch-window observation. Never call load(): its
    * backup recovery can write the journal. Stale leases are left to the manager. */
   private runs(
-    record: TicketExecutionRecord,
+    record: StoredTicketExecutionRecord,
     stopped = false,
   ): PersistedRunState[] {
     const paths = workflowProjectPaths(record.path);
@@ -299,7 +303,7 @@ export class LegacyTickets {
   }
 
   private launchMatches(
-    record: TicketExecutionRecord,
+    record: StoredTicketExecutionRecord,
     runs: PersistedRunState[],
   ) {
     return runs.filter((run) => {
@@ -312,7 +316,7 @@ export class LegacyTickets {
         (!Object.hasOwn(args, "repair") || isRepairRequest(args.repair)) &&
         // Published v4 observes the original journal, never replays a legacy
         // requested/queued/consumed ledger as new-run authorization.
-        (record.schemaVersion === 4 || this.matches(record, args, run.runId)) &&
+        (record.schemaVersion !== 3 || this.matches(record, args, run.runId)) &&
         Date.parse(run.startedAt) >= (record.launchingAt ?? 0) - 1000
       );
     });
@@ -333,11 +337,44 @@ export class LegacyTickets {
     );
   }
 
+  /** Re-observe a published uncertain launch without replaying legacy ledgers. */
+  observeLaunchV5(record: TicketExecutionRecordV5, owner: OwnerLock, assertCurrent: () => void): TicketExecutionRecordV5 | undefined {
+    if (record.activeRunId || record.launchingAt === undefined)
+      throw new Error("Only an uncertain launch may bind a persisted run.");
+    const runs = this.runs(record);
+    const matches = this.launchMatches(record, runs);
+    if (matches.length !== 1) return undefined;
+    return this.deps.worktrees.updateV5(record, (r) => ({ ...r, launchingAt: undefined,
+      activeRunId: matches[0].runId, activeRunStartedAt: Date.parse(matches[0].startedAt) }), owner, () => {
+      assertCurrent();
+      if (!equal(this.runs(record), runs)) throw new Error("Legacy launch journal changed before publication.");
+    });
+  }
+
+  /** Transitional v4 entry point. T05 switches the executor to migrateV5. */
   async migrate(
     owner: OwnerLock,
     canMigrate: () => boolean = () => true,
     control?: OperationControl,
   ): Promise<LegacyMigrationReport> {
+    return this.migrateTo(4, owner, canMigrate, control);
+  }
+
+  async migrateV5(
+    owner: OwnerLock,
+    canMigrate: () => boolean = () => true,
+    control?: OperationControl,
+  ): Promise<LegacyMigrationReport> {
+    return this.migrateTo(5, owner, canMigrate, control);
+  }
+
+  private async migrateTo(
+    target: 4 | 5,
+    owner: OwnerLock,
+    canMigrate: () => boolean,
+    control?: OperationControl,
+  ): Promise<LegacyMigrationReport> {
+    this.migrationTarget = target;
     const external = control;
     control = { ...control, check: () => {
       checkOperation(external);
@@ -397,8 +434,8 @@ export class LegacyTickets {
           : undefined;
         const saved = bytes ? JSON.parse(bytes.toString("utf8")) : undefined;
         if (
-          isTicketExecutionRecord(saved) &&
-          saved.schemaVersion === 4 &&
+          (isTicketExecutionRecordV5(saved) ||
+            (target === 4 && isTicketExecutionRecord(saved) && saved.schemaVersion === 4)) &&
           worktrees.recordPath(saved.itemId) === path
         ) {
           this.failures.delete(saved.itemId);
@@ -449,7 +486,7 @@ export class LegacyTickets {
           );
         itemId = original.itemId;
         control?.onProgress?.({ phase: "read-evidence", itemId, issueNumber: original.issueNumber, completed, total: sources.size, unit: "items" });
-        if (original.schemaVersion === 4 && !recordless) continue; // never replay a published ticket
+        if (target === 4 && original.schemaVersion === 4 && !recordless) continue;
         this.assertOwner();
         const card = await this.deps.board.getCard(itemId);
         if (
@@ -473,6 +510,8 @@ export class LegacyTickets {
           !original.activeRunId &&
           original.launchingAt === undefined &&
           !original.finalization &&
+          !original.integration &&
+          !original.retry &&
           !receiptBytes &&
           !this.all(itemId).length &&
           !worktrees.localBranchSha(original.taskBranch) &&
@@ -497,17 +536,18 @@ export class LegacyTickets {
           continue;
         }
         worktrees.assertOwnedPath(original);
-        if (!receiptBytes && !original.finalization) {
+        if (!receiptBytes && !original.finalization && !original.integration && original.retry?.stage !== "cleanup") {
           const check = worktrees.check(original, false); // dirty / MERGE_HEAD is intentionally allowed
           if (!check.ok)
             throw new Error(check.reason ?? "Unsafe legacy worktree.");
         }
         const runState = this.runs(original, true);
-        const handoffs = this.all(itemId);
+        // V4 already consumed v3 repair authority. Never replay a retained ledger.
+        const handoffs = original.schemaVersion === 3 ? this.all(itemId) : [];
         // A corrupt/lost ledger cannot turn an authentic pending repair marker
         // into an ordinary Ready launch. Its issue scopes the failure; other
         // tickets with damaged, unidentifiable files remain independent.
-        if (this.deps.board.decisionComments) {
+        if (original.schemaVersion === 3 && this.deps.board.decisionComments) {
           const comments = await this.deps.board.decisionComments(card);
           if (
             comments.some(
@@ -539,7 +579,7 @@ export class LegacyTickets {
         }
         const next: TicketExecutionRecordV4 = { ...original, schemaVersion: 4 };
         delete (next as TicketExecutionRecord).finalization;
-        if (original.launchingAt !== undefined) {
+        if (original.schemaVersion === 3 && original.launchingAt !== undefined) {
           const matches = this.launchMatches(original, runState);
           if (matches.length === 1) {
             delete next.launchingAt;
@@ -547,7 +587,7 @@ export class LegacyTickets {
             next.activeRunStartedAt = Date.parse(matches[0].startedAt);
           }
         }
-        if (!next.activeRunId && next.launchingAt === undefined) {
+        if (original.schemaVersion === 3 && !next.activeRunId && next.launchingAt === undefined) {
           const pending = handoffs.filter(
             (h) => h.step !== "consumed" || h.runId !== original.lastRunId,
           );
@@ -575,7 +615,7 @@ export class LegacyTickets {
             );
         }
         const task = { ...original, title: card.title, body: card.body };
-        if (receiptBytes || original.finalization) {
+        if ((receiptBytes || original.finalization) && !(target === 5 && original.schemaVersion === 4 && !recordless)) {
           const old = original.finalization;
           if (
             old &&
@@ -655,27 +695,38 @@ export class LegacyTickets {
           worktrees.repoRoot,
           ".pi",
           "board-agent",
-          "legacy-v3",
+          bytes && original.schemaVersion === 4 ? "legacy-v4" : "legacy-v3",
         );
         const archivePath = join(archiveDir, bytes ? name : `receipt-${name}`);
         const source = bytes ?? receiptBytes!;
         await this.archive(archivePath, source);
+        const receiptArchive = join(worktrees.repoRoot, ".pi", "board-agent", "legacy-v3", `receipt-${name}`);
         if (receiptBytes && bytes)
-          await this.archive(join(archiveDir, `receipt-${name}`), receiptBytes);
+          await this.archive(receiptArchive, receiptBytes);
         await this.mapDesign(card);
         const assertSource = () => {
           this.assertOwner();
           if (
             !this.bytes(archivePath).equals(source) ||
-            (receiptBytes && !this.bytes(receiptPath).equals(receiptBytes)) ||
+            (target === 5 && (bytes ? !this.bytes(path).equals(bytes) : worktrees.has(original.itemId))) ||
+            (receiptBytes && (!this.bytes(receiptPath).equals(receiptBytes) ||
+              !this.bytes(receiptArchive).equals(receiptBytes))) ||
             !equal(this.runs(original, true), runState) ||
-            !equal(this.all(itemId), handoffs)
+            (original.schemaVersion === 3 && !equal(this.all(itemId), handoffs))
           )
             throw new Error(
               "Legacy source/backup changed before atomic conversion.",
             );
         };
-        worktrees.publishLegacy(original, next, bytes, assertSource);
+        if (target === 5) {
+          const { record, assertGit } = await this.v5Draft(original, next, receiptBytes, assertSource);
+          const observedRun = original.schemaVersion !== 3 ? undefined
+            : next.activeRunId !== original.activeRunId && next.activeRunId
+              ? { runId: next.activeRunId, startedAt: next.activeRunStartedAt! }
+              : next.launchingAt !== original.launchingAt && next.launchingAt !== undefined
+                ? { launchingAt: next.launchingAt } : undefined;
+          worktrees.publishV5(original, record, bytes, owner, () => { assertSource(); assertGit(); }, observedRun);
+        } else worktrees.publishLegacy(original, next, bytes, assertSource);
         this.failures.delete(itemId);
         report.converted.push(itemId);
       } catch (error) {
@@ -690,6 +741,156 @@ export class LegacyTickets {
     this.assertOwner();
     control?.onProgress?.({ phase: "read-evidence", completed, total: sources.size, unit: "items" });
     return report;
+  }
+
+  /** Finish the old in-memory draft directly as v5. This path observes only:
+   * no ref writes, no fresh result commit and no intermediate v4 publication. */
+  private async v5Draft(
+    original: TicketExecutionRecord,
+    draft: TicketExecutionRecordV4,
+    receiptBytes: Buffer | undefined,
+    assertSource: () => void,
+  ): Promise<{ record: TicketExecutionRecordV5; assertGit: () => void }> {
+    const { worktrees } = this.deps;
+    const task = { ...original, title: "", body: "" };
+    const guard = async () => { assertSource(); };
+    assertSource();
+    const { integration: _old, ...execution } = draft;
+    const record: TicketExecutionRecordV5 = { ...execution, schemaVersion: 5 };
+    if (!draft.integration && !original.finalization && !receiptBytes) {
+      if (draft.retry?.stage === "cleanup")
+        throw new Error("Legacy cleanup has no recorded result proof; sources retained.");
+      return { record, assertGit: () => {} }; // active/idle execution needs no network observation
+    }
+    const local = worktrees.localBranchSha(original.taskBranch);
+    const remote = (await worktrees.remoteSha(original.taskBranch)) ?? null;
+    assertSource();
+    const receipt = receiptBytes ? await this.readReceipt(task, this.control, receiptBytes) : undefined;
+    if (receipt) {
+      await this.checkCleanup(task, receipt, this.control);
+      assertSource();
+    }
+    const state = draft.integration ?? (receipt ? {
+      baseSha: receipt.resultSha, taskSha: receipt.taskSha, resultSha: receipt.resultSha,
+      remoteTaskSha: receipt.schemaVersion === 2 ? receipt.remoteTaskSha! : receipt.taskSha,
+    } : undefined);
+    if (receipt && state && (state.resultSha !== receipt.resultSha || state.taskSha !== receipt.taskSha ||
+        (receipt.schemaVersion === 2 && (state.remoteTaskSha ?? null) !== receipt.remoteTaskSha)))
+      throw new Error("Receipt and legacy integration sources disagree.");
+    if (original.finalization && state && (state.baseSha !== original.finalization.baseSha ||
+        state.taskSha !== original.finalization.taskSha))
+      throw new Error("Receipt and legacy finalization sources disagree.");
+    let assertLegacyEvidence = () => {};
+    if (original.finalization?.resultSha) await this.verifyLegacyResult(original.finalization, guard);
+    // Receipt-only v4 conversion recorded the integrated base, not a pre-merge
+    // intent. Its verified snapshots (including old squashes) are the proof;
+    // never guess original parents or require task ancestry in that result.
+    else if (original.integration && !(receipt && original.integration.baseSha === receipt.resultSha))
+      assertLegacyEvidence = await this.verifyDirectResult(original, guard);
+    assertSource();
+    let base: string | undefined;
+    let pending = false;
+    if (state || original.finalization) {
+      await worktrees.fetchRequired(original.baseBranch);
+      assertSource();
+      base = worktrees.fetchedSha(original.baseBranch);
+      const intent = state ?? original.finalization!;
+      if (!worktrees.isAncestor(intent.baseSha, base))
+        throw new Error("Legacy base history was rewritten; sources retained.");
+      const integrated = !!state && worktrees.isAncestor(state.resultSha, base);
+      if (!integrated && (receipt || draft.retry?.stage === "cleanup"))
+        throw new Error("Legacy cleanup result is absent from fresh origin/base; cleanup proof retained.");
+      pending = !integrated;
+      const remoteTaskSha = state?.remoteTaskSha === undefined ? intent.taskSha : state.remoteTaskSha;
+      if (pending && (local !== intent.taskSha || remote !== remoteTaskSha))
+        throw new Error("Legacy task sources changed; original result/work retained.");
+      if (state) {
+        const sources = { scope: { owner: this.deps.repoOwner, repo: this.deps.repoName,
+          base: original.baseBranch, head: original.taskBranch },
+          baseSha: state.baseSha, taskSha: state.taskSha, remoteTaskSha };
+        if (integrated) {
+          record.integration = { ...sources, kind: "legacy-completed", resultSha: state.resultSha };
+          record.retry = { stage: "cleanup", reason: "Legacy result verified on fresh origin/base; immutable cleanup only." };
+        } else {
+          // A historical squash can be cleanup proof, but cannot be a normally
+          // pushed PR head if it loses source ancestry. Never guess equivalence.
+          for (const sha of [state.taskSha, remoteTaskSha])
+            if (sha && !worktrees.isAncestor(sha, state.resultSha))
+              throw new Error("Legacy result does not retain task source ancestry; cannot reuse it as a PR head.");
+          record.integration = { ...sources, kind: "pr", phase: "prepared",
+            preparedHeadSha: state.resultSha, initialPreparedHeadSha: state.resultSha };
+          record.retry = draft.retry ?? { stage: "integrate", reason: "Reuse the verified legacy result on the task PR; never push base." };
+        }
+      }
+    }
+    if (((await worktrees.remoteSha(original.taskBranch)) ?? null) !== remote)
+      throw new Error("Legacy remote task source changed during conversion.");
+    const assertGit = () => {
+      assertLegacyEvidence();
+      if (worktrees.localBranchSha(original.taskBranch) !== local ||
+          (base && worktrees.fetchedSha(original.baseBranch) !== base))
+        throw new Error("Legacy Git sources changed before atomic conversion.");
+      if (pending) {
+        worktrees.cleanupRecord(task); // strict inventory/ownership, including an absent worktree
+        if (existsSync(original.path) || worktrees.worktreeEntries().some((e) => samePath(e.path, original.path))) {
+          const check = worktrees.check(original, true);
+          if (!check.ok) throw new Error(check.reason ?? "Unsafe pending legacy worktree.");
+        }
+      }
+    };
+    assertSource();
+    assertGit();
+    return { record, assertGit };
+  }
+
+  /** Validate the old merge-tree/commit-tree algorithm, including its optional
+   * local/remote combination, without creating another result commit. */
+  private async verifyDirectResult(record: TicketExecutionRecord, guard: () => Promise<void>): Promise<() => void> {
+    const { worktrees } = this.deps;
+    const state = record.integration!;
+    const remote = state.remoteTaskSha === undefined ? state.taskSha : state.remoteTaskSha;
+    if (state.resultSha === state.baseSha) {
+      for (const sha of [state.taskSha, remote])
+        if (sha && !worktrees.isAncestor(sha, state.baseSha))
+          throw new Error("Legacy base result does not cover its recorded sources.");
+      return () => {};
+    }
+    const parents = mustGit(["show", "-s", "--format=%P", state.resultSha], worktrees.repoRoot).split(" ");
+    if (parents.length === 1 && remote === state.taskSha) {
+      // Native v4 never squashed. Only an exact archived v3 intent explains
+      // this shape; an arbitrary one-parent task commit is not an old result.
+      const path = join(worktrees.repoRoot, ".pi", "board-agent", "legacy-v3", basename(worktrees.recordPath(record.itemId)));
+      if (!existsSync(path)) throw new Error("Legacy single-parent result lacks its original v3 evidence.");
+      const bytes = this.bytes(path);
+      const old: unknown = JSON.parse(bytes.toString("utf8"));
+      if (!isTicketExecutionRecord(old) || old.schemaVersion !== 3 || !old.finalization ||
+          old.finalization.targetBranch !== record.baseBranch || old.finalization.baseSha !== state.baseSha ||
+          old.finalization.taskSha !== state.taskSha || old.finalization.resultSha !== state.resultSha ||
+          !["itemId", "issueNumber", "taskKey", "plan", "path", "createdAt", "taskBranch", "baseBranch", "lastRunId", "reviewedTaskSha"].every(
+            (key) => old[key as keyof TicketExecutionRecord] === record[key as keyof TicketExecutionRecord]))
+        throw new Error("Legacy single-parent result differs from archived v3 evidence.");
+      await this.verifyLegacyResult(old.finalization, guard);
+      return () => {
+        if (!this.bytes(path).equals(bytes)) throw new Error("Archived legacy result evidence changed before publication.");
+      };
+    }
+    if (parents.length !== 2 || parents[0] !== state.baseSha)
+      throw new Error("Ambiguous legacy integration result parents.");
+    let source = state.taskSha;
+    if (remote && !worktrees.isAncestor(remote, source)) {
+      if (worktrees.isAncestor(source, remote)) source = remote;
+      else {
+        source = parents[1];
+        if (mustGit(["show", "-s", "--format=%P", source], worktrees.repoRoot) !== `${state.taskSha} ${remote}` ||
+            await worktrees.resultTree({ baseSha: state.taskSha, taskSha: remote }, guard) !==
+              mustGit(["rev-parse", `${source}^{tree}`], worktrees.repoRoot))
+          throw new Error("Legacy combined task sources/tree mismatch.");
+      }
+    }
+    if (parents[1] !== source || await worktrees.resultTree({ baseSha: state.baseSha, taskSha: source }, guard) !==
+        mustGit(["rev-parse", `${state.resultSha}^{tree}`], worktrees.repoRoot))
+      throw new Error("Legacy integration result sources/tree mismatch.");
+    return () => {};
   }
 
   /** v3 allowed human-approved Done without AI review. Only the exact original
@@ -870,6 +1071,7 @@ export class LegacyTickets {
 
   private async verifyLegacyResult(
     old: TicketFinalizationState,
+    guard: () => Promise<void> = async () => {},
   ): Promise<void> {
     // Prove the recorded merge/squash, not a new merge against today's possibly conflicting base.
     const parents = mustGit(
@@ -880,7 +1082,7 @@ export class LegacyTickets {
       throw new Error("Ambiguous legacy finalization result parents.");
     let tree: string;
     try {
-      tree = await this.deps.worktrees.resultTree(old);
+      tree = await this.deps.worktrees.resultTree(old, guard);
     } catch (error) {
       throw new Error("Ambiguous legacy finalization result tree.", {
         cause: error,
@@ -905,10 +1107,15 @@ export class LegacyTickets {
     checkOperation(control);
     await verifyParents(receipt.parents);
     await verifyParents(receipt.gitParents);
-    const record = await this.deps.worktrees.cleanupRecord(task);
+    const stored = this.deps.worktrees.readStored(task.itemId);
+    const record = stored?.schemaVersion === 5
+      ? this.deps.worktrees.cleanupRecordV5(task) : this.deps.worktrees.cleanupRecord(task);
     if (record) {
+      if (record.schemaVersion === 5 && record.integration?.kind !== "legacy-completed")
+        throw new Error("Only legacy-completed records may consume old cleanup evidence.");
+      const integration = record.integration;
       if (
-        record.schemaVersion === 4
+        record.schemaVersion !== 3
           ? (receipt.record &&
               ![
                 "itemId",
@@ -921,13 +1128,13 @@ export class LegacyTickets {
                 "createdAt",
               ].every(
                 (key) =>
-                  record[key as keyof TicketExecutionRecord] ===
+                  record[key as keyof TicketExecutionRecordV5] ===
                   receipt.record![key as keyof TicketExecutionRecord],
               )) ||
-            record.integration?.taskSha !== receipt.taskSha ||
-            record.integration?.resultSha !== receipt.resultSha ||
+            integration?.taskSha !== receipt.taskSha ||
+            !integration || !("resultSha" in integration) || integration.resultSha !== receipt.resultSha ||
             (receipt.schemaVersion === 2 &&
-              record.integration?.remoteTaskSha !== receipt.remoteTaskSha)
+              integration.remoteTaskSha !== receipt.remoteTaskSha)
           : !receipt.record ||
             JSON.stringify(record) !== JSON.stringify(receipt.record) ||
             hash(
@@ -1062,13 +1269,13 @@ export class LegacyTickets {
 
   /** The only residual deletion path: existing, unchanged v3 snapshots, after
    * conversion. Never called as a fallback when normal worktree remove fails. */
-  async cleanupResidual(record: TicketExecutionRecord, control?: OperationControl) {
+  async cleanupResidual(record: StoredTicketExecutionRecord, control?: OperationControl) {
     const { worktrees } = this.deps;
     const external = control;
     const evidence: FileEvidence[] = [];
     control = { ...control, check: () => {
       checkOperation(external);
-      if (!equal(worktrees.read(record.itemId), record))
+      if (!equal(worktrees.readStored(record.itemId), record))
         throw new TicketStateChangedError("Legacy cleanup record changed; work retained.");
       // Recheck immutable evidence even after an awaited authorization/long hash,
       // without repeating expensive Git probes or rereading whole receipts.
