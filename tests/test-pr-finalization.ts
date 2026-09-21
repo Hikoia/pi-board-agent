@@ -163,6 +163,79 @@ try {
     f.prs.merge(); assert.equal((await f.finish()).status, "finalized");
     console.log("PASS: withdrawn original-worktree repair/review/reclose updates the same open PR and stable marker without body edits");
   }
+  for (const [boundary, change] of [
+    ["lookup", "owner"], ["lookup", "stop"], ["lookup", "reopen"], ["lookup", "lane"], ["lookup", "claim"],
+    ["lookup", "record"], ["lookup", "source"], ["authorize", "owner"], ["authorize", "stop"],
+    ["authorize", "record"], ["authorize", "source"], ["authorize", "dirty"], ["authorize", "untracked"],
+  ] as const) {
+    const f = await fixture(false, false), executor = f.make();
+    const extra = commit(f, f.taskSha, "late local work");
+    let entered = false, changed = false, dispatched = 0;
+    let prepared: TicketPullRequestIntegration | undefined;
+    const mutate = () => {
+      changed = true;
+      if (change === "owner") f.owner.release();
+      if (change === "stop") executor.stopScheduling();
+      if (change === "reopen") f.card.closed = false;
+      if (change === "lane") f.card.status = f.cfg.columns.ready;
+      if (change === "claim") f.card.assignees = ["human"];
+      if (change === "record") writeFileSync(f.recordFile, JSON.stringify({ ...f.recordNow(), lastRunId: "other-execution" }));
+      if (change === "source") git(f.repo, "update-ref", `refs/heads/${f.task.taskBranch}`, extra);
+      if (change === "dirty") writeFileSync(join(f.record.path, "feature.txt"), "late uncommitted work\n");
+      if (change === "untracked") writeFileSync(join(f.record.path, "new.txt"), "late untracked work\n");
+    };
+    f.prs.hooks.before = async op => {
+      if (op !== "create") return;
+      await Promise.resolve();
+      entered = true;
+      prepared = structuredClone(prep(f));
+      if (boundary === "lookup") mutate();
+    };
+    const getCard = f.board.getCard;
+    f.board.getCard = async itemId => {
+      const card = await getCard(itemId);
+      if (entered && !changed && boundary === "authorize") mutate();
+      return card;
+    };
+    f.prs.hooks.after = op => { if (op === "create") dispatched++; };
+    calls.length = 0;
+    const result = await executor.finalizeClosed(structuredClone(f.card));
+    assert.ok(entered && changed, `must reach final ${boundary} boundary: ${JSON.stringify(result)}`);
+    assert.ok(["skipped", "blocked"].includes(result.status), JSON.stringify(result));
+    assert.equal(f.prs.calls.filter(op => op === "create").length, 1, "create API entered once");
+    assert.equal(dispatched, 0, "guard vetoes mutation dispatch, not just response handling");
+    assert.equal(f.prs.prs.length, 0);
+    assert.equal(prepared!.phase, "prepared"); assert.deepEqual(prep(f), prepared);
+    assert.ok(existsSync(f.record.path)); assert.equal(f.tip(), f.base);
+    assert.ok(!calls.some(deleting));
+    assert.ok(calls.filter(publish).every(a => a.at(-1)!.endsWith(`:refs/heads/${f.task.taskBranch}`)));
+    if (change === "record") assert.equal(f.recordNow().lastRunId, "other-execution");
+    if (change === "source") assert.equal(f.store.localBranchSha(f.task.taskBranch), extra);
+    if (change === "dirty") assert.equal(readFileSync(join(f.record.path, "feature.txt"), "utf8"), "late uncommitted work\n");
+    if (change === "untracked") assert.equal(readFileSync(join(f.record.path, "new.txt"), "utf8"), "late untracked work\n");
+    console.log(`PASS: ${change} during final create ${boundary} vetoes dispatch and retains preparation/work`);
+  }
+  {
+    const f = await fixture(false, false), executor = f.make();
+    let prepared: Buffer | undefined;
+    f.prs.hooks.after = async op => {
+      if (op !== "create") return;
+      assert.equal(f.prs.prs.length, 1, "server accepted the create before stop");
+      prepared = readFileSync(f.recordFile);
+      await Promise.resolve();
+      executor.stopScheduling();
+    };
+    assert.equal((await executor.finalizeClosed(structuredClone(f.card))).status, "skipped");
+    assert.ok(prepared); assert.deepEqual(readFileSync(f.recordFile), prepared);
+    assert.equal(prep(f).phase, "prepared"); assert.equal(prep(f).prNumber, undefined);
+    assert.equal(f.prs.prs.length, 1); assert.ok(existsSync(f.record.path));
+    f.prs.hooks.after = undefined;
+    assert.equal((await f.finish()).status, "waiting");
+    assert.equal(prep(f).prNumber, f.prs.prs[0].number);
+    assert.equal(f.prs.calls.filter(op => op === "create").length, 1);
+    assert.equal(f.tip(), f.base);
+    console.log("PASS: stop after create dispatch retains prepared recovery data; next authorized tick recovers the server PR without replay");
+  }
   for (const boundary of ["create", "delete"] as const) for (const change of ["owner", "stop", "card", "source"] as const) {
     const f = await fixture(false, false); let allowed = true, hit = false;
     if (boundary === "delete") { await f.finish(); f.prs.merge(); }
