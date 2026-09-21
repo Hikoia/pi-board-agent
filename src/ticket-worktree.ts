@@ -1521,7 +1521,7 @@ export class TicketWorktrees {
     };
     await cleanupGuard();
     control.onProgress?.({ phase: "remove" });
-    await this.removeTaskArtifacts(task, record, local, remote ?? null, cleanupGuard, localGuard, undefined, control);
+    await this.removeTaskArtifacts(task, record, local, remote ?? null, cleanupGuard, assertCurrent, localGuard, undefined, control);
     return integration.mergeCommitSha;
   }
 
@@ -1551,7 +1551,7 @@ export class TicketWorktrees {
     await cleanupGuard();
     control.onProgress?.({ phase: "remove" });
     await this.removeTaskArtifacts(task, record, integration.taskSha, integration.remoteTaskSha,
-      cleanupGuard, localGuard, legacyResidual, control);
+      cleanupGuard, assertCurrent, localGuard, legacyResidual, control);
     return integration.resultSha;
   }
 
@@ -1637,6 +1637,7 @@ export class TicketWorktrees {
     expectedLocal: string | undefined,
     expectedRemote: string | null,
     cleanupGuard: () => Promise<void>,
+    assertCurrent: () => Promise<void>,
     localGuard: () => void,
     legacyResidual?: TicketResidualCleanup<R>,
     control?: OperationControl,
@@ -1649,6 +1650,11 @@ export class TicketWorktrees {
       localGuard();
       if (remote && remote !== (remoteDeleted ? undefined : expectedRemote))
         throw new Error("Remote task ref changed or reappeared; cleanup retained.");
+      // Git observations yield too. Renew ticket/PR authority LAST, then pin
+      // local sources, record, worktree, stop and owner without another await.
+      // Re-running proofGuard here would just open another observation window.
+      await assertCurrent();
+      localGuard();
     };
     const residual = () =>
       existsSync(record.path) && !this.entryForPath(record.path);
@@ -1967,6 +1973,10 @@ export class TicketWorktrees {
     await proof();
     await assertBacklog();
     await proof(); // Backlog observation also yields; never erase raced recovery.
+    // The second proof may itself outlive approval. Reuse the caller's exact
+    // Backlog/PR authorizer, then only synchronous preconditions before unlink.
+    await assertBacklog();
+    localGuard();
     const path = this.recordPath(task.itemId);
     if (!readFileSync(path).equals(loaded!.bytes))
       throw new Error("Cleanup record changed before deletion.");
