@@ -26,7 +26,9 @@ tick_seconds: 90
 branches:
   base: "main"
   task_prefix: "task/"
-task_merge_strategy: "merge" # base/task parents; normal base push only
+# Bot normally pushes only task refs and creates/observes managed PRs.
+# Humans merge PRs (Squash and merge recommended); no base-push permission needed.
+# Retired task_merge_strategy: merge/squash inputs warn and are ignored; omit it.
 
 builder_timeout_ms: 21600000 # optional; 6 hours per attempt
 builder_retries: 1
@@ -37,8 +39,9 @@ review:
   timeout_ms: 600000 # automatic Task review is always enabled
 
 # Ready -> In Progress -> Review -> Done (Issue stays OPEN).
-# Human-closed Done Issues of any Type finalize without a review marker.
-# Integration/cleanup then moves the closed Issue to Backlog.
+# Human-closed Done Issues of any Type request a PR without a review marker.
+# Waiting retains worktree/refs; closing a PR without merge is not completion.
+# Verified manual PR merge permits safe cleanup, then Project Backlog.
 # Needs Human requires a trusted reply AND a manual move back to Ready.
 context:
   enabled: true

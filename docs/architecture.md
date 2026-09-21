@@ -1,4 +1,4 @@
-# Architecture: Task-only v4 continuation
+# Architecture: Task-only v5 managed PR continuation
 
 Board Agent retains the polling loop, ticket executor, WorkflowManager and its
 provider/backoff scheduler. It is a foreground Pi extension, not a daemon or a
@@ -15,14 +15,15 @@ unsupported-state.ts     read-only unsupported/corrupt-state detection
 loop.ts                  reconcile, integrate/cleanup, bounded build/review admission
   ticket-executor.ts     claim, launch, resume, drain, result settlement, finalize
     WorkflowManager      original durable script/args/worktree and provider backoff
-  ticket-worktree.ts     v4 atomic store, owned worktrees, native Git finalization
+  ticket-worktree.ts     v5 atomic store, PR preparation/proof, guarded Git cleanup
   ticket-retry.ts        stage and pending comment/status/reopen/release settlement
-  legacy-tickets.ts      sole v3 conversion/legacy evidence adapter
+  legacy-tickets.ts      sole v3/v4 conversion/legacy evidence adapter
     cleanup-snapshot.ts  read-only old evidence verification and checked residual removal
   review.ts              detached exact-SHA isolated review
   dispatch.ts            fail-closed outcome/decision parsing
   workflow-prompt.ts     builder mission and trusted maintainer context
   plan.ts                optional read-only grouping
+gh.ts                    strict findPullRequests/createPullRequest/getPullRequest
 process-runner.ts         non-interactive, deadline-bound Git/gh process trees
 context.ts / notify.ts   configured navigation digest and notifications
 ```
@@ -30,8 +31,8 @@ context.ts / notify.ts   configured navigation digest and notifications
 Story splitting/publication, design and PR watchdog execution do not exist.
 Their old journals remain untouched. No production caller creates repair
 ledgers, cleanup receipts, full-tree cleanup hashes or backups. The snapshot
-module is reachable only for **existing legacy evidence**, not ordinary v4
-build/review retry or native finalization.
+module is reachable only for **existing legacy evidence**, not ordinary v5
+build/review retry or PR cleanup.
 
 ## Identity and ownership
 
@@ -60,8 +61,8 @@ remove a replacement lock. Global model capacity never substitutes for ownership
 `.pi/board-agent/ticket-worktrees/<safe-item-id>.json` is atomically replaced:
 
 ```ts
-interface TicketV4 {
-  schemaVersion: 4;
+interface TicketExecutionRecordV5 {
+  schemaVersion: 5;
   itemId: string;
   issueNumber: number;
   taskKey: string;
@@ -76,16 +77,33 @@ interface TicketV4 {
   lastRunId?: string;
   reviewedTaskSha?: string;
   retry?: { stage: "build" | "review" | "integrate" | "cleanup"; reason: string };
-  integration?: { baseSha: string; taskSha: string; remoteTaskSha?: string | null; resultSha: string };
+  integration?: TicketPullRequestIntegration | TicketLegacyCompletedIntegration;
 }
 ```
 
+The exact types/validators live in `src/ticket-worktree.ts`. Both variants pin
+`scope: {owner, repo, base, head}`, `baseSha`, `taskSha` and nullable
+`remoteTaskSha` (v5 never uses omission to mean a source):
+
+- `kind: "pr"`: `preparedHeadSha`, stable `initialPreparedHeadSha`, and phase
+  `prepared | open | suspended | merged`. `prNumber`/`prUrl` are required for open
+  and merged; prepared/suspended may retain them. Merged additionally requires
+  `mergedHeadSha` and the actual `mergeCommitSha`.
+- `kind: "legacy-completed"`: `resultSha` attested by owner-held migration on
+  fresh base. Cleanup-only forever, not a new PR preparation.
+
+`recordPullRequestPreparation()` permits new/renewed suspended approval;
+`progressPullRequest()` advances PR evidence. Ordinary `updateV5()` cannot replace
+sources, PR references or evidence. Merged evidence is never downgraded/erased.
+The stable initial SHA identifies recovery across repairs, not an equality
+constraint on later PR heads. Strict readers and compare-before-write atomic
+publication preserve uncertainty/corruption rather than treating it as absence.
+
 `retry.reason` also carries unsettled writeback until comment, optional reopen,
-status and release have been freshly confirmed. There is no second retry store
-or requested/queued/consumed execution protocol. Integration is saved **before
-push**; its presence is not evidence that origin accepted it. Strict readers,
-compare-before-write and atomic publication preserve failures/corruption rather
-than turn absence into successful cleanup.
+status and release have been freshly confirmed. Existing `integrate | cleanup`
+stages handle technical failures; normal PR waiting is not a failure. There is
+no second retry store. Preparation is saved **before task push/PR creation**;
+its presence proves neither publication nor merge.
 
 ## Scheduling and launch
 
@@ -94,7 +112,7 @@ Each tick:
 1. Reject unsupported state read-only, then list cards.
 2. Reconcile original run associations, uncertain launches and model-result I/O.
    Pure finalization records do not repeat per-ticket remote checks here.
-3. If idle, start one tracked finalizer for closed Done, old technical Ready,
+3. If idle, start one tracked finalizer for closed Done, retained PR observation,
    pending Backlog cleanup or retirement of an old technical writeback. Do not
    await it before model admission. Rotate stable item IDs using an in-memory
    cursor; exclude its ticket until the Promise and settlement have completed.
@@ -105,15 +123,18 @@ Each tick:
 A tick-local attempted set prevents same-ticket immediate retries. Only target
 Tasks enter model lanes; no Plan gate or dependency scheduler exists. Finalization
 checks local and remote refs: local absence cannot exclude remote-only work.
-Confirmed no-ref history moves to Backlog, preserving idle records and leftovers;
-corrupt or pending recovery is never treated as absence. Idle closed Backlog
-history stops per-ticket polling.
+Confirmed no-ref history without PR/integration/pending evidence moves to
+Backlog, preserving idle records and leftovers; corrupt or pending recovery is
+never absence. Retained PR evidence takes precedence even if GitHub deleted head.
+Idle closed Backlog history without pending evidence stops per-ticket polling.
 
 `max_workers` includes builders and foreground review. Active associations count
 until safely drained and settled, including paused, terminal-but-unsettled,
 missing/unreadable and launch-window state. Display observations cannot lend a
 slot. The one finalizer has its own Promise/AbortController and no model slot,
-queue, journal or dispatch timer. A failed board list still prevents admissions;
+queue, journal or dispatch timer. `waiting` returns the PR number/URL/reason after
+bounded observation and releases the finalizer; it never holds a worker or
+launches a CI-triggered rebuild. A failed board list still prevents admissions;
 background maintenance does not authorize work from stale board data.
 Existing UsageLimitScheduler timers call fresh resume authorization after
 cooperative drain; a final synchronous stop/admission veto guards actual resume.
@@ -129,8 +150,10 @@ ticket args/time/path; ambiguity or no match retains the window for observation.
 
 Builders retain configured model, timeout/retry policy and worktree-specific
 context. Durable resumes preserve original script/args/context/worktree, including
-interrupted MERGE_HEAD. Builders push only their task branch. Review or humans
-assess test adequacy; missing tool telemetry is not a product-decision signal.
+interrupted MERGE_HEAD. On returned work, builders finish owned interrupted merges,
+then fetch/merge published `origin/task` ancestry before a normal task push; no
+force/rebase rewrite of required evidence. Review or humans assess test adequacy;
+missing tool telemetry is not a product-decision signal.
 
 ## Results, decisions and review
 
@@ -158,73 +181,120 @@ builder context; untrusted text is not authorization. Fresh withdrawal preserves
 the human's state. Failed release retains the association/pending write; a
 second builder cannot use its occupied slot.
 
-## Merge-only integration and cleanup
+## Managed PR submission, observation and cleanup
 
-Fresh closed Done approval authorizes either or both task refs without an
-AI-review marker. Existing record identity/ownership remains binding; a safe
-recordless branch gets a v4 record. Remote-only restoration is create-only and
-never starts a builder or creates a worktree. Both tips are pinned separately
-(`remoteTaskSha: null` means no remote; omission on older v4 means `taskSha`).
-Ahead/divergent sources preserve both ancestries; source conflicts require manual
-resolution, never an automatic repair builder. New integration uses native
-`merge-tree`/`commit-tree`, then a normal base push. Main is never checked out/reset
-and new squash integration is not used. There is no blanket integration-test run.
+Fresh closed Done requests a PR from either or both task refs without an AI-review
+marker. Existing record identity/ownership remains binding; a safe recordless
+branch gets a v5 record. Remote-only restoration is compare-and-create and never
+starts a builder or creates a worktree. `preparePullRequest()` pins both sources,
+supporting local-only, remote-only, ahead and divergent histories. Source conflicts
+retain both tips for manual resolution, never an automatic repair builder.
+Native `merge-tree`/`commit-tree` prepares a head preserving both ancestries and
+base, saves it atomically, then **normally pushes task only**. Neither main nor
+the user's task-worktree HEAD is moved. A prepared retry observes publication
+first; open PRs are observation-only, not automatically updated for CI/base drift.
 
-A real conflict produces no integration commit or push. It queues the ordinary
-build retry, comments, reopens and moves Ready; branch/path ownership and fresh
-card authority remain guarded throughout settlement. Resolution merges base
-into the original task, tests, pushes, reviews and requires another human close.
+Only an initial deterministic, repairable base conflict uses the existing build
+retry: comment, reopen, Ready; resolve base into the original branch, test, push,
+review, Done and renewed close. CI failure or pending review never initiates this
+handoff. Humans handle strict required checks with merge-based Update branch or
+appended commits. Human PR merge (squash recommended) remains the sole final
+integration approval. There is no base push, merge/Auto-merge API or protection
+bypass, and no blanket integration-test run.
 
-A rejected nonconflicting base advance stays integrate-only. Fresh observation
-must show the old base remains in history before the prepared result can be
-atomically superseded by a new normal merge. An actual new conflict instead
-clears unconfirmed progress under checked authority and requires reapproval.
-Confirmed cleanup progress cannot be superseded. Push success with a lost
-response is resolved by observing fresh origin/base, not by assuming success or
-rerunning a builder.
+### PR API and identity
 
-Cleanup order is fixed and reentrant:
+`src/gh.ts` uses the existing deadline-bound `gh` GraphQL/JSON boundary:
 
-1. Prove the recorded result is an ancestor of **fresh** origin/base.
-2. Reject nested Git identities; clean ignored files and unlink ignored junctions without following targets, while refs/registration remain.
-3. Delete the remote task ref with its expected SHA lease.
-4. Use normal `git worktree remove` for the owned registered task worktree.
-5. Delete the local task ref with expected-SHA compare-and-delete.
-6. Write/confirm Project Backlog.
-7. Delete the ticket record last.
+- `PullRequestScope { owner, repo, base, head }` requires the same repository at
+  both ends. `PullRequestInfo` carries scope, number, URL, body, open/closed state,
+  explicit merged boolean, head SHA and nullable `mergeCommitSha` (an unmerged
+  value can be a test-merge SHA, not completion).
+- `findPullRequests(scope)` paginates all OPEN/CLOSED/MERGED candidates;
+  `getPullRequest(scope, number)` never falls back to discovery on unknown data.
+- `createPullRequest(scope, title, body, authorize?)` renews caller authorization
+  after repository lookup, before the mutation. Production injects these through
+  `TicketExecutorDeps.pullRequests`; tests inject fakes, never a live fallback.
 
-Every operation tolerates an already-absent ref/path but not changed ownership.
-Guards re-observe approval, record, Git identity/locks and refs across awaits.
-Dirty/untracked program files, wrong branch/path, symlinked ownership,
-locks, active runs or concurrent ref movement block deletion. **Ignored files
-may be discarded by `git clean -fdX` and normal Git removal.** Nested Git
-identities are inspected without following links; no cleanup snapshot is created. No force remove, broad prune/unlock, recursive fallback or force base
-push is allowed. Unknown unregistered leftovers are retained. Failed cleanup
-keeps closed Done/Backlog (or an existing closed Ready compatibility retry) and
-updates only local `retry.stage`/reason and deduplicated warnings. Historical
-integrate/cleanup pending Ready writes retire without status/comment/reopen
-replay; original identity/claim/record guards still govern release/withdrawal.
-Retiring a withdrawn write preserves its technical stage: confirmed cleanup must
-not silently become an unconfirmed integration that can be superseded.
+One PR belongs to `itemId + createdAt`. Body uses `Refs #N` and a machine marker
+with that identity plus `initialPreparedHeadSha`. Saved number/URL wins; marker
+recovery also requires exact scope and source ancestry. Multiple/wrong candidates,
+missing JSON, permission errors and timeouts block instead of implying absence.
+Response loss recovers before another create; human PR bodies are not overwritten.
+PR closed-not-merged returns waiting with retained work, not cleanup or a new PR.
 
-## Exclusive stopped v3 continuation
+### Withdrawal and renewal
 
-The old owner must stop and drain before installing/restarting; finishing every
-Task is unnecessary. Startup acquires exclusive ownership before invoking the
-single `LegacyTickets` adapter, and before creating managers. Per-ticket
-conversion creates/verifies an exact raw v3 backup before atomic v4 publication.
-A stop-generation/owner loss vetoes publication. Already-published v4 never
-replays migration. A bad ticket is isolated; no source or Issue is deleted to
-claim successful conversion.
+Issue reopen or leaving the approval lane suspends unmerged submission, retaining
+the PR. Open Ready permits the original builder in its original worktree; review,
+Done and renewed close may prepare/update the same still-open PR while retaining
+initial marker identity. No automatic PR reopen/close occurs. A merge observed
+while withdrawn/active is persisted irreversibly (draining the original run), not
+permission to delete. Confirmed merged/legacy-completed state is cleanup-only;
+uncovered later work requires a new submission/PR, never reuse of old merge proof.
+
+### Merge proof and cleanup
+
+`cleanupMergedPullRequest()` requires exact saved PR identity, explicit
+`merged=true`, and the actual GitHub `mergeCommitSha` on **fresh** `origin/base`.
+An unmerged test-merge SHA or task ancestry in base is not proof of squash merge.
+The merged PR head object (fetched via `refs/pull/<number>/head` when needed) must
+cover prepared head, saved sources and current local/remote tips. Appended commits
+and merge-based Update branch preserve this evidence; rebase/force rewrites losing
+ancestry block without patch-equivalence guesses. Merged evidence is persisted
+before cleanup, including when GitHub has already deleted the task branch.
+
+After proof, reject nested Git and clean ignored files/unlink ignored junctions
+without following targets while refs/registration remain. Cleanup order is fixed:
+
+1. Delete remote task ref with its exact SHA lease.
+2. Normal `git worktree remove` of the owned registered task worktree.
+3. Delete local task ref with expected-SHA compare-and-delete.
+4. Write/confirm Project Backlog.
+5. `completeFinalization()` deletes the ticket record last.
+
+Guards renew owner/stop, ticket/PR authorization, record, source tips, fresh base
+proof and worktree/Git identity across awaits, then pin local preconditions after
+the last awaited authorizer. Unknown/dirty/untracked work, extra commits, unsafe
+paths, symlinks, nested Git, Windows/Git locks and active runs detected by those
+guards retain artifacts. **Ignored files may be discarded by `git clean -fdX` and
+normal removal.** No force removal, broad prune/unlock or recursive fallback is
+allowed. Unknown unregistered leftovers stay; cleanup creates no snapshots.
+
+These are **latest-observation guards, not cross-system atomicity**. GitHub and
+remote Git cannot be read atomically. If a task ref is recreated during the final
+GitHub authorizer, exact leases protect new remote commits, but the already-merged
+local worktree/ref/record may still be removed. The post-observation race is an
+accepted limitation, not an absolute prevention claim or reason to add distributed
+locks/watchdogs. See the [operating boundary](runbook.md#cleanup-observation-boundary).
+
+Failed cleanup retains proof, updates local cleanup diagnostics and retries only
+unfinished steps. Historical integrate/cleanup pending Ready writes retire without
+status/comment/reopen replay; identity/claim/record guards still govern release.
+Withdrawal never erases confirmed cleanup evidence.
+
+## Exclusive stopped v3/v4 continuation
+
+Stop/drain the old owner and back up raw records, worktree bytes, refs and external
+journals before installing/restarting; finishing every Task is unnecessary.
+Upgrade all writers together, never mix the old direct executor with v5. Startup
+acquires exclusive ownership before `LegacyTickets.migrateV5()` and manager
+creation. Per-ticket conversion verifies exact-byte backups in `legacy-v3/` or
+`legacy-v4/` before atomic v5 publication. Stop/owner loss vetoes publication.
+Already-published v5 never replays migration. A bad ticket is isolated; no source
+or Issue is deleted to claim successful conversion.
 
 Conversion retains original run ID, script/args/worktree, paused work and unique
 launch bindings. Unlaunched old repair becomes an ordinary build retry with its
 request/diagnostics retained. Bound old repair resumes its original run. Old
-merge/squash results are adopted; fresh remote observation selects integrate or
-cleanup, never a new squash. Human-closed Done approval needs no AI-review marker
-in either schema. Unknown/rewritten pre-result bases, task drift and unsafe
-ownership block conversion. Valid v1/v2 cleanup receipts with null records can
-finish or convert safely; completed receipts do not resurrect execution records.
+merge/squash results already verified on fresh base become immutable
+`legacy-completed` cleanup-only evidence. Pending valid results that retain exact
+source ancestry become prepared PR heads for normal task push, never base push.
+Missing/corrupt evidence, changed sources, rewritten base or a cleanup result
+absent from base blocks migration; a pending squash losing ancestry cannot be
+reused. Human-closed Done submission needs no AI-review marker in either schema.
+Valid v1/v2 cleanup receipts with null records can finish or convert safely;
+completed receipts do not resurrect execution records.
 
 Old receipts/ledgers stay read-only and are not garbage-collected. Partly removed
 unregistered legacy paths require their existing ownership/unchanged snapshots
@@ -246,7 +316,7 @@ and local Git guards are not cached. Ref deletion and Backlog/record completion
 have independent fresh checks and expected-SHA protection. This window is not a
 network deadline or a promise to detect remote withdrawal within one second.
 Unknown/recreated entries, symlink/junction replacement, nested Git and locks
-still block; partial progress resumes without rollback. A failed normal v4 Git
+still block; partial progress resumes without rollback. A failed normal v5 Git
 removal never falls back to this legacy path.
 
 There are no new snapshots or inferred backups. Without existing evidence,
@@ -291,6 +361,9 @@ All runtime Git/gh calls use the shared deadline runner. POSIX process groups an
 Windows Job Objects contain ordinary descendant processes, not malicious POSIX
 session escapes. Telegram combines cancellation with its fixed deadline. No
 live models, GitHub or deployment policy are certified by offline fixture tests.
+This delivery makes no deployment or real #121 changes. Live PR permissions,
+CI/protections and manual merge acceptance remain unverified; final full-suite
+offline acceptance is pending MAIN T07.
 
 Historical audit reports retain their original source baselines and are not
 current policy. See [runbook](runbook.md) for stopped backups and recovery.

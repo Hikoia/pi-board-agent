@@ -8,7 +8,8 @@ compatibility: "Requires gh CLI auth with project scope, git, and a persistent t
 
 Implement exactly one Issue in the persistent worktree prepared by Board Agent.
 Push only its `task/issue-<number>` branch. Board Agent reviews the pushed SHA;
-a human later closes the Issue to approve integration into the configured base.
+a human later closes Done to request a managed PR. **Only the human's manual PR
+merge approves final integration**; Issue close or PR close without merge does not.
 
 ## State at entry
 
@@ -20,8 +21,15 @@ a human later closes the Issue to approve integration into the configured base.
   original branch; never reset, stash, overwrite, or discard it to get clean.
 - On a merge-conflict retry, merge the specified base into this task, preserve
   useful edits from both branches, resolve conflicts, test, commit and push.
-  It must pass review and receive renewed manual close approval.
-- The worktree remains after the run for AI review and human validation.
+  It must pass review and receive renewed manual close for PR submission.
+- Returned **open Ready** work can retain the same unmerged PR. The executor may
+  have published preparation commits on `origin/task` without moving this
+  worktree's HEAD. Preserve that ancestry when resuming (step 5).
+- Confirmed merged/legacy-completed work is cleanup-only. If it is presented as
+  buildable, stop and report the mismatch; retain new/dirty work for a new
+  submission/PR rather than deleting it or reusing old approval.
+- The worktree remains for AI review, human validation and waiting PR checks.
+  CI failure alone is not a builder mission or permission to reopen an Issue.
 
 ## Minimal implementation
 
@@ -50,8 +58,9 @@ accessibility, and the smallest relevant regression check.
    ```
 
    Inspect `git diff` before editing. If the branch/path/Issue identity does not
-   match the mission, return a failure without changing anything. Pull an
-   existing remote task branch with `--ff-only` only when the worktree is clean.
+   match the mission, return a failure without changing anything. Inspect owned
+   `MERGE_HEAD` and dirty work before fetching/merging; continue the interrupted
+   merge first, preserving all intended changes.
 
 2. **Read the contract**
 
@@ -76,14 +85,25 @@ accessibility, and the smallest relevant regression check.
    refs #<issue-number>
    ```
 
-5. **Push only the task branch**
+5. **Preserve published ancestry, then normally push task**
+
+   Once interrupted merges are complete and intended work is committed, fetch
+   `origin`. If the remote task branch exists, merge it into this original task
+   branch before pushing returned work:
 
    ```bash
+   git fetch origin
+   git merge origin/task/issue-<issue-number> # when the remote task exists
+   # Resolve conflicts preserving both histories; rerun relevant tests.
    git push -u origin task/issue-<issue-number>
    ```
 
-   Do not merge into the base, close the Issue, delete refs/worktrees, or force-push. Report
-   success only after the exact task branch is pushed and clean.
+   A fast-forward is fine; divergent work needs a merge, not rebase or a force
+   rewrite that loses prepared/saved source evidence. If the normal push rejects,
+   re-observe and preserve the published history; report unresolved conflicts as
+   technical failure. Report success only when the exact task branch is pushed
+   and clean. Renewed review → Done → human close updates the same still-open
+   managed PR; human merge is still required.
 
 6. **Return one outcome object**
 
@@ -137,7 +157,9 @@ merge conflicts and retry exhaustion remain technical retries, not decisions.
 - Work only in the supplied persistent ticket worktree and task branch.
 - Leave the base branch, main checkout, Issue state, and Project fields alone.
 - Keep the Issue open and the worktree available.
-- Never delete branches/worktrees or force-push.
+- Leave PR creation/recovery to the executor and PR merge to the human. Never
+  merge/auto-merge a PR, push base, bypass protection or force-push.
+- Retain unknown/dirty/new work; never delete branches/worktrees to make cleanup pass.
 - Report incomplete decision output as a technical failure; never invent a
   product decision to explain a tool or test failure.
 - Modify `.pi/`, `.specify/`, or `.claude/` only when the ticket explicitly
