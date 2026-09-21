@@ -356,10 +356,47 @@ check(
   "builder prompt retains the minimal implementation ladder",
 );
 check(
-  builder.prompt.includes("Do NOT merge") &&
-    builder.prompt.includes("do NOT close the ticket") &&
-    !builderSource.includes("git merge --"),
-  "builder leaves the task unmerged for manual validation",
+  builder.prompt.includes("git status --short") &&
+    builder.prompt.includes("git diff") &&
+    builder.prompt.includes("Continue any interrupted merge on this original branch before fetching or starting another merge") &&
+    builder.prompt.includes("Preserve and continue any existing modifications") &&
+    builder.prompt.includes("do not switch branches"),
+  "rendered builder inspects and preserves WIP and interrupted merges on the original branch",
+);
+check(
+  builder.prompt.includes("Only when the worktree is clean, intended work is committed, and MERGE_HEAD is absent") &&
+    builder.prompt.includes("git ls-remote --exit-code --heads origin refs/heads/task/issue-42") &&
+    builder.prompt.includes("Exit 2 confirms an absent branch (normal first push allowed)") &&
+    builder.prompt.includes("other observation or fetch/network errors are technical failures, not absence"),
+  "rendered builder gates sync on clean work and distinguishes first-push absence from remote errors",
+);
+check(
+  builder.prompt.includes("fetch published origin/task/issue-42 with `git fetch origin task/issue-42`") &&
+    builder.prompt.includes("merge that fetched head into this original task branch with `git merge --ff FETCH_HEAD`") &&
+    builder.prompt.includes("Fast-forward if possible; on divergence, resolve conflicts preserving both sides, commit the merge, and rerun relevant tests") &&
+    !builder.prompt.includes("git pull --ff-only"),
+  "rendered builder fast-forwards or merges published task ancestry instead of stopping at divergence",
+);
+check(
+  builder.prompt.includes("Preserve published prepared/saved source ancestry for the same still-open managed PR on reapproval") &&
+    builder.prompt.includes("Never rebase, reset, stash, overwrite, or discard work") &&
+    builder.prompt.includes("Never force-push") &&
+    !/\bgit (?:rebase|reset|stash)\b|\bgit push[^`\n]*(?:--force|-f\b)/.test(builder.prompt),
+  "rendered builder retains managed PR source evidence without rewriting or discarding work",
+);
+check(
+  builder.prompt.includes("git push -u origin task/issue-42") &&
+    builder.prompt.includes("If rejected, re-observe/fetch/merge via step 3 before retrying a normal push") &&
+    builder.prompt.includes("report unresolved errors as technical failure"),
+  "rendered builder recovers rejected normal task pushes through observation and merge",
+);
+check(
+  builder.prompt.includes("Do NOT merge into or push main, close the Issue, or create, close, merge, or otherwise mutate a PR") &&
+    builder.prompt.includes("Never push to `main`. Only push `task/issue-42`") &&
+    builder.prompt.includes("After review reaches Done, the human closes the Issue to submit a managed PR through the executor") &&
+    builder.prompt.includes("the human manually merges the PR for final approval") &&
+    !/\bgh pr (?:create|close|merge)\b|\bgit (?:push|merge)[^`\n]*\bmain\b/.test(builder.prompt),
+  "rendered builder forbids base/PR mutations and requires human final merge approval",
 );
 check(
   builder.prompt.includes("gh issue view 42 --json comments") &&
