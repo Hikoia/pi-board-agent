@@ -212,8 +212,8 @@ try {
         assert.throws(() => {
           if (action === "create") f.store.createV5(initial, owner, noop);
           else if (action === "update") f.store.updateV5(previous, () => next, owner, noop);
-          else if (action === "prepare") f.store.preparePullRequest(previous, preparation, owner, noop);
-          else if (action === "renew") f.store.preparePullRequest(previous, { ...preparation, taskSha: "d".repeat(40), preparedHeadSha: "e".repeat(40) }, owner, noop);
+          else if (action === "prepare") f.store.recordPullRequestPreparation(previous, preparation, owner, noop);
+          else if (action === "renew") f.store.recordPullRequestPreparation(previous, { ...preparation, taskSha: "d".repeat(40), preparedHeadSha: "e".repeat(40) }, owner, noop);
           else f.store.progressPullRequest(previous, next.integration as TicketPullRequestIntegration, undefined, owner, noop);
         }, /offline .* interruption/);
         cut = () => {};
