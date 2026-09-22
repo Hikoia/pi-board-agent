@@ -1,5 +1,6 @@
 import {
   WorkflowErrorCode,
+  runWorkflow,
   workflowProjectPaths,
   type PersistedRunState,
 } from "@quintinshaw/pi-dynamic-workflows";
@@ -617,18 +618,57 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
       "PASS: six-hour timeout and one retry reach executor and generated agent",
     );
   else fail("FAIL: builder timeout launch propagation");
-  if (
-    builderScript.includes("git status --short") &&
-    builderScript.includes("git diff") &&
-    builderScript.includes("the persistent worktree for this ticket") &&
-    builderScript.includes("Only when there is no MERGE_HEAD") &&
-    builderScript.includes("Never reset, stash, overwrite, or discard") &&
-    builderScript.includes("clean, committed, and pushed")
-  )
-    console.log(
-      "PASS: builder preserves and completes a ticket-owned partial diff",
-    );
-  else fail("FAIL: ticket-owned dirty-worktree contract");
+  // Execute the generated script with an injected mock, as in test-core.ts;
+  // assert on the rendered mission in this test, never inside the agent call.
+  const builderRecord = recordFor(card79.itemId);
+  const builderResult = {
+    taskKey: builderRecord.taskKey,
+    itemId: card79.itemId,
+    branch: builderRecord.taskBranch,
+    status: "success",
+  };
+  const builderPrompts: string[] = [];
+  const renderedBuilder = await runWorkflow(builderScript, {
+    cwd: builderRecord.path,
+    persistLogs: false,
+    maxAgents: 1,
+    concurrency: 1,
+    agentRegistry: new Map(),
+    agent: {
+      async run(prompt) {
+        builderPrompts.push(prompt);
+        return builderResult;
+      },
+    },
+  });
+  // The generated array is from the VM realm; compare the full JSON-shaped value.
+  assert.deepEqual(structuredClone(renderedBuilder.result), [builderResult], "actual mock-builder result");
+  assert.equal(builderPrompts.length, 1, "generated workflow invokes one mock builder");
+  const [builderPrompt] = builderPrompts;
+  for (const text of [
+    "git status --short", "git diff", "MERGE_HEAD", "the persistent worktree for this ticket",
+    "Continue any interrupted merge on this original branch before fetching or starting another merge",
+    "Preserve and continue any existing modifications", "do not switch branches",
+    "Only when the worktree is clean, intended work is committed, and MERGE_HEAD is absent",
+    `git ls-remote --exit-code --heads origin refs/heads/${builderRecord.taskBranch}`,
+    "Exit 2 confirms an absent branch (normal first push allowed)",
+    "other observation or fetch/network errors are technical failures, not absence",
+    `fetch published origin/${builderRecord.taskBranch} with \`git fetch origin ${builderRecord.taskBranch}\``,
+    "merge that fetched head into this original task branch with `git merge --ff FETCH_HEAD`",
+    "Fast-forward if possible; on divergence, resolve conflicts preserving both sides, commit the merge, and rerun relevant tests",
+    "Preserve published prepared/saved source ancestry for the same still-open managed PR on reapproval",
+    "Never rebase, reset, stash, overwrite, or discard work", "Never force-push",
+    `git push -u origin ${builderRecord.taskBranch}`,
+    "If rejected, re-observe/fetch/merge via step 3 before retrying a normal push",
+    "report unresolved errors as technical failure", "clean, committed, and pushed",
+    `Do NOT merge into or push ${builderRecord.baseBranch}, close the Issue, or create, close, merge, or otherwise mutate a PR`,
+    `Never push to \`${builderRecord.baseBranch}\`. Only push \`${builderRecord.taskBranch}\``,
+    "After review reaches Done, the human closes the Issue to submit a managed PR through the executor",
+    "the human manually merges the PR for final approval",
+  ]) assert.ok(builderPrompt.includes(text), `rendered builder mission missing: ${text}`);
+  assert.doesNotMatch(builderPrompt, /\bgit (?:pull --ff-only|rebase|reset|stash)\b|\bgit push[^`\n]*(?:--force|-f\b)/);
+  assert.doesNotMatch(builderPrompt, /\bgh (?:issue close|pr (?:create|close|merge|edit|reopen))\b|\bgit (?:push|merge)[^`\n]*\bmain\b/);
+  console.log("PASS: rendered builder preserves interrupted work and published PR ancestry with safe normal merges and human-only approval");
   const startsBeforeDuplicate = [...managerStates.values()].reduce(
     (sum, state) => sum + state.starts,
     0,

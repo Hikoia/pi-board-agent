@@ -2,7 +2,7 @@
 // Retired request/test-history proof assertions are mapped in docs/test-v4-mapping.md.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRunPersistence, type WorkflowManagerOptions, type WorkflowRunOptions } from "@quintinshaw/pi-dynamic-workflows";
 import { BoardLoop, createLoopState } from "../src/loop.js";
 import { runReview } from "../src/review.js";
@@ -74,7 +74,16 @@ async function settled(f: Awaited<ReturnType<typeof fixture>>, runId: string) {
   const persistence = createRunPersistence(f.record.path);
   for (let i = 0; i < 300; i++) {
     const run = persistence.load(runId);
-    if (run && ["completed", "failed", "aborted"].includes(run.status)) return run;
+    if (run && ["completed", "failed", "aborted"].includes(run.status)) {
+      // A completed workflow can contain [null] after a mock-builder assertion.
+      // Report that agent error here, before a missing .pi/tested hides it.
+      assert.equal(run.status, "completed", run.error ?? JSON.stringify(run));
+      assert.equal(run.agents.length, 1, "exactly one mock builder must execute");
+      const agent = run.agents[0];
+      assert.equal(agent.status, "done", `Mock builder ${agent.label}: ${agent.errorCode}: ${agent.error}`);
+      assert.deepEqual(run.result, [{ taskKey: f.task.taskKey, itemId: f.task.itemId, branch: f.task.taskBranch, status: "success" }], "actual builder result, not just workflow completion");
+      return run;
+    }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error("Builder did not settle (not a passing test)");
@@ -106,10 +115,24 @@ function integrate(f: Awaited<ReturnType<typeof fixture>>) {
 
 {
   const f = await fixture();
+  f.setBuilder(async () => { assert.fail("injected mock-builder assertion"); });
+  try {
+    const launched = await f.executor.launch(f.card, "demo", undefined, undefined);
+    if (launched.status !== "launched") throw new Error(JSON.stringify(launched));
+    await assert.rejects(settled(f, launched.runId), /AGENT_EXECUTION_ERROR: injected mock-builder assertion/);
+    const run = createRunPersistence(f.record.path).load(launched.runId)!;
+    assert.equal(run.status, "completed", "exercise the completed-workflow/failed-agent case");
+    assert.equal(run.agents[0].status, "error");
+    assert.deepEqual(run.result, [null]);
+    assert.equal(existsSync(join(f.record.path, ".pi/tested")), false, "no fabricated test evidence");
+    console.log("PASS: a completed workflow with a failed mock builder surfaces its assertion instead of .pi/tested ENOENT");
+  } finally { await f.executor.shutdown(); }
+}
+
+{
+  const f = await fixture();
   let resultSha = "";
-  f.setBuilder(async (prompt) => {
-    assert.ok(prompt.includes(f.card.body), "repair never replaces original requirements");
-    for (const text of [f.repair.taskSha, f.repair.baseSha, "MERGE_HEAD", "Never force-push", "do NOT close"]) assert.ok(prompt.includes(text), text);
+  f.setBuilder(async () => {
     resultSha = integrate(f);
     execFileSync(process.execPath, ["test.cjs"], { cwd: f.record.path });
     git(f.record.path, "push", "origin", f.task.taskBranch);
@@ -121,6 +144,32 @@ function integrate(f: Awaited<ReturnType<typeof fixture>>) {
     if (launched.status !== "launched") throw new Error("not launched");
     const run = await settled(f, launched.runId);
     assert.equal(run.status, "completed", JSON.stringify(run));
+    // Check the actual mission in the main test, not inside a swallowed agent call.
+    const prompt = run.agents[0].prompt;
+    assert.ok(prompt.includes(f.card.body), "repair never replaces original requirements");
+    for (const text of [
+      f.repair.taskSha, f.repair.baseSha, "git status --short", "git diff", "MERGE_HEAD",
+      "Continue any interrupted merge on this original branch before fetching or starting another merge",
+      "Preserve and continue any existing modifications", "do not switch branches",
+      "Only when the worktree is clean, intended work is committed, and MERGE_HEAD is absent",
+      `git ls-remote --exit-code --heads origin refs/heads/${f.task.taskBranch}`,
+      "Exit 2 confirms an absent branch (normal first push allowed)",
+      "other observation or fetch/network errors are technical failures, not absence",
+      `fetch published origin/${f.task.taskBranch} with \`git fetch origin ${f.task.taskBranch}\``,
+      "merge that fetched head into this original task branch with `git merge --ff FETCH_HEAD`",
+      "Fast-forward if possible; on divergence, resolve conflicts preserving both sides, commit the merge, and rerun relevant tests",
+      "Preserve published prepared/saved source ancestry for the same still-open managed PR on reapproval",
+      "Never rebase, reset, stash, overwrite, or discard work", "Never force-push",
+      `git push -u origin ${f.task.taskBranch}`,
+      "If rejected, re-observe/fetch/merge via step 3 before retrying a normal push",
+      "report unresolved errors as technical failure", "clean, committed, and pushed",
+      `Do NOT merge into or push ${f.task.baseBranch}, close the Issue, or create, close, merge, or otherwise mutate a PR`,
+      `Never push to \`${f.task.baseBranch}\`. Only push \`${f.task.taskBranch}\``,
+      "After review reaches Done, the human closes the Issue to submit a managed PR through the executor",
+      "the human manually merges the PR for final approval",
+    ]) assert.ok(prompt.includes(text), `rendered repair mission missing: ${text}`);
+    assert.doesNotMatch(prompt, /\bgit (?:pull --ff-only|rebase|reset|stash)\b|\bgit push[^`\n]*(?:--force|-f\b)/);
+    assert.doesNotMatch(prompt, /\bgh (?:issue close|pr (?:create|close|merge|edit|reopen))\b|\bgit (?:push|merge)[^`\n]*\bmain\b/);
     assert.equal(Object.hasOwn(run.args!, "repair"), false, "ordinary run args, no repair protocol");
     assert.equal(run.maxAgents, 1); assert.equal(run.concurrency, 1);
     assert.equal(f.store.read(f.card.itemId)?.schemaVersion, 5);
@@ -138,6 +187,7 @@ function integrate(f: Awaited<ReturnType<typeof fixture>>) {
     assert.equal(git(f.record.path, "status", "--porcelain"), "");
     assert.equal(git(f.origin, "rev-parse", `refs/heads/${f.task.taskBranch}`), resultSha);
     let reviews = 0;
+    let reviewedTested: string | undefined;
     const notices: string[] = [];
     const loop = new BoardLoop({ cwd: f.repo, cfg: f.cfg, botLogin: "bot", repoOwner: "owner", repoName: "repo", meta: { projectId: "P", statusFieldId: "S", statusOptions: {} },
       callback: (message) => notices.push(message), listCards: async () => [structuredClone(f.card)],
@@ -148,6 +198,7 @@ function integrate(f: Awaited<ReturnType<typeof fixture>>) {
         return runReview(input, async (source, options) => {
           assert.ok(!source.includes("REPAIR TEST EVIDENCE"));
           execFileSync(process.execPath, ["test.cjs"], { cwd: options.cwd });
+          reviewedTested = readFileSync(join(options.cwd, ".pi/tested"), "utf8");
           assert.ok(source.includes(f.card.body));
           assert.equal(git(options.cwd, "rev-parse", "HEAD"), resultSha);
           return { result: { verdict: "pass", summary: "Both branches and integrated test evidence reviewed", findings: [] } };
@@ -161,12 +212,13 @@ function integrate(f: Awaited<ReturnType<typeof fixture>>) {
       assert.equal(f.card.status, f.cfg.columns.done, notices.join("\n"));
       assert.equal(f.card.closed, false, "AI Review cannot self-close repair");
       assert.equal(f.store.read(f.card.itemId)?.reviewedTaskSha, resultSha);
+      assert.equal(reviewedTested, resultSha + "\n", "Review executed test.cjs at the integrated commit in its detached worktree");
     } finally { await loop.stop(); }
     await f.executor.shutdown();
     const restarted = f.makeExecutor();
     try { await restarted.reconcile([f.card]); assert.equal(f.calls(), 1); }
     finally { await restarted.shutdown(); }
-    console.log("PASS: real conflicting branches preserve both edits, execute existing tests at the pushed integrated SHA, and await Review/manual close without relaunch");
+    console.log(`PASS: real conflicting branches preserve both edits; test.cjs records ${resultSha} for builder and Review; the pushed integrated SHA awaits manual close without relaunch`);
   } finally { await f.executor.shutdown(); }
 }
 
@@ -232,7 +284,9 @@ for (const association of ["active", "launch-window"] as const) {
       assert.equal(f.card.status, f.cfg.columns.review, f.comments.join("\n"));
       assert.equal(calls, 2, "one interrupted invocation and one resume, never a new run");
       assert.equal(readFileSync(join(f.record.path, "task-only.txt"), "utf8"), "preserve interrupted edit\n");
-      console.log(`PASS: ${association} pause/drain/restart resumes the same args/script/run/worktree with dirty merge and advanced HEAD`);
+      const testedSha = git(f.record.path, "rev-parse", "HEAD");
+      assert.equal(readFileSync(join(f.record.path, ".pi/tested"), "utf8"), testedSha + "\n", "resumed builder executed test.cjs at its completed merge");
+      console.log(`PASS: ${association} pause/drain/restart resumes the same args/script/run/worktree with dirty merge and advanced HEAD; test.cjs records ${testedSha}`);
     } finally { await restarted.shutdown(); }
   } finally { drained.resolve(); await f.executor.shutdown(); }
 }
