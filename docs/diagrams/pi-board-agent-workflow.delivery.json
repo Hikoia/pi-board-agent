@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "workflow",
+  "input": "D:\\Project\\pi-board-agent\\docs\\diagrams\\pi-board-agent-workflow.json",
+  "output": "D:\\Project\\pi-board-agent\\docs\\diagrams\\pi-board-agent-workflow.html",
+  "specification": {
+    "sha256": "cae24ef4b22d7938d6517f95745c66130aea147a7dd448ddaeefe52f4b020893",
+    "bytes": 6467
+  },
+  "artifact": {
+    "sha256": "b8da70590d1597e6575d94f8bc89b3bfea37e7b44b6bedacc8b5f296c341c59f",
+    "bytes": 818845
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "showcase",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "pi-board-agent 工作流程",
+    "quality_profile": "showcase",
+    "legend": {
+      "entries": {
+        "backend": { "label": "插件／模型執行" },
+        "cloud": { "label": "GitHub 看板" },
+        "security": { "label": "審查／人工關卡" },
+        "database": { "label": "Git 整合／持久狀態" }
+      }
+    }
+  },
+  "lanes": [
+    { "id": "board_control", "label": "啟動與調度" },
+    { "id": "model_execution", "label": "建置與審查" },
+    { "id": "human_authority", "label": "人工決策／驗收" },
+    { "id": "git_finalization", "label": "整合與收尾" }
+  ],
+  "mainPath": [
+    "owner_poll", "ready_task", "persistent_builder", "pinned_review",
+    "done_open", "human_close", "native_merge", "safe_cleanup", "closed_backlog"
+  ],
+  "semanticChecks": {
+    "allowedRoots": ["owner_poll"],
+    "allowedTerminals": ["closed_backlog"],
+    "requiredPaths": [
+      { "from": "persistent_builder", "to": "pinned_review" },
+      { "from": "done_open", "to": "human_close" },
+      { "from": "human_close", "to": "native_merge" },
+      { "from": "human_decision", "to": "ready_task" }
+    ]
+  },
+  "nodes": [
+    { "id": "owner_poll", "lane": "board_control", "col": 0, "type": "backend", "label": "啟動與輪詢", "sublabel": "檢查／獨占／恢復", "tag": "/board-agent run" },
+    { "id": "ready_task", "lane": "board_control", "col": 1, "width": 128, "type": "cloud", "label": "Ready · 待執行", "sublabel": "本倉庫的開啟 Task Issue", "tag": "Plan 非必要" },
+    { "id": "persistent_builder", "lane": "model_execution", "col": 1, "width": 144, "type": "backend", "label": "In Progress · 建置", "sublabel": "原 worktree 實作與測試", "tag": "WorkflowManager" },
+    { "id": "pinned_review", "lane": "model_execution", "col": 2, "width": 128, "type": "security", "label": "Review · AI 審查", "sublabel": "隔離 worktree／精確 SHA", "tag": "不可略過" },
+    { "id": "done_open", "lane": "model_execution", "col": 3, "width": 128, "type": "cloud", "label": "Done · 等待驗收", "sublabel": "Issue 仍開啟；保留工作區", "tag": "尚未合併" },
+    { "id": "human_decision", "lane": "human_authority", "col": 1, "type": "security", "label": "Needs Human", "sublabel": "僅暫停這張任務", "tag": "具體問題＋選項＋建議" },
+    { "id": "human_close", "lane": "human_authority", "col": 3, "width": 128, "type": "security", "label": "人工驗收並關閉", "sublabel": "檢查保留的 task worktree", "tag": "手動關閉 Issue" },
+    { "id": "native_merge", "lane": "git_finalization", "col": 3, "width": 144, "type": "database", "label": "原生 Git 整合", "sublabel": "最新 base／正常 merge＋push", "tag": "單一 finalizer" },
+    { "id": "safe_cleanup", "lane": "git_finalization", "col": 4, "width": 144, "type": "database", "label": "依序安全清理", "sublabel": "遠端 ref → 工作區 → 本地 ref", "tag": "先確認遠端整合" },
+    { "id": "closed_backlog", "lane": "git_finalization", "col": 5, "width": 144, "type": "cloud", "label": "Backlog · 收尾完成", "sublabel": "確認看板後才刪除紀錄", "tag": "Issue 保持關閉" }
+  ],
+  "edges": [
+    { "id": "poll_ready", "from": "owner_poll", "to": "ready_task", "label": "讀取看板", "role": "main" },
+    { "id": "claim_launch", "from": "ready_task", "to": "persistent_builder", "label": "容量＋認領", "role": "main" },
+    { "id": "push_review", "from": "persistent_builder", "to": "pinned_review", "label": "commit＋push", "role": "main", "variant": "emphasis" },
+    { "id": "review_pass", "from": "pinned_review", "to": "done_open", "label": "通過", "role": "main", "variant": "emphasis" },
+    { "id": "await_validation", "from": "done_open", "to": "human_close", "label": "人工驗收", "role": "main", "variant": "security" },
+    { "id": "closure_approval", "from": "human_close", "to": "native_merge", "label": "重查關閉授權", "role": "main", "variant": "security" },
+    { "id": "verify_remote", "from": "native_merge", "to": "safe_cleanup", "label": "確認已整合", "role": "main", "variant": "emphasis" },
+    { "id": "confirm_backlog", "from": "safe_cleanup", "to": "closed_backlog", "label": "寫回看板", "role": "main" },
+    { "id": "builder_question", "from": "persistent_builder", "to": "human_decision", "label": "needs_decision", "role": "branch", "variant": "security" },
+    { "id": "review_question", "from": "pinned_review", "to": "human_decision", "label": "needs_decision", "role": "branch", "variant": "security" },
+    { "id": "maintainer_resume", "from": "human_decision", "to": "ready_task", "label": "可信回覆＋手動 Ready", "role": "return", "variant": "dashed", "fromSide": "left", "toSide": "left" },
+    { "id": "review_build_retry", "from": "pinned_review", "to": "persistent_builder", "label": "程式缺陷 → Ready", "role": "return", "variant": "dashed" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan", "title": "調度與持久恢復",
+      "items": [
+        "每輪先恢復原 run、處理待寫回結果，再接新任務；不建立重複 builder。",
+        "max_workers 共用於 builder＋最多一個 review；finalizer 不占模型名額。",
+        "獨占 owner；每張票保留分支、worktree 與 v4 紀錄。stop 排空後才釋鎖。"
+      ]
+    },
+    {
+      "dot": "amber", "title": "失敗重試 ≠ 人工決策",
+      "items": [
+        "建置失敗／審查缺陷：Ready＋build，沿用原工作區；審查技術故障：Ready＋review，重查原 SHA。",
+        "可交回 builder 的 base 衝突：重新開啟 → Ready → 建置／審查 → 再次人工關閉；本地／遠端來源衝突保留待手動處理。",
+        "integrate／cleanup 技術失敗僅重試 Git／收尾，不重開票；GitHub 寫回失敗只補 I/O，不重跑模型。"
+      ]
+    },
+    {
+      "dot": "emerald", "title": "人工授權與清理邊界",
+      "items": [
+        "Needs Human 必須由 OWNER／MEMBER／COLLABORATOR 回覆且手動移到 Ready；留言本身不啟動任務。",
+        "已關閉 Done 的本倉庫 Issue 可直接收尾，不限 Type、無須審查標記；PR／Draft／外倉庫排除。",
+        "髒檔、鎖或 ref 變動會阻擋 task 清理；ignored 檔可能被清除。無本地／遠端 ref 時僅移 Backlog、保留歷史。"
+      ]
+    }
+  ]
+}
