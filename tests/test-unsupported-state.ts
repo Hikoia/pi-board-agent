@@ -263,7 +263,7 @@ try {
   );
   const configFile = join(project, ".pi", "board-agent.yml");
   const configText =
-    "project:\n  owner: project-user\n  number: 17\nauto_start: false\n";
+    "project:\n  owner: project-user\n  number: 17\nauto_start: true\n";
   writeFileSync(configFile, configText);
 
   const ghCalls: unknown[][] = [];
@@ -461,7 +461,7 @@ try {
       writeFileSync(
         configFile,
         configText.replace(
-          "auto_start: false",
+          "auto_start: true",
           `auto_start: ${action === "session_start"}`,
         ),
       );
@@ -501,7 +501,7 @@ try {
   await event("session_start");
   assert.equal(loops.length, 1, messages.join("\n"));
   const recovery = loops[0];
-  assert.equal(recovery.admissions, false);
+  assert.equal(recovery.admissions, true);
   assert.equal(recovery.deps.repoOwner, "repo-org");
   assert.equal(recovery.deps.repoName, "target-repo");
   assert.ok(
@@ -512,9 +512,11 @@ try {
   );
   check(
     true,
-    "startup resumes durable records in recovery-only mode with separate Project/origin identities",
+    "opted-in startup resumes durable records with separate Project/origin identities",
   );
 
+  // Simulate a running loop closing admissions; promotion must still revalidate.
+  recovery.admissions = false;
   putLegacy();
   const unchanged = inventory(state);
   const callCount = ghCalls.length;

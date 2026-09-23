@@ -65,20 +65,46 @@ const invoke = async (name: string) => {
   const path = join(cwd, ".pi", "board-agent", "runtime.json");
   const runtime = () => existsSync(path) ? readFileSync(path, "utf8") : "";
   const before = runtime();
+  const messageStart = messages.length;
   await (name === "session_start" ? events.get(name)!({}, ctx) : command(name, ctx));
-  if (["session_start", "run"].includes(name))
+  if (["session_start", "run"].includes(name) && messages.slice(messageStart).some(({ message }) => message.includes("STARTING")))
     await until(() => !!runtime() && runtime() !== before && JSON.parse(runtime()).state !== "starting");
 };
 try {
   (await import(entry)).default({ on: (name: string, handler: Function) => events.set(name, handler), registerCommand: (_name: string, options: any) => { command = options.handler; } });
-  // auto_start reaches the shared startup loader too; explicit run exercises it directly.
+  // A local false must override global true, even with durable recovery pending.
+  const records = join(cwd, ".pi", "board-agent", "ticket-worktrees");
+  const recordPath = join(records, "pvti_3.json");
+  mkdirSync(records, { recursive: true });
+  writeFileSync(global, "auto_start: true\n");
+  writeFileSync(project, config + "auto_start: false\n");
+  writeFileSync(recordPath, JSON.stringify({
+    schemaVersion: 3, itemId: "PVTI_3", issueNumber: 3, taskKey: "T003", plan: "release",
+    taskBranch: "task/issue-3", baseBranch: "main", path: join(cwd, ".pi", "worktrees", "pvti_3"),
+    createdAt: 1, activeRunId: "run-3", activeRunStartedAt: 1,
+  }));
+  for (const recovery of [true, false]) {
+    if (!recovery) rmSync(recordPath);
+    messages.length = 0;
+    await invoke("session_start");
+    assert.equal(starts, 0, "auto_start=false must not start a loop, including recovery");
+    assert.deepEqual(messages, [], "disabled auto-start must not announce startup");
+    assert.equal(existsSync(join(cwd, ".pi", "board-agent", "owner.lock")), false);
+    assert.equal(existsSync(join(cwd, ".pi", "board-agent", "runtime.json")), false);
+  }
+  await invoke("run");
+  assert.equal(starts, 1, "manual run still starts with auto_start=false");
+  await command("stop", ctx);
+  console.log("PASS: auto_start=false overrides global true and prevents session startup with or without recovery; explicit run still works");
+
+  // Explicit commands still load config when automatic startup is disabled.
   for (const [source, value] of [[global, true], [project, false], [undefined, undefined]] as const) {
     rmSync(global, { force: true });
     writeFileSync(project, source === project
       ? config.replace("  require_clean_worktree: false", `  require_clean_worktree: false\n  skip_closed_issues: ${value}`)
       : config);
     if (source === global) writeFileSync(global, `safety:\n  skip_closed_issues: ${value}\n`);
-    for (const action of ["session_start", "lint", "run", "status", "context", "init-project"]) {
+    for (const action of ["lint", "run", "status", "context", "init-project"]) {
       messages.length = 0;
       await invoke(action);
       assert.ok(!messages.some(({ level }) => level === "error"), JSON.stringify(messages));
@@ -93,7 +119,7 @@ try {
       } else assert.deepEqual(warnings, [], `${action}: defaults must not warn`);
       await command("stop", ctx);
     }
-    console.log(`PASS: production session_start/run/lint/status/context/init-project ${source ? `warn for ${source === global ? "global true" : "project false"}` : "stay quiet for defaults"} through real loadConfig`);
+    console.log(`PASS: production run/lint/status/context/init-project ${source ? `warn for ${source === global ? "global true" : "project false"}` : "stay quiet for defaults"} through real loadConfig`);
   }
   writeFileSync(project, config + "auto_start: true\n");
   writeFileSync(global, "safety:\n  skip_closed_issues: false\n");

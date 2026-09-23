@@ -484,9 +484,10 @@ export default function (pi: ExtensionAPI) {
     Parameters<ExtensionAPI["registerCommand"]>[1]
   >();
 
-  // Resume durable ticket runs on every startup/reload; auto_start also admits new work.
+  // Session startup/reload is opt-in, including recovery of existing runs.
   pi.on("session_start", (_event, ctx) => {
     if (startup || stopBarrier || loop?.isStopping() || loop?.isRunning()) return;
+    if (!loadConfig(ctx.cwd).auto_start) return;
     clearBoardWidget(ctx);
     runtimeStartedAt = new Date().toISOString();
     startBoardLoop(ctx); // Automatic admission/recovery decision is inside tracked startup.

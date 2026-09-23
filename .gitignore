@@ -13,3 +13,4 @@ tmp/
 .specify/
 .pi/board-agent/
 tests/gen/
+docs/

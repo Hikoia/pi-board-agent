@@ -52,6 +52,8 @@ telegram:
   bot_token_env: "TELEGRAM_BOT_TOKEN"
   chat_id_env: "TELEGRAM_CHAT_ID"
   "on": ["needs_human"]
+# Start on Pi startup/reload, including recovery of existing runs.
+# When false, start manually with /board-agent run.
 auto_start: false
 safety:
   require_clean_worktree: true # gates new launches, not existing-run recovery
