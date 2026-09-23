@@ -362,8 +362,9 @@ Windows Job Objects contain ordinary descendant processes, not malicious POSIX
 session escapes. Telegram combines cancellation with its fixed deadline. No
 live models, GitHub or deployment policy are certified by offline fixture tests.
 This delivery makes no deployment or real #121 changes. Live PR permissions,
-CI/protections and manual merge acceptance remain unverified; final full-suite
-offline acceptance is pending MAIN T07.
+CI/protections and manual merge acceptance remain unverified. MAIN T07 completed
+all 91 offline test files with exit 1; full-suite acceptance **did not pass**.
+See the [final acceptance report](manual-pr-offline-acceptance.md).
 
 Historical audit reports retain their original source baselines and are not
 current policy. See [runbook](runbook.md) for stopped backups and recovery.

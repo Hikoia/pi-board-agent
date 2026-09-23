@@ -369,9 +369,11 @@ archive GC or production repair/snapshot maintenance path.
 remotes and fake board/model boundaries. It is not live GitHub/Project or real
 model certification. This delivery is local/offline only: no deployment or action
 on real #121. MAIN accepted G4 after typecheck and 222 focused checks including
-authorization-race fixes; **final full-suite offline acceptance remains pending
-MAIN T07**. Live GitHub permissions, PR behavior, CI and branch protections have
-not been verified here. Before rollout, separately validate task-push/PR API
+authorization-race fixes. **MAIN T07 completed all 91 files but did not pass**:
+exit 1, with a Windows process-runner assertion failure. The user closed this
+round without extending repair scope; see the [final acceptance report](manual-pr-offline-acceptance.md)
+for exact commits, logs, exits and platform limitations. Live GitHub permissions,
+PR behavior, CI and branch protections have not been verified here. Before rollout, separately validate task-push/PR API
 permissions and manual squash merge/cleanup in a protected test repository;
 never change protection as a test shortcut. The earlier v4 test-port mapping is
 historical: [test-v4-mapping.md](test-v4-mapping.md).

@@ -289,7 +289,9 @@ all `test-*.ts`/`test-*.mjs` files and isolates each test's home/state/credentia
 Local bare remotes and fake board/model adapters are offline evidence, not live
 GitHub, deployment-policy or real-model certification. This manual-PR delivery
 has not deployed or acted on real #121; live permissions, CI/protections and
-GitHub behavior remain unverified. Final full-suite offline acceptance is pending
-MAIN T07, not claimed by this documentation update.
+GitHub behavior remain unverified. MAIN T07 completed all 91 offline test files
+but **did not pass** (exit 1, Windows process-runner assertion). See the
+[final acceptance report](docs/manual-pr-offline-acceptance.md); no deployment
+or full-suite success is claimed.
 
 MIT © Alessandro Mancini. See [LICENSE](LICENSE).

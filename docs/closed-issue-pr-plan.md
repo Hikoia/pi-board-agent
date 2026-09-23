@@ -1,6 +1,6 @@
 # Closed Issue → PR → 人工合併：實作方案
 
-狀態：使用者已選擇「人工合併 PR」；v5 實作已進入離線驗收。MAIN 已接受 G4（typecheck + 222 focused tests，含獨立重現並修正 authorization races）；T06 更新設定／現行文件，**最終全套離線驗收仍待 MAIN T07**，尚未部署。
+狀態：v5 實作與原始測試契約修復已整合；**MAIN T07 以未通過結案**。`79970e1` 的完整 91 檔已執行，exit 1（Windows process-runner 斷言失敗）；使用者選擇不擴大本輪修復。詳見[最終離線驗收報告](manual-pr-offline-acceptance.md)。尚未部署，人工合併 PR 的產品決策不變。
 
 原始方案查核基準：本地 `21918074819ddef7caf3b69e48b202410368612f` 及當時記錄的 `Hikoia/lazypie` 設定。以下保留原方案脈絡；本輪僅本地／離線，未重新查核 live GitHub、CI、權限或保護規則，也未操作真實 #121。
 
@@ -169,7 +169,7 @@ Issue 重新開啟或移出已批准 lane 時，停止本批次整合／清理�
 | 3. 人工合併觀測／清理 | `src/ticket-executor.ts`、`src/ticket-worktree.ts` | 將大 finalizer 拆出 PR preparation 與 merged-proof cleanup；不另加通用策略層 |
 | 4. 等待狀態與生命週期 | `src/loop.ts`、`src/operation.ts`、`src/runtime.ts`／`src/index.ts` 的必要顯示與版本接點 | PR 連結、waiting outcome、非阻塞 round-robin、stop/drain、人工退回 Ready |
 | 5. 設定與文件 | `src/config.ts`、`config-template.yml`、`README.md`、`docs/runbook.md`、現行架構文件及 builder 操作說明 | 移除 direct-push 部署要求；退休 `task_merge_strategy`，舊值驗證後警告忽略；不新增只有一種值的模式設定 |
-| 6. 驗收（部署另行批准） | `tests/test-pr-*.ts`、`tests/test-gh-pr.ts`、現有 finalization／migration／lifecycle 測試 | MAIN T07 完成全套離線回歸；受保護測試 repo 的人工合併驗收與真實 #121 處理不在本輪 |
+| 6. 驗收（部署另行批准） | `tests/test-pr-*.ts`、`tests/test-gh-pr.ts`、現有 finalization／migration／lifecycle 測試 | MAIN T07 已跑完 91 檔但 exit 1，以未通過結案；受保護測試 repo 的人工合併驗收與真實 #121 處理不在本輪 |
 
 不需要獨立 PR watchdog：PR 的所有前進由現有 `finalizeClosed()`／maintenance tick 驅動。GitHub 呼叫集中在現有 `gh.ts`，Git／filesystem 保護集中在 `TicketWorktrees`。
 
@@ -190,7 +190,7 @@ Issue 重新開啟或移出已批准 lane 時，停止本批次整合／清理�
 
 ## 8. 本輪範圍
 
-本輪是 v5 實作與離線驗收，不是部署。T06 退休 runtime `task_merge_strategy`：Config/default/result 均無此欄位；舊 `merge`／`squash` 驗證後警告並忽略，無效值仍報錯，不新增單值 manual mode。現行 README／runbook／architecture／builder skill 同步更新。沒有 live GitHub 呼叫、真實 push／PR 建立／合併／artifact 刪除或保護規則變更；真實 #121 未動。最終全套驗收仍待 MAIN T07，不能把 focused checks 當成已完成部署或線上驗收。
+本輪是 v5 實作與離線驗收，不是部署。T06 退休 runtime `task_merge_strategy`：Config/default/result 均無此欄位；舊 `merge`／`squash` 驗證後警告並忽略，無效值仍報錯，不新增單值 manual mode。現行 README／runbook／architecture／builder skill 同步更新。沒有 live GitHub 呼叫、真實 push／PR 建立／合併／artifact 刪除或保護規則變更；真實 #121 未動。MAIN T07 已以未通過結案，不能把 focused checks 當成全量通過、已完成部署或線上驗收。
 
 第一版刻意不做：自動合併、原生 Auto-merge、merge queue 整合、自動重跑 CI、自動更新等待中的 PR、rebase 後的 patch-equivalence 推測，以及不相符 PR 的自動接管。
 
