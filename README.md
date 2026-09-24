@@ -90,9 +90,13 @@ does not update waiting PRs, watch CI, auto-merge or bypass protection.
 
 Only an explicit `needs_decision` with a concrete question, missing context,
 viable options and recommendation moves a ticket to Needs Human. Work stays in
-place; its slot is released only after safe drain and settlement. A repository
-OWNER, MEMBER or COLLABORATOR must **reply AND manually move it to Ready**.
-A reply alone never resumes work; trusted replies inform the resumed builder.
+place; its slot is released only after safe drain and settlement. **Moving the
+card to Ready is the resume signal**; no decision-reply check gates admission.
+Needs Human stays paused, and a comment alone never resumes work. Trusted OWNER,
+MEMBER or COLLABORATOR comments inform the resumed builder, including human replies
+from the same account as the agent. Agent comments and their headings carry
+`[Agent]`; these and legacy `<!-- board-agent-` comments are excluded from human
+instructions, independently of the author account.
 
 ## Requirements and install
 

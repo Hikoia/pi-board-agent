@@ -1131,33 +1131,8 @@ export class ManagedTicketExecutor implements TicketExecutor {
     let missionComments: string | undefined;
     if (this.deps.board.decisionComments) {
       const comments = await this.deps.board.decisionComments(card);
-      missionComments = trustedMissionComments(comments, this.deps.botLogin);
-      let question = -1;
-      comments.forEach((c, index) => {
-        if (
-          c.author?.toLowerCase() === this.deps.botLogin.toLowerCase() &&
-          c.body.includes("## ⚠️ Needs human input")
-        )
-          question = index;
-      });
-      if (
-        question >= 0 &&
-        !comments
-          .slice(question + 1)
-          .some(
-            (c) =>
-              c.author &&
-              c.author.toLowerCase() !== this.deps.botLogin.toLowerCase() &&
-              ["OWNER", "MEMBER", "COLLABORATOR"].includes(
-                c.authorAssociation ?? "",
-              ) &&
-              c.body.trim(),
-          )
-      )
-        return {
-          status: "skipped",
-          reason: "Ready requires a trusted maintainer decision reply",
-        };
+      // Ready is the human resume signal; comments supply context, never admission.
+      missionComments = trustedMissionComments(comments);
       const fresh = await this.deps.board.getCard(snapshot.itemId);
       if (!fresh || !sameTicketContract(fresh, card))
         return { status: "skipped", reason: "ticket contract changed" };

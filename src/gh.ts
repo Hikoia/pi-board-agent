@@ -1,5 +1,6 @@
 /** Project discovery, guarded Task Issue I/O, and strict PR observation/creation. */
 import type { Config } from "./config.js";
+import { formatAgentComment } from "./dispatch.js";
 import {
   GIT_GH_TIMEOUT_MS,
   ProcessTimeoutError,
@@ -722,7 +723,12 @@ function hydratePullRequest(
     (value.merged && value.mergeCommit === null)
   )
     throw new Error("GitHub returned missing or invalid PR commit data.");
-  const url = new URL(requiredString(value.url, "PR URL"));
+  let url: URL;
+  try {
+    url = new URL(requiredString(value.url, "PR URL"));
+  } catch (cause) {
+    throw new Error("GitHub returned an invalid PR URL.", { cause });
+  }
   if (
     value.url !== value.url.trim() ||
     url.protocol !== "https:" || url.username || url.password ||
@@ -1027,7 +1033,7 @@ export async function createComment(
     mutation($issueId: ID!, $body: String!) {
       addComment(input: { subjectId: $issueId, body: $body }) { commentEdge { node { id } } }
     }`;
-  const data = await graphql<any>(mutation, { issueId, body });
+  const data = await graphql<any>(mutation, { issueId, body: formatAgentComment(body) });
   return requiredString(
     data?.addComment?.commentEdge?.node?.id,
     "created comment id",

@@ -105,17 +105,30 @@ for (const mode of ["failure", "malformed-decision", "tool-exception", "timeout"
   console.log(`PASS: ${mode} retries build on the original dirty branch, never Needs Human or same-tick relaunch`);
 }
 
-{
+for (const reply of [false, true]) {
   const f = fixture(); await f.loop.tickNow(); f.complete({ status: "needs_decision", ...decision });
   await f.loop.tickNow(); assert.equal(f.card.status, f.cfg.columns.needs_human); assert.equal(f.executor.activeCount(), 0);
-  f.comments.push({ id: "stranger", author: "stranger", authorAssociation: "NONE", body: "Use paid", createdAt: "now" });
-  f.card.status = f.cfg.columns.ready; await f.loop.tickNow(); assert.equal(f.starts(), 1);
-  f.card.status = f.cfg.columns.needs_human;
-  f.comments.push({ id: "trusted", author: "maintainer", authorAssociation: "MEMBER", body: "Use free", createdAt: "now" });
-  await f.loop.tickNow(); assert.equal(f.starts(), 1, "comment alone cannot resume");
-  f.card.status = f.cfg.columns.ready; await f.loop.tickNow(); assert.equal(f.starts(), 2);
+  assert.ok(["Question", "Missing decision context", "Options", "Recommendation", "Resume"].every(
+    (title) => f.comments[0].body.includes(`### [Agent] ${title}`)));
+  f.comments.push({ id: "stranger", author: "stranger", authorAssociation: "NONE", body: "Untrusted paid-service instruction", createdAt: "now" });
+  if (reply) f.comments.push({ id: "human", author: "bot", authorAssociation: "OWNER", body: "Human approval: use the free service", createdAt: "now" });
+  await f.loop.tickNow(); assert.equal(f.starts(), 1, "Needs Human remains paused regardless of comments");
+  f.card.status = f.cfg.columns.ready; await f.loop.tickNow();
+  assert.equal(f.starts(), 2, "Ready alone resumes; no reply gate");
+  assert.equal(f.runs[1].script.includes("Human approval: use the free service"), reply);
+  assert.ok(!f.runs[1].script.includes("Untrusted paid-service instruction"));
   await f.loop.stop(); f.store.clearExecution(f.card.itemId);
-  console.log("PASS: Needs Human releases the slot; only manual Ready AND a trusted decision reply permit a new build");
+  console.log(`PASS: Ready resumes ${reply ? "with a same-account human reply in context" : "without any trusted reply"}; Needs Human stays paused`);
+}
+
+{
+  const f = fixture();
+  f.comments.push({ id: "legacy", author: "bot", authorAssociation: "OWNER", createdAt: "now",
+    body: "<!-- board-agent-run:old:repair-verification -->\n## ⚠️ Needs human input\nRepair verification failed: Error: Repair test execution evidence is incomplete." });
+  await f.loop.tickNow(); assert.equal(f.starts(), 1, "historical technical comments cannot veto Ready");
+  assert.ok(!f.runs[0].script.includes("Repair verification failed:"));
+  await f.loop.stop(); f.store.clearExecution(f.card.itemId);
+  console.log("PASS: an old repair-verification Needs Human comment does not block an open Ready ticket");
 }
 
 for (const step of ["drain", "comment", "status", "release"]) {
@@ -129,6 +142,23 @@ for (const step of ["drain", "comment", "status", "release"]) {
   await f.loop.tickNow(); assert.equal(f.starts(), 2);
   await f.loop.stop(); f.store.clearExecution(f.card.itemId);
   console.log(`PASS: failed ${step} retains pending writeback and run identity until drain/release; no second run`);
+}
+
+{
+  const f = fixture(); await f.loop.tickNow(); f.complete({ status: "failure", error: "failed tests" }); f.failAt("status");
+  await f.loop.tickNow();
+  const pending = pendingTicketWrite(f.record())!;
+  assert.ok(f.comments[0].body.startsWith("[Agent]\n\n"));
+  assert.ok(f.comments[0].body.includes("## [Agent] Builder failed"));
+  const marker = f.comments[0].body.match(/<!-- board-agent-write:[^\n]+ -->/)![0];
+  // An older owner may have posted the untagged body before losing its response.
+  f.comments[0].body = `${marker}\n${pending.comment}`;
+  const legacyBody = f.comments[0].body;
+  await f.loop.tickNow();
+  assert.equal(f.comments.length, 1); assert.equal(f.comments[0].body, legacyBody);
+  assert.equal(pendingTicketWrite(f.record()), undefined);
+  await f.loop.stop(); f.store.clearExecution(f.card.itemId);
+  console.log("PASS: tagged writeback also recognizes an already-posted legacy comment without reposting or editing it");
 }
 
 for (const mode of ["infrastructure", "findings", "decision", "malformed", "pass-status", "findings-comment", "pass-release"]) {
@@ -394,4 +424,4 @@ for (const cut of ["manual-drain", "manual-release", "missing-drain", "pending-r
   console.log("PASS: withdrawal retains an uncertain launch until its original execution can be observed and drained");
 }
 
-import { testOwner, noPullRequests, fakePullRequests } from "./pr-fixture.js";
+import { testOwner, fakePullRequests } from "./pr-fixture.js";

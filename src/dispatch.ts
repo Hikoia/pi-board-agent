@@ -35,34 +35,49 @@ export function renderDecisionComment(decision: Decision): string {
   return [
     "## ⚠️ Needs human input",
     "",
-    "**Question**",
+    "### Question",
     decision.question,
     "",
-    "**Missing decision context**",
+    "### Missing decision context",
     decision.context,
     "",
-    "**Options**",
+    "### Options",
     ...decision.options.map((option) => `- ${option}`),
     "",
-    "**Recommendation**",
+    "### Recommendation",
     decision.recommendation,
     "",
-    "**Resume**",
-    "A repository OWNER, MEMBER, or COLLABORATOR must reply with the decision AND manually move this card to `Ready`. A comment alone never resumes work.",
+    "### Resume",
+    "Add any needed context, then manually move this card to `Ready` to resume. Ready is the resume signal; no reply check is required. A comment alone never resumes work.",
   ].join("\n");
 }
 
-export function trustedMissionComments(
-  comments: IssueComment[],
-  botLogin: string,
-): string {
+/** Visible provenance, independent of the GitHub account used to post it. */
+export function formatAgentComment(body: string): string {
+  let fence: string | undefined;
+  const tagged = body.split(/\r?\n/).map((line) => {
+    const boundary = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (boundary) {
+      if (!fence) fence = boundary[1];
+      else if (boundary[1][0] === fence[0] && boundary[1].length >= fence.length && !boundary[2].trim()) fence = undefined;
+      return line;
+    }
+    if (fence) return line;
+    return line.replace(/^( {0,3}#{1,6})([ \t]+)(.*)$/, (heading, prefix, gap, title) =>
+      /^\[Agent\](?:\s|$)/.test(title) ? heading : `${prefix}${gap}[Agent] ${title}`);
+  }).join("\n");
+  return /^\[Agent\](?:\s|$)/.test(tagged.trimStart()) ? tagged : `[Agent]\n\n${tagged}`;
+}
+
+export function trustedMissionComments(comments: IssueComment[]): string {
   return comments
     .filter(
       (c) =>
-        c.author?.toLowerCase() !== botLogin.toLowerCase() &&
+        c.author &&
         ["OWNER", "MEMBER", "COLLABORATOR"].includes(
           c.authorAssociation ?? "",
         ) &&
+        !/^(?:#{1,6}\s+)?\[Agent\](?:\s|$)/.test(c.body.trimStart()) &&
         !c.body.trimStart().startsWith("<!-- board-agent-"),
     )
     .map((c) => `${c.createdAt} ${c.author}: ${c.body}`)

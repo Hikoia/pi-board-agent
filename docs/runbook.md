@@ -243,7 +243,7 @@ all current work is covered. Uncovered later work needs a new submission/PR.
 | --- | --- |
 | Ready/build | Continue original branch/worktree, including dirty partial work and MERGE_HEAD; tests, push, then mandatory review |
 | Ready/review | Retry the original pinned review commit; fix provider/fetch/setup failure, not rebuild successful code |
-| Needs Human | Real requirement/product/cost/authorization decision only: trusted maintainer reply **and manual Ready**; reply alone does nothing |
+| Needs Human | Paused until manually moved to Ready; no reply check. Trusted non-Agent comments provide context, including same-account human replies; comments alone never resume work |
 | Review code findings | Ready/build, not Needs Human; preserve original work |
 | Malformed output, tests, timeout, exhausted retries | Technical retry, not a decision; repair the underlying problem |
 | Pending comment/status/reopen/release | Retry I/O after fresh observation and safe drain; no replacement builder or false Ready claim |

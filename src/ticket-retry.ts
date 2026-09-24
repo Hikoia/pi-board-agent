@@ -2,6 +2,7 @@ import { assertOwnerLock, type OwnerLock } from "./owner-lock.js";
 import { createHash } from "node:crypto";
 import { checkOperation, type OperationControl } from "./operation.js";
 import { isTargetIssue, type Card } from "./gh.js";
+import { formatAgentComment } from "./dispatch.js";
 import {
   TicketWorktrees,
   type TicketExecutionRecordV5,
@@ -221,11 +222,12 @@ export async function settleTicketWrite(
       )
       .digest("hex")
       .slice(0, 20)} -->`;
-    const body = `${marker}\n${write.comment}`;
+    const legacyBody = `${marker}\n${write.comment}`;
+    const body = formatAgentComment(legacyBody);
     const comments = await board.listComments(card);
     card = await guard();
     if (!card) return "withdrawn";
-    if (!comments.includes(body)) await board.comment(card, body);
+    if (!comments.includes(body) && !comments.includes(legacyBody)) await board.comment(card, body);
   }
   card = await guard();
   if (!card) return "withdrawn";

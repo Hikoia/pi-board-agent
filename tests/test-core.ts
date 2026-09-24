@@ -88,7 +88,7 @@ const comments = [
     createdAt: "now",
     author: "BOT",
     authorAssociation: "MEMBER",
-    body: "Internal result",
+    body: "[Agent] Internal result",
   },
   {
     id: "3",
@@ -106,8 +106,18 @@ const comments = [
   },
 ];
 check(
-  trustedMissionComments(comments, "bot") === "now owner: Approved scope",
-  "builder context includes trusted maintainer replies, not bot/protocol/untrusted comments",
+  trustedMissionComments(comments) === "now owner: Approved scope",
+  "builder context includes trusted maintainer replies, not Agent/protocol/untrusted comments",
+);
+check(
+  trustedMissionComments([
+    { ...comments[0], body: "[Agent] Automated reply" },
+    { ...comments[0], body: "## [Agent] Automated heading" },
+    { ...comments[0], body: "### [Agent] Another automated heading" },
+    { ...comments[1], body: "Human follow-up from the shared account" },
+    { ...comments[0], body: "Discuss the [Agent] label" },
+  ]) === "now BOT: Human follow-up from the shared account\n\nnow owner: Discuss the [Agent] label",
+  "Agent markers, not usernames, distinguish automation from trusted human comments",
 );
 check(
   parseDecision({
@@ -400,8 +410,11 @@ check(
 );
 check(
   builder.prompt.includes("gh issue view 42 --json comments") &&
-    builder.prompt.includes("OWNER, MEMBER, or COLLABORATOR"),
-  "builder reads linked Issue comments with the trusted-reply rule",
+    builder.prompt.includes("OWNER, MEMBER, or COLLABORATOR") &&
+    builder.prompt.includes("Ready is the human resume signal") &&
+    builder.prompt.includes("same account as the agent") &&
+    builder.prompt.includes("Prefix every GitHub comment you write and each comment heading with [Agent]"),
+  "builder uses Ready-only resumption and Agent markers while retaining trusted comment context",
 );
 check(
   ["attempted", "limitations", "workaround", "humanAction"].every(
@@ -853,4 +866,4 @@ check(
 );
 assert.equal(process.exitCode ?? 0, 0, "core regressions failed");
 
-import { testOwner, noPullRequests } from "./pr-fixture.js";
+import { testOwner } from "./pr-fixture.js";

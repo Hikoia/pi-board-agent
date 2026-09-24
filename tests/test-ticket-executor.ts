@@ -1127,7 +1127,7 @@ if (process.env.TICKET_FINALIZATION_ONLY !== "1") {
   );
   if (
     board.cards.get(explained.itemId)?.status === cfg.columns.needs_human &&
-    blockerComment.includes("## ⚠️ Needs human input") &&
+    blockerComment.includes("## [Agent] ⚠️ Needs human input") &&
     blockerComment.includes("Deployment target is missing.") &&
     blockerComment.includes("Checked repository configuration.") &&
     blockerComment.includes("Choosing a target would be unsafe.") &&

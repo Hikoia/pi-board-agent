@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { listIssueComments } from "../src/gh.js";
+import { createComment, listIssueComments } from "../src/gh.js";
 
 const check = (condition: boolean, label: string) => {
   assert.ok(condition, label);
@@ -51,6 +51,24 @@ const comment = (id: string, second: number, authorAssociation = "MEMBER") => ({
   id, body: `comment ${id}`, createdAt: new Date(second * 1000).toISOString(),
   authorAssociation, author: { login: "maintainer" },
 });
+
+const untagged = [
+  "<!-- board-agent-write:fixture -->", "## Result", "", "### Details", "Complete.",
+  "```markdown", "# Keep this code unchanged", "```", "~~~", "## Also code", "~~~",
+  "##  [Agent] Already tagged",
+].join("\n");
+const tagged = [
+  "[Agent]", "", "<!-- board-agent-write:fixture -->", "## [Agent] Result", "", "### [Agent] Details", "Complete.",
+  "```markdown", "# Keep this code unchanged", "```", "~~~", "## Also code", "~~~",
+  "##  [Agent] Already tagged",
+].join("\n");
+for (const body of [untagged, tagged]) {
+  resetMock([{ data: { addComment: { commentEdge: { node: { id: "COMMENT" } } } } }]);
+  assert.equal(await createComment("ISSUE", body), "COMMENT");
+  assert.equal(calls()[0].find((arg) => arg.startsWith("body=")), `body=${tagged}`);
+  assert.ok(!(calls()[0].find((arg) => arg.startsWith("query=")) ?? "").includes(tagged));
+}
+check(true, "every Agent reply and Markdown heading is tagged once; protocol markers and fenced code remain intact");
 
 resetMock([
   page([comment("later", 3)], true, "CURSOR_1"),
